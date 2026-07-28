@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 dependencies = [
     "anthropic",
     "openai",
+    "pathspec>=0.12",
     "pydantic>=2",
     "PyYAML>=6",
     "prompt-toolkit>=3.0",
@@ -44,4 +45,3 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
-

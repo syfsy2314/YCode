@@ -30,6 +30,7 @@ from ycode.core.messages import (
     thaw_json,
 )
 from ycode.errors import ProviderError
+from ycode.tools.contracts import ToolDefinition
 
 MAX_TOKENS = 16_000
 
@@ -147,6 +148,17 @@ class AnthropicProvider:
         }.get(reason or "", StopReason.UNKNOWN)
 
     @staticmethod
+    def _tools(definitions: Sequence[ToolDefinition[Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": definition.name,
+                "description": definition.description,
+                "input_schema": thaw_json(definition.input_schema),
+            }
+            for definition in definitions
+        ]
+
+    @staticmethod
     def _provider_error(error: Exception) -> ProviderError:
         if isinstance(error, anthropic.AuthenticationError):
             return ProviderError(
@@ -168,7 +180,13 @@ class AnthropicProvider:
             )
         return ProviderError("stream", "Anthropic 响应流意外中断，请重试。", True)
 
-    async def stream_chat(self, messages: Sequence[ChatMessage]) -> AsyncIterator[StreamEvent]:
+    async def stream_chat(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        system_prompt: str = "",
+        tools: Sequence[ToolDefinition[Any]] = (),
+    ) -> AsyncIterator[StreamEvent]:
         request: dict[str, Any] = {
             "model": self._config.model,
             "max_tokens": MAX_TOKENS,
@@ -180,6 +198,10 @@ class AnthropicProvider:
             if self._config.thinking
             else {"type": "disabled"}
         )
+        if system_prompt:
+            request["system"] = system_prompt
+        if tools:
+            request["tools"] = self._tools(tools)
 
         message_started = False
         completed = False

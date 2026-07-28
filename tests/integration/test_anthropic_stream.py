@@ -1,8 +1,17 @@
 import time
+from pathlib import Path
 
 import pytest
+from pydantic import BaseModel, ConfigDict, Field
 
 from tests.support.sse_server import SSETestServer, StreamResponse, sse_event
+from ycode.agent import (
+    AgentLoop,
+    AgentTextDelta,
+    FinalResponseEvent,
+    PlainChatRunner,
+    SystemPromptBuilder,
+)
 from ycode.config.models import ProviderConfig
 from ycode.core import (
     StopReason,
@@ -23,6 +32,31 @@ from ycode.errors import ProviderError
 from ycode.providers.anthropic import AnthropicProvider
 from ycode.session.assembler import ResponseAssembler
 from ycode.session.chat import ChatSession
+from ycode.tools import (
+    ToolAccess,
+    ToolContext,
+    ToolDefinition,
+    ToolExecutor,
+    ToolScheduler,
+    create_builtin_registry,
+)
+from ycode.tools.command import PowerShellCommandRunner
+from ycode.tools.paths import WorkspacePathResolver
+from ycode.tools.text_files import TextFileService
+
+
+class ReadArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1)
+
+
+READ_DEFINITION = ToolDefinition(
+    name="read_file",
+    description="读取文件",
+    access=ToolAccess.READ,
+    arguments_model=ReadArguments,
+)
 
 
 def config(server: SSETestServer, *, thinking: bool = False) -> ProviderConfig:
@@ -94,12 +128,108 @@ def normal_events() -> list[str]:
     ]
 
 
+def tool_events(call_id: str, name: str, arguments: str) -> list[str]:
+    return [
+        message_start(),
+        sse_event(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": name,
+                    "input": {},
+                },
+            },
+        ),
+        sse_event(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": arguments,
+                },
+            },
+        ),
+        sse_event("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        sse_event(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                "usage": {"output_tokens": 2},
+            },
+        ),
+        sse_event("message_stop", {"type": "message_stop"}),
+    ]
+
+
+def agent_session(workspace: Path, server: SSETestServer) -> ChatSession:
+    (workspace / "sample.txt").write_text("needle\n", encoding="utf-8")
+    resolver = WorkspacePathResolver(workspace)
+    registry = create_builtin_registry(
+        resolver,
+        TextFileService(),
+        PowerShellCommandRunner(),
+    )
+    return ChatSession(
+        AgentLoop(
+            AnthropicProvider(config(server)),
+            registry,
+            ToolScheduler(registry, ToolExecutor(registry)),
+            SystemPromptBuilder(workspace),
+            ToolContext(workspace),
+        )
+    )
+
+
 def visible(events: list[StreamEvent]) -> list[tuple[type[object], str]]:
     return [
         (type(event), event.text if isinstance(event, TextDelta | ThinkingDelta) else "")
         for event in events
         if isinstance(event, TextDelta | ThinkingDelta | StreamEnd)
     ]
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_reinjects_two_tool_results_before_final_response(
+    tmp_path: Path,
+    sse_server: SSETestServer,
+) -> None:
+    sse_server.enqueue(
+        StreamResponse(events=tool_events("read-1", "read_file", '{"path":"sample.txt"}'))
+    )
+    sse_server.enqueue(StreamResponse(events=tool_events("glob-1", "glob", '{"pattern":"*.txt"}')))
+    sse_server.enqueue(StreamResponse(events=normal_events()))
+    session = agent_session(tmp_path, sse_server)
+
+    try:
+        events = [event async for event in session.stream_reply("inspect")]
+    finally:
+        await session.close()
+
+    assert [event.message.text for event in events if isinstance(event, FinalResponseEvent)] == [
+        "你好"
+    ]
+    assert len(sse_server.requests) == 3
+    first, second, third = [request.json for request in sse_server.requests]
+    assert [tool["name"] for tool in first["tools"]] == [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "run_command",
+        "glob",
+        "grep",
+    ]
+    assert "Workspace:" in first["system"]
+    assert second["messages"][-2]["content"][0]["id"] == "read-1"
+    assert second["messages"][-1]["content"][0]["tool_use_id"] == "read-1"
+    assert third["messages"][-2]["content"][0]["id"] == "glob-1"
+    assert third["messages"][-1]["content"][0]["tool_use_id"] == "glob-1"
 
 
 @pytest.mark.asyncio
@@ -128,6 +258,34 @@ async def test_official_sdk_streams_text_and_records_request(sse_server: SSETest
     assert request.json["messages"] == [{"role": "user", "content": "hello"}]
     assert request.json["stream"] is True
     assert request.json["thinking"] == {"type": "disabled"}
+
+
+@pytest.mark.asyncio
+async def test_official_sdk_sends_agent_system_and_tools(sse_server: SSETestServer) -> None:
+    sse_server.enqueue(StreamResponse(events=normal_events()))
+    provider = AnthropicProvider(config(sse_server))
+    try:
+        result = [
+            event
+            async for event in provider.stream_chat(
+                [ChatMessage.user_text("inspect")],
+                system_prompt="minimal prompt",
+                tools=(READ_DEFINITION,),
+            )
+        ]
+    finally:
+        await provider.close()
+
+    assert isinstance(result[-1], StreamEnd)
+    request = sse_server.requests[0].json
+    assert request["system"] == "minimal prompt"
+    assert request["tools"] == [
+        {
+            "name": "read_file",
+            "description": "读取文件",
+            "input_schema": ReadArguments.model_json_schema(),
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -381,14 +539,14 @@ async def test_interleaved_text_is_visible_in_arrival_order_and_stored_by_index(
         sse_event("message_stop", {"type": "message_stop"}),
     ]
     sse_server.enqueue(StreamResponse(events=events, delay=0.01))
-    session = ChatSession(AnthropicProvider(config(sse_server)))
+    session = ChatSession(PlainChatRunner(AnthropicProvider(config(sse_server))))
 
     try:
         result = [event async for event in session.stream_reply("hello")]
     finally:
         await session.close()
 
-    assert [event.text for event in result if isinstance(event, TextDelta)] == [
+    assert [event.text for event in result if isinstance(event, AgentTextDelta)] == [
         "one-",
         "zero-",
         "end",

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import BaseModel, ConfigDict, Field
 
 from ycode.config.models import ProviderConfig
 from ycode.core import (
@@ -23,6 +24,21 @@ from ycode.core import (
 )
 from ycode.errors import ProviderError
 from ycode.providers.anthropic import MAX_TOKENS, AnthropicProvider
+from ycode.tools import ToolAccess, ToolDefinition
+
+
+class ReadArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, description="文件路径")
+
+
+READ_DEFINITION = ToolDefinition(
+    name="read_file",
+    description="读取文件",
+    access=ToolAccess.READ,
+    arguments_model=ReadArguments,
+)
 
 
 class AsyncEvents:
@@ -109,6 +125,38 @@ async def test_text_stream_maps_request_and_events() -> None:
     }
     assert provider.client is client
     assert not hasattr(provider, "_client")
+
+
+@pytest.mark.asyncio
+async def test_agent_request_adds_system_and_provider_neutral_tools() -> None:
+    client = client_with(
+        event("message_start"),
+        block_start(0, "text", text="answer"),
+        event("content_block_stop", index=0),
+        *completed(),
+    )
+    provider = AnthropicProvider(config(), client=client)
+
+    events = [
+        event
+        async for event in provider.stream_chat(
+            [ChatMessage.user_text("hi")],
+            system_prompt="minimal agent prompt",
+            tools=(READ_DEFINITION,),
+        )
+    ]
+
+    assert events[-1] == StreamEnd(StopReason.END_TURN, "end_turn")
+    request = client.messages.create.await_args.kwargs
+    assert request["system"] == "minimal agent prompt"
+    assert request["tools"] == [
+        {
+            "name": "read_file",
+            "description": "读取文件",
+            "input_schema": ReadArguments.model_json_schema(),
+        }
+    ]
+    assert isinstance(request["tools"][0]["input_schema"], dict)
 
 
 @pytest.mark.asyncio

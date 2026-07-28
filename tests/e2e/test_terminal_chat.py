@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import subprocess
@@ -35,6 +36,116 @@ def response(*parts: str, delay: float = 0.05) -> StreamResponse:
     events = [chunk(part) for part in parts]
     events.extend([chunk(None, "stop"), sse_event(None, "[DONE]")])
     return StreamResponse(events=events, delay=delay)
+
+
+def anthropic_message_start() -> str:
+    return sse_event(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_e2e_agent",
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "claude-test",
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 2, "output_tokens": 1},
+            },
+        },
+    )
+
+
+def anthropic_tool_response(
+    calls: list[tuple[str, str, dict[str, object]]],
+) -> StreamResponse:
+    events = [anthropic_message_start()]
+    for index, (call_id, name, arguments) in enumerate(calls):
+        events.extend(
+            [
+                sse_event(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": call_id,
+                            "name": name,
+                            "input": {},
+                        },
+                    },
+                ),
+                sse_event(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": json.dumps(arguments),
+                        },
+                    },
+                ),
+                sse_event(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": index},
+                ),
+            ]
+        )
+    events.extend(
+        [
+            sse_event(
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                    "usage": {"output_tokens": 6},
+                },
+            ),
+            sse_event("message_stop", {"type": "message_stop"}),
+        ]
+    )
+    return StreamResponse(events=events, delay=0.01)
+
+
+def anthropic_text_response(text: str) -> StreamResponse:
+    return StreamResponse(
+        events=[
+            anthropic_message_start(),
+            sse_event(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            ),
+            sse_event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": text},
+                },
+            ),
+            sse_event(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": 0},
+            ),
+            sse_event(
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": 2},
+                },
+            ),
+            sse_event("message_stop", {"type": "message_stop"}),
+        ],
+        delay=0.01,
+    )
 
 
 class PtyReader:
@@ -292,6 +403,209 @@ def test_windows_terminal_anthropic_thinking(tmp_path: Path, sse_server: SSETest
         "type": "adaptive",
         "display": "summarized",
     }
+
+
+@pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
+def test_windows_terminal_agent_executes_six_tools(
+    tmp_path: Path,
+    sse_server: SSETestServer,
+) -> None:
+    project = tmp_path / "agent-tools"
+    project.mkdir()
+    (project / "sample.txt").write_text("needle\n", encoding="utf-8")
+    sse_server.enqueue(
+        anthropic_tool_response(
+            [
+                ("read-1", "read_file", {"path": "sample.txt"}),
+                ("glob-1", "glob", {"pattern": "*.txt"}),
+                ("grep-1", "grep", {"pattern": "needle"}),
+                (
+                    "write-1",
+                    "write_file",
+                    {"path": "new.txt", "content": "before\n"},
+                ),
+                (
+                    "edit-1",
+                    "edit_file",
+                    {"path": "new.txt", "old_text": "before", "new_text": "after"},
+                ),
+                ("command-1", "run_command", {"command": "Get-Content new.txt"}),
+            ]
+        )
+    )
+    sse_server.enqueue(anthropic_text_response("all tools completed"))
+    write_anthropic_config(
+        project / ".ycode" / "config.yaml",
+        sse_server,
+        thinking=False,
+    )
+    process, reader = spawn_ycode(project)
+    try:
+        output = reader.wait_for("mode: agen", timeout=15)
+        assert "Send a message..." in output
+        process.write("use every tool\r")
+        for tool_name in (
+            "read_file",
+            "glob",
+            "grep",
+            "write_file",
+            "edit_file",
+            "run_command",
+        ):
+            reader.wait_for(tool_name, timeout=20)
+        reader.wait_for("all tools completed", timeout=20)
+        reader.wait_for("Send a message...", timeout=15, count=2)
+        process.write("/exit\r")
+        wait_for_exit(process)
+        output = reader.snapshot()
+        write_started = output.index("◇ write_file")
+        assert output.index("✓ read_file") < write_started
+        assert output.index("✓ glob") < write_started
+        assert output.index("✓ grep") < write_started
+        assert "Traceback" not in output
+    finally:
+        stop_process(process)
+
+    assert (project / "new.txt").read_text(encoding="utf-8") == "after\n"
+    assert len(sse_server.requests) == 2
+    tool_results = sse_server.requests[1].json["messages"][-1]["content"]
+    assert [result["tool_use_id"] for result in tool_results] == [
+        "read-1",
+        "glob-1",
+        "grep-1",
+        "write-1",
+        "edit-1",
+        "command-1",
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
+def test_windows_terminal_plan_mode_and_tool_filter(
+    tmp_path: Path,
+    sse_server: SSETestServer,
+) -> None:
+    project = tmp_path / "plan-mode"
+    write_anthropic_config(
+        project / ".ycode" / "config.yaml",
+        sse_server,
+        thinking=False,
+    )
+    sse_server.enqueue(
+        anthropic_tool_response(
+            [
+                (
+                    "blocked-write",
+                    "write_file",
+                    {"path": "forbidden.txt", "content": "must not exist"},
+                )
+            ]
+        )
+    )
+    sse_server.enqueue(anthropic_text_response("implementation plan"))
+    process, reader = spawn_ycode(project)
+    try:
+        reader.wait_for("Send a message...", timeout=15)
+        process.write("/plan\r")
+        reader.wait_for("mode: plan-only", timeout=15)
+        reader.wait_for("Send a message...", timeout=15, count=2)
+        process.write("make a plan\r")
+        reader.wait_for("当前模式不允许执行该工具", timeout=15)
+        reader.wait_for("implementation plan", timeout=15)
+        reader.wait_for("Send a message...", timeout=15, count=3)
+        process.write("/agent\r")
+        reader.wait_for("mode: agent", timeout=15)
+        process.write("/exit\r")
+        wait_for_exit(process)
+        assert "Traceback" not in reader.snapshot()
+    finally:
+        stop_process(process)
+
+    assert len(sse_server.requests) == 2
+    request = sse_server.requests[0].json
+    assert [tool["name"] for tool in request["tools"]] == [
+        "read_file",
+        "glob",
+        "grep",
+    ]
+    assert "Plan-only mode" in request["system"]
+    assert sse_server.requests[1].json["messages"][-1]["content"][0]["is_error"] is True
+    assert not (project / "forbidden.txt").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
+def test_windows_terminal_agent_stops_at_ten_tool_rounds(
+    tmp_path: Path,
+    sse_server: SSETestServer,
+) -> None:
+    project = tmp_path / "agent-limit"
+    project.mkdir()
+    (project / "sample.txt").write_text("value\n", encoding="utf-8")
+    write_anthropic_config(
+        project / ".ycode" / "config.yaml",
+        sse_server,
+        thinking=False,
+    )
+    for index in range(10):
+        sse_server.enqueue(
+            anthropic_tool_response([(f"read-{index}", "read_file", {"path": "sample.txt"})])
+        )
+    process, reader = spawn_ycode(project)
+    try:
+        reader.wait_for("Send a message...", timeout=15)
+        process.write("keep reading\r")
+        reader.wait_for("Agent 已达到最大轮数 10", timeout=30)
+        reader.wait_for("Send a message...", timeout=15, count=2)
+        process.write("/exit\r")
+        wait_for_exit(process)
+        assert "Traceback" not in reader.snapshot()
+    finally:
+        stop_process(process)
+
+    assert len(sse_server.requests) == 10
+
+
+@pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
+def test_windows_terminal_ctrl_c_cancels_active_command_and_recovers(
+    tmp_path: Path,
+    sse_server: SSETestServer,
+) -> None:
+    project = tmp_path / "agent-cancel"
+    write_anthropic_config(
+        project / ".ycode" / "config.yaml",
+        sse_server,
+        thinking=False,
+    )
+    sse_server.enqueue(
+        anthropic_tool_response(
+            [
+                (
+                    "command-1",
+                    "run_command",
+                    {"command": "Start-Sleep -Seconds 30"},
+                )
+            ]
+        )
+    )
+    sse_server.enqueue(anthropic_text_response("recovered after cancel"))
+    process, reader = spawn_ycode(project)
+    try:
+        reader.wait_for("Send a message...", timeout=15)
+        process.write("run a long command\r")
+        reader.wait_for("run_command", timeout=15)
+        process.sendintr()
+        reader.wait_for("已取消", timeout=15)
+        reader.wait_for("Send a message...", timeout=15, count=2)
+        process.write("retry\r")
+        reader.wait_for("recovered after cancel", timeout=15)
+        reader.wait_for("Send a message...", timeout=15, count=3)
+        process.write("/exit\r")
+        wait_for_exit(process)
+        assert "Traceback" not in reader.snapshot()
+    finally:
+        stop_process(process)
+
+    assert len(sse_server.requests) == 2
+    assert sse_server.requests[1].json["messages"] == [{"role": "user", "content": "retry"}]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")

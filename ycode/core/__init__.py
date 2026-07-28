@@ -24,9 +24,10 @@ from ycode.core.messages import (
     freeze_json,
     thaw_json,
 )
-from ycode.core.provider import ChatProvider
+from ycode.core.provider import AgentChatProvider, ChatProvider
 
 __all__ = [
+    "AgentChatProvider",
     "ChatMessage",
     "ChatProvider",
     "ContentBlock",

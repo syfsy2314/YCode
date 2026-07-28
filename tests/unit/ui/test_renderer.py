@@ -3,6 +3,7 @@ from io import StringIO
 import pytest
 from rich.console import Console
 
+from ycode.core import ChatMessage
 from ycode.ui.renderer import LiveResponseRenderer
 from ycode.ui.timer import ResponseTimer
 
@@ -84,3 +85,24 @@ async def test_failure_keeps_partial_text_and_can_restart() -> None:
     assert renderer.response_text == ""
     assert "safe error" not in snapshot(renderer)
     await renderer.cancel()
+
+
+@pytest.mark.asyncio
+async def test_multiple_rounds_keep_process_text_out_of_final_markdown() -> None:
+    target = StringIO()
+    renderer = LiveResponseRenderer(
+        console=Console(file=target, width=80, color_system=None),
+        refresh_interval=10,
+    )
+    await renderer.start()
+    renderer.append_text("**process**", round_number=1)
+    renderer.add_tool_status("✓ read_file  读取 1 行")
+    renderer.append_text("# Final", round_number=2)
+
+    await renderer.complete(ChatMessage.assistant_text("# Final"))
+
+    output = snapshot(renderer)
+    assert "**process**" in output
+    assert "Final" in output
+    assert "# Final" not in output
+    assert "read_file" in output

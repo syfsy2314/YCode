@@ -8,12 +8,14 @@ from prompt_toolkit.layout.processors import AfterInput, BeforeInput, Conditiona
 from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
+from ycode.agent import AgentMode
 from ycode.ui.input_box import (
     ASCII_INDICATOR,
     HELP_HINT,
     PLACEHOLDER,
     UNICODE_INDICATOR,
     InputBox,
+    format_hint,
 )
 from ycode.ui.styles import InputBorderStyle, create_prompt_style
 
@@ -57,7 +59,7 @@ def test_four_line_layout_and_indicator(unicode_supported: bool, expected: str) 
     assert PLACEHOLDER in fragment_list_to_text(to_formatted_text(processors[1].processor.text))
 
     assert isinstance(hint.content, FormattedTextControl)
-    assert HELP_HINT in fragment_list_to_text(to_formatted_text(hint.content.text))
+    assert "mode: agent" in fragment_list_to_text(to_formatted_text(hint.content.text))
 
 
 def test_border_color_is_injected_without_changing_hint() -> None:
@@ -85,6 +87,14 @@ def test_layout_reserves_last_terminal_column() -> None:
     assert isinstance(bottom, Window)
     assert top.width.preferred == 19
     assert bottom.width.preferred == 19
+
+
+def test_hint_places_mode_on_right_and_prioritizes_it_when_narrow() -> None:
+    assert format_hint(40, AgentMode.AGENT).startswith(HELP_HINT)
+    assert format_hint(40, AgentMode.AGENT).endswith("mode: agent")
+    assert format_hint(15, AgentMode.PLAN_ONLY) == "mode: plan-only"
+    assert format_hint(9, AgentMode.PLAN_ONLY) == "plan-only"
+    assert format_hint(1, AgentMode.PLAN_ONLY) == "P"
 
 
 @pytest.mark.asyncio

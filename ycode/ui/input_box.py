@@ -1,14 +1,16 @@
 """异步终端输入提示区。"""
 
+import asyncio
 import sys
 
 from prompt_toolkit import Application
-from prompt_toolkit.application.current import get_app
+from prompt_toolkit.application.current import get_app, get_app_session
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.input.base import Input
 from prompt_toolkit.key_binding.defaults import load_key_bindings
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import (
     BufferControl,
     Dimension,
@@ -25,6 +27,7 @@ from prompt_toolkit.layout.processors import (
 from prompt_toolkit.output.base import Output
 from rich.console import Console
 
+from ycode.agent import AgentMode
 from ycode.ui.styles import (
     DEFAULT_INPUT_BORDER_STYLE,
     InputBorderStyle,
@@ -35,6 +38,18 @@ UNICODE_INDICATOR = "❯"
 ASCII_INDICATOR = ">"
 PLACEHOLDER = "Send a message..."
 HELP_HINT = "? for help"
+
+
+def format_hint(width: int, mode: AgentMode) -> str:
+    full_mode = f"mode: {mode.value}"
+    if width >= len(HELP_HINT) + len(full_mode) + 1:
+        return f"{HELP_HINT}{' ' * (width - len(HELP_HINT) - len(full_mode))}{full_mode}"
+    if width >= len(full_mode):
+        return full_mode.rjust(width)
+    if width >= len(mode.value):
+        return mode.value.rjust(width)
+    compact = "A" if mode is AgentMode.AGENT else "P"
+    return compact.rjust(width)
 
 
 def supports_unicode_indicator(encoding: str | None = None) -> bool:
@@ -64,7 +79,11 @@ class InputBox:
         self._input = input
         self._output = output
 
-    def _create_application(self, width: int) -> Application[str]:
+    def _create_application(
+        self,
+        width: int,
+        mode: AgentMode = AgentMode.AGENT,
+    ) -> Application[str]:
         indicator = UNICODE_INDICATOR if self._unicode_supported else ASCII_INDICATOR
 
         def accept(buffer: Buffer) -> bool:
@@ -108,7 +127,9 @@ class InputBox:
             wrap_lines=False,
         )
         hint_window = Window(
-            content=FormattedTextControl(FormattedText([("class:input-hint", HELP_HINT)])),
+            content=FormattedTextControl(
+                FormattedText([("class:input-hint", format_hint(width, mode))])
+            ),
             width=exact_width,
             height=1,
             dont_extend_width=True,
@@ -126,6 +147,19 @@ class InputBox:
             output=self._output,
         )
 
-    async def read(self) -> str:
+    async def read(self, mode: AgentMode = AgentMode.AGENT) -> str:
         width = max(1, min(self._console.width - 1, 100))
-        return await self._create_application(width).run_async()
+        return await self._create_application(width, mode).run_async()
+
+    async def wait_for_interrupt(self) -> None:
+        """响应期间只监听 Ctrl+C，不接受普通文本输入。"""
+        input_device = self._input or get_app_session().input
+        interrupted = asyncio.get_running_loop().create_future()
+
+        def input_ready() -> None:
+            for key_press in input_device.read_keys():
+                if key_press.key == Keys.ControlC and not interrupted.done():
+                    interrupted.set_result(None)
+
+        with input_device.raw_mode(), input_device.attach(input_ready):
+            await interrupted
