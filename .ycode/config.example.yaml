@@ -1,0 +1,16 @@
+active: claude-local
+
+providers:
+  - name: claude-local
+    protocol: anthropic
+    model: your-claude-model
+    base_url: https://api.anthropic.com
+    api_key: ${ANTHROPIC_API_KEY}
+    thinking: true
+
+  - name: openai-local
+    protocol: openai
+    model: your-openai-model
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
+    thinking: false
