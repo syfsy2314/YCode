@@ -14,8 +14,16 @@ from ycode.agent import (
     AgentTurnStream,
     FinalResponseEvent,
     ModeChangedEvent,
+    ToolApprovalRequested,
 )
-from ycode.core.messages import ChatMessage
+from ycode.core.events import TokenUsage
+from ycode.core.messages import ChatMessage, ToolCallBlock
+from ycode.security import (
+    ApprovalChoice,
+    PermissionAction,
+    PermissionDecision,
+    PermissionSubject,
+)
 
 
 def test_agent_events_are_frozen_and_validate_fields() -> None:
@@ -38,9 +46,11 @@ def test_completed_result_requires_final_message_at_end() -> None:
         termination=AgentTermination.COMPLETED,
         messages=(user, final),
         final_message=final,
+        usage=TokenUsage(input_tokens=10, output_tokens=5),
     )
 
     assert result.final_message is final
+    assert result.usage == TokenUsage(input_tokens=10, output_tokens=5)
     with pytest.raises(ValueError, match="最终"):
         AgentTurnResult(
             termination=AgentTermination.COMPLETED,
@@ -111,3 +121,72 @@ async def test_turn_cancel_interrupts_child_and_can_finish_with_cancel_event() -
     assert cleaned.is_set()
     assert turn.result is not None
     assert turn.result.termination is AgentTermination.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_turn_allows_only_one_blocking_approval() -> None:
+    subject = PermissionSubject(
+        ToolCallBlock(id="call-1", name="write_file", arguments={"path": "a"}),
+        {"path": "a"},
+        {"tool": "write_file", "path": "a", "overwrite": False},
+        "写入 a",
+    )
+    decision = PermissionDecision(
+        PermissionAction.ASK,
+        subject,
+        "mode_default",
+        "需要确认",
+    )
+
+    async def producer(turn: AgentTurnStream):
+        turn.begin_approval()
+        yield ToolApprovalRequested(1, 0, decision)
+        choice = await turn.run_child(turn.consume_approval())
+        assert choice is ApprovalChoice.ALLOW_ONCE
+        final = ChatMessage.assistant_text("done")
+        turn.complete(
+            AgentTurnResult(
+                AgentTermination.COMPLETED,
+                (final,),
+                final,
+            )
+        )
+        yield FinalResponseEvent(final)
+
+    turn = AgentTurnStream(producer)
+    assert isinstance(await anext(turn), ToolApprovalRequested)
+    assert turn.approval_pending
+    with pytest.raises(RuntimeError, match="只能等待一个"):
+        turn.begin_approval()
+    turn.submit_approval(ApprovalChoice.ALLOW_ONCE)
+    assert isinstance(await anext(turn), FinalResponseEvent)
+    with pytest.raises(RuntimeError, match="没有等待"):
+        turn.submit_approval(ApprovalChoice.DENY)
+    with pytest.raises(StopAsyncIteration):
+        await anext(turn)
+
+
+@pytest.mark.asyncio
+async def test_cancelling_pending_approval_clears_it_without_choice() -> None:
+    async def producer(turn: AgentTurnStream):
+        turn.begin_approval()
+        yield AgentTextDelta(1, 0, "等待审批")
+        try:
+            await turn.run_child(turn.consume_approval())
+        except asyncio.CancelledError:
+            turn.complete(
+                AgentTurnResult(
+                    AgentTermination.CANCELLED,
+                    (),
+                )
+            )
+            yield AgentCancelledEvent("已取消。")
+
+    turn = AgentTurnStream(producer)
+    assert isinstance(await anext(turn), AgentTextDelta)
+    turn.cancel()
+
+    assert isinstance(await anext(turn), AgentCancelledEvent)
+    assert not turn.approval_pending
+    with pytest.raises(StopAsyncIteration):
+        await anext(turn)

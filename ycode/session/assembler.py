@@ -10,6 +10,7 @@ from ycode.core.events import (
     TextDelta,
     ThinkingComplete,
     ThinkingDelta,
+    TokenUsage,
     ToolCallComplete,
     ToolCallDelta,
     ToolCallStart,
@@ -55,6 +56,7 @@ class ResponseAssembler:
         self._finished = False
         self._stop_reason: StopReason | None = None
         self._provider_reason = ""
+        self._usage = TokenUsage()
 
     @property
     def stop_reason(self) -> StopReason | None:
@@ -63,6 +65,10 @@ class ResponseAssembler:
     @property
     def provider_reason(self) -> str:
         return self._provider_reason
+
+    @property
+    def usage(self) -> TokenUsage:
+        return self._usage
 
     def consume(self, event: StreamEvent) -> None:
         if self._finished:
@@ -193,3 +199,4 @@ class ResponseAssembler:
         self._stream_ended = True
         self._stop_reason = event.stop_reason
         self._provider_reason = event.provider_reason
+        self._usage = event.usage

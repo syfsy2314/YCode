@@ -19,22 +19,35 @@ from ycode.agent.events import (
     AgentTextDelta,
     AgentThinkingDelta,
     FinalResponseEvent,
+    ToolApprovalRequested,
     ToolExecutionCancelled,
     ToolExecutionCompleted,
     ToolExecutionStarted,
 )
-from ycode.agent.prompt import SystemPromptBuilder
-from ycode.core.events import StopReason, TextDelta, ThinkingDelta
+from ycode.core.events import StopReason, TextDelta, ThinkingDelta, TokenUsage
 from ycode.core.messages import (
     ChatMessage,
     ToolCallBlock,
     ToolResultBlock,
     thaw_json,
 )
-from ycode.core.provider import AgentChatProvider
+from ycode.core.provider import AgentChatProvider, AgentModelRequest
 from ycode.errors import MessageAssemblyError, ProviderError
+from ycode.prompt import EnvironmentCollector, PromptBundle, PromptRuntimeContext
+from ycode.prompt.models import SupplementKind, SystemSupplement
+from ycode.security import (
+    ApprovalChoice,
+    PermissionAction,
+    PermissionEngine,
+    PermissionSession,
+)
 from ycode.session.assembler import ResponseAssembler
-from ycode.tools.contracts import ToolAccess, ToolContext, ToolExecutionRecord
+from ycode.tools.contracts import (
+    ToolAccess,
+    ToolContext,
+    ToolExecutionRecord,
+    ToolExecutionResult,
+)
 from ycode.tools.registry import ToolRegistry
 from ycode.tools.scheduler import (
     ScheduledToolCancelled,
@@ -52,9 +65,13 @@ class AgentLoop:
         provider: AgentChatProvider,
         registry: ToolRegistry,
         scheduler: ToolScheduler,
-        prompt_builder: SystemPromptBuilder,
+        prompt_bundle: PromptBundle,
+        prompt_runtime: PromptRuntimeContext,
+        environment: EnvironmentCollector,
         context: ToolContext,
         *,
+        permission_engine: PermissionEngine | None = None,
+        permission_session: PermissionSession | None = None,
         max_rounds: int = 10,
     ) -> None:
         if not isinstance(max_rounds, int) or isinstance(max_rounds, bool) or max_rounds < 1:
@@ -62,8 +79,14 @@ class AgentLoop:
         self._provider = provider
         self._registry = registry
         self._scheduler = scheduler
-        self._prompt_builder = prompt_builder
+        self._prompt_bundle = prompt_bundle
+        self._prompt_runtime = prompt_runtime
+        self._environment = environment
         self._context = context
+        if (permission_engine is None) != (permission_session is None):
+            raise ValueError("权限引擎和权限会话必须同时提供")
+        self._permission_engine = permission_engine
+        self._permission_session = permission_session
         self._max_rounds = max_rounds
 
     def start_turn(
@@ -94,18 +117,38 @@ class AgentLoop:
         allowed_access = (
             frozenset({ToolAccess.READ})
             if mode is AgentMode.PLAN_ONLY
-            else frozenset({ToolAccess.READ, ToolAccess.WRITE})
+            else frozenset({ToolAccess.READ, ToolAccess.WRITE, ToolAccess.UNKNOWN})
         )
         definitions = self._registry.definitions(allowed_access)
-        system_prompt = self._prompt_builder.build(mode, definitions)
+        usage = TokenUsage()
 
         try:
+            environment = await turn.run_child(self._environment.collect())
+            request_supplements = [environment.to_supplement()]
+            if self._permission_session is not None:
+                request_supplements.append(
+                    SystemSupplement(
+                        SupplementKind.TOOL_STATE,
+                        f"Current permission mode: {self._permission_session.mode.value}.",
+                    )
+                )
+            prompt_context = self._prompt_runtime.begin_turn(
+                mode.value,
+                tuple(request_supplements),
+            )
+            system_prompt = self._prompt_bundle.content_blocks
+            supplements = tuple(
+                supplement.tagged_content for supplement in prompt_context.supplements
+            )
             for round_number in range(1, self._max_rounds + 1):
                 assembler = ResponseAssembler()
-                stream = self._provider.stream_chat(
-                    working_messages,
-                    system_prompt=system_prompt,
-                    tools=definitions,
+                stream = self._provider.stream_agent(
+                    AgentModelRequest(
+                        messages=tuple(working_messages),
+                        system_prompt=system_prompt,
+                        supplements=supplements,
+                        tools=definitions,
+                    )
                 )
                 while True:
                     try:
@@ -127,6 +170,7 @@ class AgentLoop:
                         )
 
                 assistant_message = assembler.finish()
+                usage += assembler.usage
                 stop_reason = assembler.stop_reason
                 tool_calls = assistant_message.blocks(ToolCallBlock)
                 working_messages.append(assistant_message)
@@ -138,6 +182,7 @@ class AgentLoop:
                             termination=AgentTermination.COMPLETED,
                             messages=tuple(turn_messages),
                             final_message=assistant_message,
+                            usage=usage,
                         )
                     )
                     yield FinalResponseEvent(assistant_message)
@@ -154,7 +199,7 @@ class AgentLoop:
                         if code == "inconsistent_response"
                         else f"模型以异常原因停止：{stop_reason or StopReason.UNKNOWN}。"
                     )
-                    yield self._finish_error(turn, turn_messages, code, message)
+                    yield self._finish_error(turn, turn_messages, code, message, usage)
                     return
 
                 if not tool_calls:
@@ -163,14 +208,43 @@ class AgentLoop:
                         turn_messages,
                         "missing_tool_calls",
                         "模型声明使用工具，但响应中没有工具调用。",
+                        usage,
                     )
                     return
+
+                denied_results: dict[int, ToolExecutionResult] = {}
+                if self._permission_engine is not None and self._permission_session is not None:
+                    for position, call in enumerate(tool_calls):
+                        decision = await turn.run_child(
+                            self._permission_engine.evaluate(
+                                call,
+                                self._permission_session,
+                                allowed_access=allowed_access,
+                            )
+                        )
+                        if decision.action is PermissionAction.ALLOW:
+                            continue
+                        if decision.action is PermissionAction.ASK:
+                            turn.begin_approval()
+                            yield ToolApprovalRequested(
+                                round_number,
+                                position,
+                                decision,
+                            )
+                            choice = await turn.run_child(turn.consume_approval())
+                            if choice is ApprovalChoice.ALLOW_SESSION:
+                                self._permission_session.grant(decision.subject.session_key)
+                                continue
+                            if choice is ApprovalChoice.ALLOW_ONCE:
+                                continue
+                        denied_results[position] = _permission_denied_result(decision)
 
                 records: list[ToolExecutionRecord] = []
                 scheduled = self._scheduler.stream(
                     tool_calls,
                     self._context,
                     allowed_access,
+                    denied_results,
                 )
                 while True:
                     try:
@@ -199,6 +273,7 @@ class AgentLoop:
                         turn_messages,
                         "incomplete_tool_batch",
                         "工具批次没有产生完整结果。",
+                        usage,
                     )
                     return
 
@@ -224,6 +299,7 @@ class AgentLoop:
                             termination=AgentTermination.LIMIT_REACHED,
                             messages=tuple(turn_messages),
                             error_message=message,
+                            usage=usage,
                         )
                     )
                     yield AgentLimitReachedEvent(self._max_rounds, message)
@@ -237,6 +313,7 @@ class AgentLoop:
                     termination=AgentTermination.CANCELLED,
                     messages=tuple(turn_messages),
                     error_message=message,
+                    usage=usage,
                 )
             )
             yield AgentCancelledEvent(message)
@@ -246,6 +323,7 @@ class AgentLoop:
                 turn_messages,
                 error.code,
                 error.user_message,
+                usage,
             )
         except MessageAssemblyError:
             yield self._finish_error(
@@ -253,6 +331,7 @@ class AgentLoop:
                 turn_messages,
                 "invalid_response",
                 "模型响应结构无效，请重试。",
+                usage,
             )
         except Exception:
             yield self._finish_error(
@@ -260,6 +339,7 @@ class AgentLoop:
                 turn_messages,
                 "agent_internal_error",
                 "Agent 运行时发生内部错误。",
+                usage,
             )
 
     @staticmethod
@@ -268,6 +348,7 @@ class AgentLoop:
         messages: list[ChatMessage],
         code: str,
         message: str,
+        usage: TokenUsage,
     ) -> AgentErrorEvent:
         turn.complete(
             AgentTurnResult(
@@ -275,6 +356,7 @@ class AgentLoop:
                 messages=tuple(messages),
                 error_code=code,
                 error_message=message,
+                usage=usage,
             )
         )
         return AgentErrorEvent(code, message)
@@ -288,4 +370,20 @@ def _result_content(record: ToolExecutionRecord) -> str:
         },
         ensure_ascii=False,
         separators=(",", ":"),
+    )
+
+
+def _permission_denied_result(decision: object) -> ToolExecutionResult:
+    from ycode.security import PermissionDecision
+
+    if not isinstance(decision, PermissionDecision):
+        raise TypeError("权限拒绝结果必须来自 PermissionDecision")
+    return ToolExecutionResult(
+        content=decision.message,
+        is_error=True,
+        metadata={
+            "code": "permission_denied",
+            "reason_code": decision.reason_code,
+            "rule_id": decision.rule_id,
+        },
     )

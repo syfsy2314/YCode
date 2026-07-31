@@ -22,7 +22,10 @@ class RunCommandArguments(BaseModel):
 class RunCommandTool:
     definition = ToolDefinition(
         name="run_command",
-        description="在工作区目录内使用 PowerShell 执行命令，并返回退出码和输出。",
+        description=(
+            "在工作区目录内使用 PowerShell 执行命令，并返回退出码和输出；"
+            "存在专用文件或搜索工具时应优先使用专用工具。"
+        ),
         access=ToolAccess.WRITE,
         arguments_model=RunCommandArguments,
     )

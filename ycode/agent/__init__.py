@@ -17,6 +17,9 @@ from ycode.agent.events import (
     AgentThinkingDelta,
     FinalResponseEvent,
     ModeChangedEvent,
+    PermissionGrantsClearedEvent,
+    PermissionModeChangedEvent,
+    ToolApprovalRequested,
     ToolExecutionCancelled,
     ToolExecutionCompleted,
     ToolExecutionStarted,
@@ -24,7 +27,6 @@ from ycode.agent.events import (
 )
 from ycode.agent.loop import AgentLoop
 from ycode.agent.plain import PlainChatRunner
-from ycode.agent.prompt import SystemPromptBuilder
 
 __all__ = [
     "AgentCancelledEvent",
@@ -42,9 +44,11 @@ __all__ = [
     "ConversationRunner",
     "FinalResponseEvent",
     "ModeChangedEvent",
+    "PermissionGrantsClearedEvent",
+    "PermissionModeChangedEvent",
     "PlainChatRunner",
-    "SystemPromptBuilder",
     "ToolExecutionCancelled",
+    "ToolApprovalRequested",
     "ToolExecutionCompleted",
     "ToolExecutionStarted",
     "UserMessageEvent",

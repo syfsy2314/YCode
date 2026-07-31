@@ -94,17 +94,30 @@ if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
         PowerShellCommandRunner(),
     )
     executor = ToolExecutor(registry)
+    security_config = load_security_config(workspace, registry)
+    permission_session = PermissionSession(security_config.mode)
+    permission_engine = PermissionEngine(
+        registry,
+        resolver,
+        security_config,
+        PowerShellSafetyChecker(workspace),
+    )
     runner = AgentLoop(
         provider,
         registry,
         ToolScheduler(registry, executor),
-        SystemPromptBuilder(workspace),
+        build_builtin_prompt(),
+        PromptRuntimeContext(),
+        EnvironmentCollector(workspace),
         ToolContext(workspace),
+        permission_engine=permission_engine,
+        permission_session=permission_session,
     )
 else:
     runner = PlainChatRunner(provider)
+    permission_session = None
 
-session = ChatSession(runner)
+session = ChatSession(runner, permission_session)
 ~~~
 
 Anthropic 的对象关系：
@@ -117,7 +130,12 @@ TerminalUI
                     ├── ToolRegistry
                     ├── ToolScheduler
                     │       └── ToolExecutor
-                    ├── SystemPromptBuilder
+                    ├── PermissionEngine
+                    │       ├── PermissionSession
+                    │       └── PowerShellSafetyChecker
+                    ├── PromptBundle
+                    ├── PromptRuntimeContext
+                    ├── EnvironmentCollector
                     └── ToolContext
 ~~~
 
@@ -216,7 +234,8 @@ ToolCallComplete
 StreamEnd
 ~~~
 
-`StreamEvent` 只描述一次模型请求。`StreamEnd` 表示本次 Provider 响应结束，并不表示整次 Agent 对话已经结束。
+`StreamEvent` 只描述一次模型请求。`StreamEnd` 表示本次 Provider 响应结束，并不表示整次
+Agent 对话已经结束。它还携带当前请求的 `TokenUsage`。
 
 消费者使用 `isinstance()` 判断事件：
 
@@ -236,10 +255,13 @@ AgentLoop 或 PlainChatRunner 把 Provider 事件转换为供应商无关的 Age
 | UserMessageEvent | 当前用户消息 |
 | AgentThinkingDelta | 指定 Agent 轮次的 Thinking 增量 |
 | AgentTextDelta | 指定 Agent 轮次的文本增量 |
+| ToolApprovalRequested | 工具需要用户确认，携带权限决策和安全摘要 |
 | ToolExecutionStarted | 工具开始执行 |
 | ToolExecutionCompleted | 工具完成，携带完整执行记录 |
 | ToolExecutionCancelled | 已启动工具被取消 |
 | ModeChangedEvent | agent 与 plan-only 模式变化 |
+| PermissionModeChangedEvent | 权限模式查询或变化 |
+| PermissionGrantsClearedEvent | 会话授权已清除 |
 | FinalResponseEvent | Agent 正常完成后的最终回复 |
 | AgentLimitReachedEvent | 达到最大模型轮数 |
 | AgentCancelledEvent | 用户取消当前回合 |
@@ -264,7 +286,11 @@ TerminalUI 只消费 AgentEvent，不导入或判断 StreamEnd。
 Provider 是协议适配器，负责两个方向：
 
 ~~~text
-ChatMessage + system prompt + ToolDefinition
+AgentModelRequest
+    ├── 稳定 system_prompt
+    ├── 动态 supplements
+    ├── 真实 ChatMessage
+    └── ToolDefinition
     ↓
 供应商请求格式
 
@@ -273,7 +299,9 @@ ChatMessage + system prompt + ToolDefinition
 StreamEvent
 ~~~
 
-`ChatProvider` 是纯聊天接口；`AgentChatProvider` 在它的基础上增加可选的 `system_prompt` 和 `tools` 参数。
+`ChatProvider.stream_chat(messages)` 是纯聊天接口。`AgentChatProvider` 在其基础上增加
+`stream_agent(request)`，一次性接收供应商无关的 `AgentModelRequest`。这避免在
+Provider 方法签名中继续堆叠 system、工具、记忆等可选参数。
 
 AnthropicProvider 会把 ToolDefinition 转换成 Anthropic 顶层 `tools`：
 
@@ -336,6 +364,7 @@ class ConversationRunner(Protocol):
 
 - AgentEvent 异步迭代器。
 - 当前回合的取消入口。
+- 当前待审批工具的唯一选择提交入口。
 - 回合结束后 AgentTurnResult 的容器。
 
 Agent 对外只有四种终止结果：
@@ -355,8 +384,10 @@ ChatSession 负责：
 
 - 保存已经提交的对话历史。
 - 保存当前 AgentMode。
+- 保存可选的 PermissionSession。
 - 保证同一时间只有一个活动 AgentTurn。
-- 处理 `/plan` 和 `/agent`。
+- 处理 `/plan`、`/agent` 和 `/permission`。
+- 把终端审批选择转交给当前 AgentTurn。
 - 传播取消和关闭。
 - 根据 AgentTurnResult 决定提交或回滚。
 
@@ -410,6 +441,9 @@ async for event in session.stream_reply(user_text):
         renderer.append_text(event.text, event.round_number)
     elif isinstance(event, ToolExecutionStarted):
         renderer.add_tool_status(...)
+    elif isinstance(event, ToolApprovalRequested):
+        # 暂停普通 Ctrl+C 监听，进入三选一审批输入
+        ...
     elif isinstance(event, FinalResponseEvent):
         await renderer.complete(event.message)
 ~~~
@@ -423,20 +457,28 @@ UI 的展示原则：
 - 只有 FinalResponseEvent 携带的最后一轮消息进行 Markdown 渲染。
 - 上限、错误和取消都会停止计时与 Rich Live，并恢复输入。
 
-InputBox 的右下角显示当前模式。宽终端显示 `mode: agent` 或 `mode: plan-only`，窄终端会逐步降级，但优先保留模式信息。
+Anthropic 的 InputBox 右下角同时显示任务模式和权限模式。审批输入只有“拒绝、本次
+允许、本会话允许”三个选择；进入审批前会暂停普通 Ctrl+C 监听，避免两个输入应用竞争
+同一终端设备。OpenAI 没有装配权限会话，保持原有输入和命令行为。
 
 ### 8. 职责边界
 
 | 组件 | 职责 |
 |---|---|
-| AnthropicProvider / OpenAIProvider | 单次模型请求和协议转换 |
+| AnthropicProvider / OpenAIProvider | 单次模型请求和供应商协议转换 |
+| PromptBuilder / PromptBundle | 加载、校验和稳定排列内置提示词章节 |
+| PromptRuntimeContext | 管理模式提醒和会话级动态补充 |
+| EnvironmentCollector | 采集请求级环境与 Git 摘要 |
 | ResponseAssembler | 把单次 StreamEvent 流组装成 Assistant 消息 |
 | AgentLoop | 多轮判断、工具执行、结果回填和 Agent 终止 |
+| PermissionEngine | 工具执行前的硬边界、规则、会话授权和模式判定 |
+| PermissionSession | 当前权限模式和内存中的本会话授权 |
+| PowerShellSafetyChecker | 使用 PowerShell AST 识别已定义的危险命令 |
 | PlainChatRunner | 把单次纯聊天包装成 AgentTurn |
 | ToolRegistry | 登记工具并提供当前可用定义 |
-| ToolExecutor | 查找、权限、参数校验、超时和安全错误转换 |
-| ToolScheduler | 读取并发、写入屏障和执行事件 |
-| ChatSession | 历史、模式、活动回合和事务提交 |
+| ToolExecutor | 执行前再次查找、校验访问分类和参数，处理超时及工具错误 |
+| ToolScheduler | 合并预先拒绝结果，并保持读取并发和非读取屏障 |
+| ChatSession | 历史、任务模式、权限模式、活动回合和事务提交 |
 | TerminalUI | 消费 AgentEvent 并控制输入、取消与展示 |
 | Renderer | 多轮内容、工具摘要、计时和最终 Markdown |
 
@@ -444,6 +486,7 @@ InputBox 的右下角显示当前模式。宽终端显示 `mode: agent` 或 `mod
 
 ~~~text
 Provider 负责翻译一次响应
+Prompt System 负责决定发什么系统上下文
 Assembler 负责拼装一次响应
 AgentLoop 负责多轮行动
 Tool 系统负责执行本地能力
@@ -454,6 +497,131 @@ TerminalUI 负责交互与展示
 ### 面试表述
 
 YCode 使用两层供应商无关事件隔离职责：Provider 将 SDK SSE 转换为单次请求级 StreamEvent，AgentLoop 或 PlainChatRunner 再转换为整轮对话级 AgentEvent。ResponseAssembler 负责单次响应完整性，AgentLoop 负责 ReAct 循环和工具回填，ChatSession 只在 COMPLETED 后事务式提交整轮历史，TerminalUI 完全不感知 StreamEnd。
+
+## 提示词系统
+
+提示词系统的核心目标是把“长期稳定、适合缓存的内容”和“每轮可能变化的上下文”
+分开，同时保持动态内容的 system 语义。
+
+### 1. 五类请求内容
+
+`AgentModelRequest` 明确区分四个字段，当前用户输入已经包含在真实消息中：
+
+| 内容 | 字段 | 生命周期 |
+|---|---|---|
+| 内置全局指令 | `system_prompt` | 应用启动后稳定 |
+| 环境、模式、工具状态、记忆 | `supplements` | 请求级或会话级 |
+| 对话历史和当前输入 | `messages` | 由 Session 事务管理 |
+| 当前允许的工具定义 | `tools` | 随模式和工具状态变化 |
+
+动态补充不进入 `ChatMessage` 模型，也不会提交到 `ChatSession.history`。它们只在
+Provider 序列化时成为 system message；因此既不会伪装成用户请求，也不会在历史中
+无限累积。
+
+### 2. 稳定内置提示词
+
+六个 Markdown 章节位于 `ycode/prompt/resources/`：
+
+~~~text
+identity → behavior → tool-use → coding → safety → output
+   100        200         300        400       500      600
+~~~
+
+`PromptBuilder` 使用包资源 API 加载正文，`PromptBundle` 再按 `(priority, id)` 排序。
+章节 ID 必须是小写 kebab-case，优先级必须是非负整数，正文不能为空，重复 ID 会在
+启动时失败。相同资源重复构建会得到相同的 `content_blocks`。
+
+这些 Markdown 文件通过 `pyproject.toml` 的 package-data 进入 wheel，避免源码运行
+正常、安装后却找不到提示词资源。
+
+### 3. 动态补充和生命周期
+
+`SystemSupplement` 包含：
+
+- `kind`：environment、task mode、tool state、memory 或 reminder。
+- `scope`：`request` 或 `session`。
+- `content`：正文。
+
+发送前会渲染固定边界标签，例如：
+
+~~~text
+<environment_context>
+Workspace: D:\project
+Operating system: Windows
+...
+</environment_context>
+~~~
+
+`PromptRuntimeContext` 按补充类型保存会话级内容；同一类型的新内容会替换旧内容。
+请求级内容只参加当前 `begin_turn()`。首次用户任务或模式变化后的任务使用完整模式
+指令，其余任务只发送精简提醒，不维护“第几轮”的计数。
+
+`EnvironmentCollector` 每个用户任务采集一次工作区、操作系统、Shell、本地时间与时区。
+Git 通过两秒超时的只读 `git status --porcelain=v1 --branch` 获取分支和 staged、
+modified、untracked 数量。Git 缺失、超时、非仓库或解析失败时只省略 Git 字段，不阻止
+对话，也不会注入环境变量、diff 或完整文件列表。
+
+### 4. AgentLoop 的注入时机
+
+应用启动时只构建一次稳定 `PromptBundle`。每个普通用户任务开始时，`AgentLoop`：
+
+~~~text
+采集一次 EnvironmentSnapshot
+    ↓
+PromptRuntimeContext.begin_turn(mode, environment)
+    ↓
+得到带标签的 supplements
+    ↓
+创建 AgentModelRequest
+~~~
+
+同一用户任务中的多次工具轮次只扩展 `working_messages`，继续复用相同的
+`system_prompt`、`supplements` 和工具定义。这保证环境与模式提醒不会在一次 ReAct
+循环中重复生成。
+
+### 5. Anthropic 缓存与兼容降级
+
+AnthropicProvider 把稳定章节序列化为顶层 `system` 文本块，并在最后一个稳定块上设置：
+
+~~~json
+{"cache_control": {"type": "ephemeral", "ttl": "5m"}}
+~~~
+
+动态补充优先追加为 `messages` 中的 `role: system`。如果服务在响应流建立前明确返回
+“不支持 system message”的 400 错误，Provider 会把动态补充移到顶层 `system`，只重试
+一次，并在当前 Provider 生命周期内记住降级结果。降级不会把补充伪装成 user message，
+也不依赖硬编码模型名单。
+
+这里的职责边界是：
+
+~~~text
+Prompt System：决定发送什么内容和生命周期
+AgentLoop：决定每个用户任务何时生成、工具轮次何时复用
+AnthropicProvider：只做协议序列化、兼容重试和响应解析
+~~~
+
+### 6. TokenUsage
+
+`StreamEnd.usage` 使用供应商无关的 `TokenUsage`：
+
+| 字段 | 含义 |
+|---|---|
+| `input_tokens` | 普通输入量 |
+| `output_tokens` | 输出量 |
+| `cache_creation_input_tokens` | 写入缓存的输入量 |
+| `cache_read_input_tokens` | 从缓存读取的输入量 |
+
+缺失或无效字段按零或已有值处理。`ResponseAssembler` 保存单次请求用量，
+`AgentLoop` 使用加法汇总一个用户任务内所有工具轮次，最终写入
+`AgentTurnResult.usage`。当前 TUI 默认不展示这些统计。
+
+### 面试表述
+
+YCode 用 `PromptBundle` 保存确定性排序的稳定指令，用 `SystemSupplement` 表达带请求级
+或会话级生命周期的动态系统上下文，再通过 `AgentModelRequest` 与真实历史和工具定义
+分离。AgentLoop 每个用户任务生成一次动态上下文并在工具轮次复用；AnthropicProvider
+只负责缓存断点、system message 兼容降级和 usage 解析，因此提示词策略没有泄漏到
+供应商协议层。
 
 ## Anthropic SSE 流式链路
 
@@ -480,18 +648,17 @@ AgentLoop
 ### 1. 建立单次响应流
 
 ~~~python
-stream = await self.client.messages.create(
-    model=self._config.model,
-    max_tokens=16_000,
-    messages=self._messages(messages),
-    stream=True,
-    thinking=thinking_config,
-    system=system_prompt,
-    tools=tool_definitions,
+request = self._request(
+    model_request,
+    native_supplements=native_supplements,
 )
+stream = await self.client.messages.create(**request)
 ~~~
 
-`system` 和 `tools` 只在非空时加入请求。`await create()` 等待请求与响应流建立，不等待完整回答；随后使用 `async for` 逐个读取 SDK Event。
+`_request()` 负责把 `AgentModelRequest` 转成 Anthropic 请求结构。`system` 和 `tools`
+只在非空时加入请求。`await create()` 等待请求与响应流建立，不等待完整回答；随后使用
+`async for` 逐个读取 SDK Event。原生 system message 的兼容降级也只发生在这一步，
+不会在已经开始读取响应后重试。
 
 ### 2. Anthropic 原始事件映射
 
@@ -499,7 +666,7 @@ Provider 在单次请求内维护私有内容块状态，并按 index 关联事�
 
 | Anthropic 原始事件 | Provider 行为 | 公共事件 |
 |---|---|---|
-| message_start | 标记消息开始 | 无 |
+| message_start | 标记消息开始并读取输入、缓存用量 | 无 |
 | text_delta | 读取文本 | TextDelta |
 | thinking_delta | 累计并输出 Thinking | ThinkingDelta |
 | signature_delta | 只在 Provider 内累计 | 无 |
@@ -507,7 +674,7 @@ Provider 在单次请求内维护私有内容块状态，并按 index 关联事�
 | thinking block stop | 构造完整 ThinkingBlock | ThinkingComplete |
 | tool block start | 保存 ID 和名称 | ToolCallStart |
 | tool block stop | 解析完整参数 | ToolCallComplete |
-| message_delta | 保存停止原因 | 无 |
+| message_delta | 保存停止原因并更新输出用量 | 无 |
 | message_stop | 标记供应商响应完成 | 无 |
 | SDK 迭代器自然结束 | 验证响应完整 | StreamEnd |
 
@@ -603,7 +770,7 @@ ToolDefinition 保存：
 
 - 唯一工具名。
 - 描述。
-- READ 或 WRITE 分类。
+- READ、WRITE 或 UNKNOWN 分类。
 - 具体 Pydantic 参数模型。
 - 从参数模型生成并冻结的 JSON Schema。
 
@@ -620,7 +787,8 @@ Pydantic 参数模型同时是“发送给模型的参数 Schema”和“执行�
 | edit_file | WRITE | 使用原文唯一匹配替换文件内容 |
 | run_command | WRITE | 在工作区目录中执行 PowerShell |
 
-READ/WRITE 是本阶段固定的二级分类。`run_command` 不分析命令文本，统一视为 WRITE。
+六个内建工具都有可靠分类。`UNKNOWN` 为未来通过统一工具适配器接入、但暂时不能可靠
+分类的工具预留：它在所有权限模式下默认询问，并按非读取工具串行调度。
 
 ### 3. Registry、Executor 与 Scheduler
 
@@ -631,10 +799,10 @@ ToolRegistry
     登记工具、拒绝重名、按名称查找、导出当前允许的 ToolDefinition
         ↓
 ToolExecutor
-    查找 → 权限 → Pydantic 参数校验 → 超时 → 调用工具
+    查找 → allowed_access 复核 → Pydantic 参数校验 → 超时 → 调用工具
         ↓
 ToolScheduler
-    按 READ/WRITE 分类安排同一响应中的多个工具调用
+    合并 PermissionEngine 的拒绝结果，按访问分类安排允许的调用
 ~~~
 
 ToolExecutor 不让可预期错误直接抛出到 AgentLoop，而是转换成 ToolExecutionResult：
@@ -695,7 +863,133 @@ TextFileService 负责 UTF-8/BOM、换行规范化和同目录原子写入。Pow
 
 ### 面试表述
 
-YCode 的工具通过 Protocol 结构化满足统一接口，ToolDefinition 从 Pydantic 参数模型生成 Schema。Registry 负责发现，Executor 负责校验、权限、超时和错误归一化，Scheduler 负责连续读取并发及写入屏障。工具失败被包装成结构化结果回灌模型，因此模型可以调整，而不是让 Agent 直接崩溃。
+YCode 的工具通过 Protocol 结构化满足统一接口，ToolDefinition 从 Pydantic 参数模型
+生成 Schema。Registry 负责登记和发现，PermissionEngine 在调度前集中决定能否执行，
+Scheduler 负责连续读取并发及非读取屏障，Executor 负责最终参数校验、超时和错误归一
+化。工具拒绝或失败都会形成结构化结果回灌模型，而不是让 Agent 直接崩溃。
+
+## 工具权限安全系统
+
+权限系统的核心不是把安全判断散落到六个工具里，而是在 `AgentLoop` 与
+`ToolScheduler` 之间设置统一的执行前入口：
+
+~~~text
+模型返回 ToolCallBlock
+    ↓
+PermissionEngine 规范化并判定
+    ├── ALLOW：允许进入待执行批次
+    ├── DENY：生成预计算错误结果
+    └── ASK：发出 ToolApprovalRequested，严格等待用户
+    ↓
+整批权限判断完成
+    ↓
+ToolScheduler 合并拒绝结果并执行允许项
+    ↓
+按原始位置回填 ToolResultBlock
+~~~
+
+这个位置有两个好处：
+
+- 工具获得允许之前不会进入 Scheduler 或 Executor，因此没有提前副作用。
+- 拒绝仍然是普通工具结果，模型可以继续选择安全替代方案。
+
+### 1. 配置、会话与三档模式
+
+项目配置从当前工作区向上查找最近的 `.ycode/security.yaml`，启动时加载一次，并结合
+ToolRegistry 校验工具名和参数名。当前项目开发配置是：
+
+~~~yaml
+mode: allow
+rules: []
+~~~
+
+三档默认行为：
+
+| 模式 | 未命中规则的可靠分类工具 |
+|---|---|
+| strict | READ、WRITE 都询问 |
+| default | READ 允许，WRITE 询问 |
+| allow | READ、WRITE 都允许，包括 run_command |
+
+`UNKNOWN` 在三档模式下都询问。`/permission strict|default|allow` 只切换当前会话，
+`/permission clear` 只清除本会话授权；它们不请求模型、不进入历史、也不修改配置。
+永久规则只能手工写入项目配置。
+
+### 2. 固定判定顺序与不可覆盖边界
+
+`PermissionEngine.evaluate()` 的核心顺序以当前实现为准：
+
+~~~text
+工具查找与 Pydantic 参数校验
+    ↓
+真实路径规范化、审批摘要和 session_key
+    ↓
+run_command 的 PowerShell 危险命令检查
+    ↓
+当前任务模式 allowed_access（包括 plan-only）
+    ↓
+本会话允许
+    ↓
+项目规则按声明顺序首次命中
+    ↓
+strict / default / allow 默认值
+~~~
+
+路径通过 `WorkspacePathResolver` 解析真实目标：工作区内的符号链接和 Junction 可以
+使用，链接到工作区外、损坏或无法解析时拒绝。新写入目标检查真实父目录，所以不能靠
+链接或 `..` 绕过沙箱。
+
+`run_command` 先把原命令经 stdin 交给固定 PowerShell AST 解析脚本；解析进程只输出
+命令、参数和管道结构，不执行待检查命令。大范围删除、磁盘破坏、远程下载后执行、
+动态或编码执行、关机与启动破坏、高破坏性 Git、工作区外权限接管等类别会硬拒绝。
+解析失败也拒绝。
+
+危险命令、路径沙箱和 plan-only 访问边界不能被 allow 模式、项目 allow 规则或本会话
+允许覆盖。这是纵深防御中最重要的一层。
+
+### 3. 阻塞审批与会话授权
+
+ASK 时，`AgentTurnStream` 只创建一个待审批 Future：
+
+~~~text
+AgentLoop yield ToolApprovalRequested
+    ↓
+TerminalUI 停止普通输入监听，显示工具、原因和安全摘要
+    ↓
+用户选择拒绝 / 本次允许 / 本会话允许
+    ↓
+ChatSession.submit_approval()
+    ↓
+AgentTurnStream 唤醒 AgentLoop
+    ↓
+才开始检查下一项
+~~~
+
+一批工具必须全部审完才进入 Scheduler。Ctrl+C 会清空待审批槽并取消整个回合，当前及
+后续工具都不会启动。
+
+本会话允许不是只按工具名匹配，而是使用工具特定的安全键。例如 `run_command` 使用
+完整命令和真实 cwd，`write_file` 使用真实路径和 overwrite。读取分页参数、搜索结果
+上限和文件正文不会进入授权键；关键参数变化后会重新询问。UNKNOWN 使用完整规范化
+参数。授权只存内存，退出进程即消失。
+
+### 4. 与提示词及未来工具的边界
+
+当前权限模式通过请求级 `<tool_state>` 动态补充发送给模型，同一用户任务的工具轮次
+复用它。项目规则、危险命令细节和会话授权不会进入稳定 System Prompt、动态补充或
+对话历史，因此切换权限模式不会破坏稳定提示词缓存。
+
+安全层只依赖统一的 `ToolDefinition`、参数模型和 `ToolAccess`，不理解 MCP 协议。
+未来 MCP 工具经统一适配器包装成普通 Tool 后复用同一入口；无法可靠分类时标为
+UNKNOWN。
+
+### 面试表述
+
+YCode 在 AgentLoop 与 Scheduler 之间设置统一 PermissionEngine：先做参数和真实路径
+规范化，再执行不可覆盖的危险命令与任务模式检查，之后才看会话授权、项目规则和权限
+模式。ASK 通过 AgentEvent 和 AgentTurn 单一 Future 严格阻塞，整批审完后 Scheduler
+才执行；拒绝作为结构化 ToolResult 回填。这样既保留 ReAct 自我修正，也保证工具在
+获准前没有副作用。
 
 ## ReAct Agent Loop
 
@@ -704,15 +998,21 @@ YCode 的工具通过 Protocol 结构化满足统一接口，ToolDefinition 从 
 AgentLoop 的一轮是：
 
 ~~~text
-调用 Provider
+用稳定提示词、动态补充、消息和工具创建 AgentModelRequest
+    ↓
+调用 AgentChatProvider.stream_agent()
     ↓
 流式接收 StreamEvent
     ↓
 ResponseAssembler 组装 Assistant ChatMessage
     ↓
+累计本次请求的 TokenUsage
+    ↓
 检查 StopReason 与 ToolCallBlock
     ↓
-有工具：Scheduler 执行
+有工具：PermissionEngine 按位置判定，必要时阻塞审批
+    ↓
+Scheduler 合并拒绝结果并执行允许项
     ↓
 结果转成 ToolResultBlock
     ↓
@@ -792,11 +1092,12 @@ ChatSession 识别两个精确命令：
 - 产生 ModeChangedEvent。
 - 只在当前进程内保存。
 
-plan-only 有两层写入保护：
+plan-only 有三层保护：
 
 ~~~text
 第一层：Registry 只把 READ ToolDefinition 发给模型
-第二层：Executor 仍使用 allowed_access 拦截伪造的 WRITE 调用
+第二层：PermissionEngine 在调度前使用 allowed_access 硬拒绝 WRITE/UNKNOWN
+第三层：Executor 执行前再次使用 allowed_access 复核
 ~~~
 
 最终计划输出后不会自动退出 plan-only。OpenAI 使用 PlainChatRunner，不支持 plan-only；输入 `/plan` 会得到 unsupported_mode 错误且不会请求 Provider。
@@ -831,6 +1132,10 @@ AgentTurnStream 取消当前 active child
 Provider / Scheduler / ToolExecutor / CommandRunner
 ~~~
 
+等待工具审批时，普通 Ctrl+C 监听会暂停，由审批 InputBox 独占输入；Ctrl+C 直接取消
+待审批 Future 和整个 AgentTurn。这样既不会出现两个终端读取器竞争，也不会在取消后
+继续检查或启动批次中的后续工具。
+
 取消要求：
 
 - 不再启动新的工具或下一轮模型请求。
@@ -844,30 +1149,49 @@ Provider / Scheduler / ToolExecutor / CommandRunner
 
 ### 面试表述
 
-YCode 把整个用户回合作为会话事务：只有 COMPLETED 才提交历史，达到上限、用户取消和异常都丢弃临时消息。plan-only 同时限制模型可见工具和 Executor 执行权限。Ctrl+C 则沿 TerminalUI、Session、AgentTurn、Scheduler 一直传播到 PowerShell 进程树，清理后恢复输入。
+YCode 把整个用户回合作为会话事务：只有 COMPLETED 才提交历史，达到上限、用户取消
+和异常都丢弃临时消息。plan-only 同时限制模型可见工具，并由 PermissionEngine 与
+Executor 双重复核。Ctrl+C 可以取消模型流、阻塞审批、调度任务或 PowerShell 进程树，
+清理后恢复输入。
 
 ## 当前验证状态
 
-工具系统与 Agent Loop 已通过：
+提示词、工具权限、Agent Loop 与终端审批系统已通过：
 
 ~~~text
-完整 pytest：237 passed，1 skipped
-Windows PTY：14 passed
+完整 pytest：314 passed，2 skipped
+Windows ConPTY：17 passed
 Ruff format：通过
 Ruff check：通过
 compileall：通过
-两个 CLI help：通过
+wheel 构建及提示词资源检查：通过
 ~~~
 
-唯一跳过项是文件符号链接越界测试：当前 Windows 环境没有创建符号链接的权限。使用相同工作区边界逻辑的 Junction 越界测试已经通过。
+两个跳过项都是符号链接测试：当前 Windows 环境没有创建符号链接的权限。使用相同
+工作区边界逻辑的 Junction 越界测试已经通过。
 
 验证覆盖：
 
-- 六个工具的真实 Windows PTY 执行。
+- 六个稳定提示词章节的排序、校验、源码加载和 wheel 打包。
+- 环境快照、请求级/会话级补充及完整/精简模式提醒。
+- Anthropic 稳定缓存断点、动态 system message、单次降级和能力记忆。
+- 输入、输出、缓存创建、缓存读取用量解析及 Agent 多轮汇总。
+- 六个工具的真实 Windows ConPTY 执行。
 - Anthropic 两个工具轮后的结果回填与最终回复。
 - OpenAI 纯聊天请求不包含工具字段。
 - READ 并发和 WRITE 屏障。
+- 三档权限模式、项目规则、真实路径规范化和工具特定会话授权键。
+- PowerShell AST 解析、危险命令硬拒绝与安全反例。
+- 阻塞审批的拒绝、本次允许、本会话允许、参数变化重询和 clear。
+- 权限模式动态 `<tool_state>` 补充不改变稳定 System Prompt。
 - plan-only 工具过滤与执行边界拦截。
 - 10 轮上限。
 - 活动 PowerShell 命令 Ctrl+C 取消和历史回滚。
+- 审批期间 Ctrl+C 取消整批且不启动后续工具。
 - Provider 错误恢复、最终 Markdown 和窄终端布局。
+
+仍需人工完成：
+
+- 使用固定任务观察真实模型的工具选择、修改前读取、模式遵守和输出风格。
+- 使用真实 Anthropic API 验证首次缓存创建及后续缓存读取；步骤见
+  `docs/manual-api-test.md`。

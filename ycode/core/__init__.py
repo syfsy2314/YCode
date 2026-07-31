@@ -7,6 +7,7 @@ from ycode.core.events import (
     TextDelta,
     ThinkingComplete,
     ThinkingDelta,
+    TokenUsage,
     ToolCallComplete,
     ToolCallDelta,
     ToolCallStart,
@@ -24,10 +25,11 @@ from ycode.core.messages import (
     freeze_json,
     thaw_json,
 )
-from ycode.core.provider import AgentChatProvider, ChatProvider
+from ycode.core.provider import AgentChatProvider, AgentModelRequest, ChatProvider
 
 __all__ = [
     "AgentChatProvider",
+    "AgentModelRequest",
     "ChatMessage",
     "ChatProvider",
     "ContentBlock",
@@ -42,6 +44,7 @@ __all__ = [
     "ThinkingBlock",
     "ThinkingComplete",
     "ThinkingDelta",
+    "TokenUsage",
     "ToolCallBlock",
     "ToolCallComplete",
     "ToolCallDelta",

@@ -9,6 +9,7 @@ from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.input.base import Input
+from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.defaults import load_key_bindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import (
@@ -28,6 +29,7 @@ from prompt_toolkit.output.base import Output
 from rich.console import Console
 
 from ycode.agent import AgentMode
+from ycode.security import ApprovalChoice, PermissionDecision, PermissionMode
 from ycode.ui.styles import (
     DEFAULT_INPUT_BORDER_STYLE,
     InputBorderStyle,
@@ -40,8 +42,14 @@ PLACEHOLDER = "Send a message..."
 HELP_HINT = "? for help"
 
 
-def format_hint(width: int, mode: AgentMode) -> str:
+def format_hint(
+    width: int,
+    mode: AgentMode,
+    permission_mode: PermissionMode | None = None,
+) -> str:
     full_mode = f"mode: {mode.value}"
+    if permission_mode is not None:
+        full_mode += f"  permission: {permission_mode.value}"
     if width >= len(HELP_HINT) + len(full_mode) + 1:
         return f"{HELP_HINT}{' ' * (width - len(HELP_HINT) - len(full_mode))}{full_mode}"
     if width >= len(full_mode):
@@ -83,6 +91,7 @@ class InputBox:
         self,
         width: int,
         mode: AgentMode = AgentMode.AGENT,
+        permission_mode: PermissionMode | None = None,
     ) -> Application[str]:
         indicator = UNICODE_INDICATOR if self._unicode_supported else ASCII_INDICATOR
 
@@ -128,7 +137,14 @@ class InputBox:
         )
         hint_window = Window(
             content=FormattedTextControl(
-                FormattedText([("class:input-hint", format_hint(width, mode))])
+                FormattedText(
+                    [
+                        (
+                            "class:input-hint",
+                            format_hint(width, mode, permission_mode),
+                        )
+                    ]
+                )
             ),
             width=exact_width,
             height=1,
@@ -147,9 +163,66 @@ class InputBox:
             output=self._output,
         )
 
-    async def read(self, mode: AgentMode = AgentMode.AGENT) -> str:
+    async def read(
+        self,
+        mode: AgentMode = AgentMode.AGENT,
+        permission_mode: PermissionMode | None = None,
+    ) -> str:
         width = max(1, min(self._console.width - 1, 100))
-        return await self._create_application(width, mode).run_async()
+        return await self._create_application(
+            width,
+            mode,
+            permission_mode,
+        ).run_async()
+
+    async def read_approval(self, decision: PermissionDecision) -> ApprovalChoice:
+        self._console.print(
+            f"\n工具审批：{decision.subject.call.name}\n"
+            f"原因：{decision.message}\n"
+            f"{decision.subject.approval_summary}\n"
+            "[1] 拒绝  [2] 本次允许  [3] 本会话允许"
+        )
+        bindings = KeyBindings()
+
+        @bindings.add("1")
+        def deny(event) -> None:
+            event.app.exit(result=ApprovalChoice.DENY)
+
+        @bindings.add("2")
+        def allow_once(event) -> None:
+            event.app.exit(result=ApprovalChoice.ALLOW_ONCE)
+
+        @bindings.add("3")
+        def allow_session(event) -> None:
+            event.app.exit(result=ApprovalChoice.ALLOW_SESSION)
+
+        @bindings.add("c-c")
+        def cancel(event) -> None:
+            event.app.exit(exception=KeyboardInterrupt())
+
+        application: Application[ApprovalChoice] = Application(
+            layout=Layout(
+                Window(
+                    FormattedTextControl(
+                        FormattedText(
+                            [
+                                (
+                                    "class:input-hint",
+                                    "请选择 1、2 或 3（Ctrl+C 取消）",
+                                )
+                            ]
+                        )
+                    )
+                )
+            ),
+            key_bindings=bindings,
+            style=create_prompt_style(self._border_style),
+            full_screen=False,
+            erase_when_done=True,
+            input=self._input,
+            output=self._output,
+        )
+        return await application.run_async()
 
     async def wait_for_interrupt(self) -> None:
         """响应期间只监听 Ctrl+C，不接受普通文本输入。"""

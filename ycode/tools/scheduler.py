@@ -2,7 +2,7 @@
 
 import asyncio
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 
 from ycode.core.messages import ToolCallBlock
@@ -10,6 +10,7 @@ from ycode.tools.contracts import (
     ToolAccess,
     ToolContext,
     ToolExecutionRecord,
+    ToolExecutionResult,
 )
 from ycode.tools.executor import ToolExecutor
 from ycode.tools.registry import ToolRegistry
@@ -45,7 +46,9 @@ class ToolScheduler:
         calls: Sequence[ToolCallBlock],
         context: ToolContext,
         allowed_access: frozenset[ToolAccess],
+        denied_results: Mapping[int, ToolExecutionResult] | None = None,
     ) -> AsyncIterator[ScheduledToolEvent]:
+        denials = denied_results or {}
         position = 0
         while position < len(calls):
             if self._is_read(calls[position]):
@@ -58,6 +61,7 @@ class ToolScheduler:
                     end,
                     context,
                     allowed_access,
+                    denials,
                 ):
                     yield event
                 position = end
@@ -66,7 +70,13 @@ class ToolScheduler:
             call = calls[position]
             yield ScheduledToolStarted(position, call)
             try:
-                record = await self._execute_one(position, call, context, allowed_access)
+                record = await self._execute_one(
+                    position,
+                    call,
+                    context,
+                    allowed_access,
+                    denials,
+                )
             except asyncio.CancelledError:
                 yield ScheduledToolCancelled(position, call)
                 raise
@@ -84,12 +94,21 @@ class ToolScheduler:
         end: int,
         context: ToolContext,
         allowed_access: frozenset[ToolAccess],
+        denied_results: Mapping[int, ToolExecutionResult],
     ) -> AsyncIterator[ScheduledToolEvent]:
         completion_queue: asyncio.Queue[asyncio.Task[ToolExecutionRecord]] = asyncio.Queue()
         tasks: dict[asyncio.Task[ToolExecutionRecord], tuple[int, ToolCallBlock]] = {}
         for position in range(start, end):
             call = calls[position]
-            task = asyncio.create_task(self._execute_one(position, call, context, allowed_access))
+            task = asyncio.create_task(
+                self._execute_one(
+                    position,
+                    call,
+                    context,
+                    allowed_access,
+                    denied_results,
+                )
+            )
             tasks[task] = (position, call)
             task.add_done_callback(completion_queue.put_nowait)
             yield ScheduledToolStarted(position, call)
@@ -117,7 +136,16 @@ class ToolScheduler:
         call: ToolCallBlock,
         context: ToolContext,
         allowed_access: frozenset[ToolAccess],
+        denied_results: Mapping[int, ToolExecutionResult],
     ) -> ToolExecutionRecord:
+        denied = denied_results.get(position)
+        if denied is not None:
+            return ToolExecutionRecord(
+                position=position,
+                call=call,
+                result=denied,
+                elapsed_seconds=0,
+            )
         started_at = time.perf_counter()
         result = await self._executor.execute(call, context, allowed_access)
         return ToolExecutionRecord(

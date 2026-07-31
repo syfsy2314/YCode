@@ -10,7 +10,6 @@ from ycode.agent import (
     AgentTextDelta,
     FinalResponseEvent,
     PlainChatRunner,
-    SystemPromptBuilder,
 )
 from ycode.config.models import ProviderConfig
 from ycode.core import (
@@ -21,6 +20,7 @@ from ycode.core import (
     ThinkingBlock,
     ThinkingComplete,
     ThinkingDelta,
+    TokenUsage,
     ToolCallBlock,
     ToolCallComplete,
     ToolCallDelta,
@@ -29,6 +29,7 @@ from ycode.core import (
 )
 from ycode.core.messages import ChatMessage
 from ycode.errors import ProviderError
+from ycode.prompt import EnvironmentCollector, PromptRuntimeContext, build_builtin_prompt
 from ycode.providers.anthropic import AnthropicProvider
 from ycode.session.assembler import ResponseAssembler
 from ycode.session.chat import ChatSession
@@ -176,12 +177,19 @@ def agent_session(workspace: Path, server: SSETestServer) -> ChatSession:
         TextFileService(),
         PowerShellCommandRunner(),
     )
+
+    async def no_git(path: Path) -> None:
+        del path
+        return None
+
     return ChatSession(
         AgentLoop(
             AnthropicProvider(config(server)),
             registry,
             ToolScheduler(registry, ToolExecutor(registry)),
-            SystemPromptBuilder(workspace),
+            build_builtin_prompt(),
+            PromptRuntimeContext(),
+            EnvironmentCollector(workspace, git_runner=no_git),
             ToolContext(workspace),
         )
     )
@@ -225,11 +233,42 @@ async def test_agent_loop_reinjects_two_tool_results_before_final_response(
         "glob",
         "grep",
     ]
-    assert "Workspace:" in first["system"]
-    assert second["messages"][-2]["content"][0]["id"] == "read-1"
-    assert second["messages"][-1]["content"][0]["tool_use_id"] == "read-1"
-    assert third["messages"][-2]["content"][0]["id"] == "glob-1"
-    assert third["messages"][-1]["content"][0]["tool_use_id"] == "glob-1"
+    assert any(
+        message["role"] == "system" and "Workspace:" in message["content"]
+        for message in first["messages"]
+    )
+    second_tool_calls = [
+        block
+        for message in second["messages"]
+        if message["role"] == "assistant" and isinstance(message["content"], list)
+        for block in message["content"]
+        if block["type"] == "tool_use"
+    ]
+    second_tool_results = [
+        block
+        for message in second["messages"]
+        if message["role"] == "user" and isinstance(message["content"], list)
+        for block in message["content"]
+        if block["type"] == "tool_result"
+    ]
+    third_tool_calls = [
+        block
+        for message in third["messages"]
+        if message["role"] == "assistant" and isinstance(message["content"], list)
+        for block in message["content"]
+        if block["type"] == "tool_use"
+    ]
+    third_tool_results = [
+        block
+        for message in third["messages"]
+        if message["role"] == "user" and isinstance(message["content"], list)
+        for block in message["content"]
+        if block["type"] == "tool_result"
+    ]
+    assert second_tool_calls[-1]["id"] == "read-1"
+    assert second_tool_results[-1]["tool_use_id"] == "read-1"
+    assert third_tool_calls[-1]["id"] == "glob-1"
+    assert third_tool_results[-1]["tool_use_id"] == "glob-1"
 
 
 @pytest.mark.asyncio
@@ -278,7 +317,13 @@ async def test_official_sdk_sends_agent_system_and_tools(sse_server: SSETestServ
 
     assert isinstance(result[-1], StreamEnd)
     request = sse_server.requests[0].json
-    assert request["system"] == "minimal prompt"
+    assert request["system"] == [
+        {
+            "type": "text",
+            "text": "minimal prompt",
+            "cache_control": {"type": "ephemeral", "ttl": "5m"},
+        }
+    ]
     assert request["tools"] == [
         {
             "name": "read_file",
@@ -286,6 +331,7 @@ async def test_official_sdk_sends_agent_system_and_tools(sse_server: SSETestServ
             "input_schema": ReadArguments.model_json_schema(),
         }
     ]
+    assert result[-1].usage == TokenUsage(input_tokens=2, output_tokens=2)
 
 
 @pytest.mark.asyncio

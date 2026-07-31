@@ -3,6 +3,7 @@
 import json
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
 
 import anthropic
@@ -16,6 +17,7 @@ from ycode.core.events import (
     TextDelta,
     ThinkingComplete,
     ThinkingDelta,
+    TokenUsage,
     ToolCallComplete,
     ToolCallDelta,
     ToolCallStart,
@@ -29,6 +31,7 @@ from ycode.core.messages import (
     ToolResultBlock,
     thaw_json,
 )
+from ycode.core.provider import AgentModelRequest
 from ycode.errors import ProviderError
 from ycode.tools.contracts import ToolDefinition
 
@@ -44,6 +47,48 @@ def _field(value: object, name: str, default: object = None) -> object:
 def _string_field(value: object, name: str) -> str:
     result = _field(value, name, "")
     return result if isinstance(result, str) else ""
+
+
+def _usage_int(value: object, name: str) -> int | None:
+    result = _field(value, name)
+    if isinstance(result, int) and not isinstance(result, bool) and result >= 0:
+        return result
+    return None
+
+
+def _merge_usage(current: TokenUsage, value: object) -> TokenUsage:
+    if value is None:
+        return current
+    input_tokens = _usage_int(value, "input_tokens")
+    output_tokens = _usage_int(value, "output_tokens")
+    cache_read = _usage_int(value, "cache_read_input_tokens")
+    cache_creation = _usage_int(value, "cache_creation_input_tokens")
+    if cache_creation is None:
+        detail = _field(value, "cache_creation")
+        if isinstance(detail, Mapping):
+            parts = [
+                item
+                for item in detail.values()
+                if isinstance(item, int) and not isinstance(item, bool) and item >= 0
+            ]
+            if parts:
+                cache_creation = sum(parts)
+    return TokenUsage(
+        input_tokens=(input_tokens if input_tokens is not None else current.input_tokens),
+        output_tokens=(output_tokens if output_tokens is not None else current.output_tokens),
+        cache_creation_input_tokens=(
+            cache_creation if cache_creation is not None else current.cache_creation_input_tokens
+        ),
+        cache_read_input_tokens=(
+            cache_read if cache_read is not None else current.cache_read_input_tokens
+        ),
+    )
+
+
+class _SystemMessageCapability(StrEnum):
+    UNKNOWN = "unknown"
+    NATIVE = "native"
+    FALLBACK = "fallback"
 
 
 @dataclass(slots=True)
@@ -88,9 +133,13 @@ class AnthropicProvider:
             max_retries=0,
         )
         self._closed = False
+        self._system_message_capability = _SystemMessageCapability.UNKNOWN
 
     @staticmethod
-    def _messages(messages: Sequence[ChatMessage]) -> list[dict[str, Any]]:
+    def _messages(
+        messages: Sequence[ChatMessage],
+        supplements: Sequence[str] = (),
+    ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         for message in messages:
             if len(message.content) == 1 and isinstance(message.content[0], TextBlock):
@@ -135,6 +184,18 @@ class AnthropicProvider:
                         value["is_error"] = True
                     blocks.append(value)
             result.append({"role": message.role, "content": blocks})
+        result.extend({"role": "system", "content": content} for content in supplements)
+        return result
+
+    @staticmethod
+    def _system(
+        stable_blocks: Sequence[str],
+        dynamic_blocks: Sequence[str] = (),
+    ) -> list[dict[str, Any]]:
+        result = [{"type": "text", "text": text} for text in stable_blocks]
+        if result:
+            result[-1]["cache_control"] = {"type": "ephemeral", "ttl": "5m"}
+        result.extend({"type": "text", "text": text} for text in dynamic_blocks)
         return result
 
     @staticmethod
@@ -157,6 +218,47 @@ class AnthropicProvider:
             }
             for definition in definitions
         ]
+
+    @staticmethod
+    def _unsupported_system_message(error: Exception) -> bool:
+        if not isinstance(error, anthropic.BadRequestError):
+            return False
+        body = getattr(error, "body", None)
+        detail = f"{error} {json.dumps(body, ensure_ascii=False, default=str)}".lower()
+        unsupported = (
+            "not supported" in detail or "unsupported" in detail or "invalid role" in detail
+        )
+        return "system" in detail and ("role" in detail or "messages" in detail) and unsupported
+
+    def _request(
+        self,
+        model_request: AgentModelRequest,
+        *,
+        native_supplements: bool,
+    ) -> dict[str, Any]:
+        request: dict[str, Any] = {
+            "model": self._config.model,
+            "max_tokens": MAX_TOKENS,
+            "messages": self._messages(
+                model_request.messages,
+                model_request.supplements if native_supplements else (),
+            ),
+            "stream": True,
+        }
+        request["thinking"] = (
+            {"type": "adaptive", "display": "summarized"}
+            if self._config.thinking
+            else {"type": "disabled"}
+        )
+        system = self._system(
+            model_request.system_prompt,
+            () if native_supplements else model_request.supplements,
+        )
+        if system:
+            request["system"] = system
+        if model_request.tools:
+            request["tools"] = self._tools(model_request.tools)
+        return request
 
     @staticmethod
     def _provider_error(error: Exception) -> ProviderError:
@@ -187,28 +289,53 @@ class AnthropicProvider:
         system_prompt: str = "",
         tools: Sequence[ToolDefinition[Any]] = (),
     ) -> AsyncIterator[StreamEvent]:
-        request: dict[str, Any] = {
-            "model": self._config.model,
-            "max_tokens": MAX_TOKENS,
-            "messages": self._messages(messages),
-            "stream": True,
-        }
-        request["thinking"] = (
-            {"type": "adaptive", "display": "summarized"}
-            if self._config.thinking
-            else {"type": "disabled"}
+        model_request = AgentModelRequest(
+            messages=tuple(messages),
+            system_prompt=(system_prompt,) if system_prompt else (),
+            tools=tuple(tools),
         )
-        if system_prompt:
-            request["system"] = system_prompt
-        if tools:
-            request["tools"] = self._tools(tools)
+        async for event in self.stream_agent(model_request):
+            yield event
 
+    async def stream_agent(
+        self,
+        model_request: AgentModelRequest,
+    ) -> AsyncIterator[StreamEvent]:
+        if not isinstance(model_request, AgentModelRequest):
+            raise TypeError("Anthropic Agent 请求必须是 AgentModelRequest")
+        native_supplements = bool(model_request.supplements) and (
+            self._system_message_capability is not _SystemMessageCapability.FALLBACK
+        )
+        request = self._request(
+            model_request,
+            native_supplements=native_supplements,
+        )
         message_started = False
         completed = False
         provider_reason = ""
+        usage = TokenUsage()
         blocks: dict[int, _BlockState] = {}
         try:
-            stream = await self.client.messages.create(**request)
+            try:
+                stream = await self.client.messages.create(**request)
+            except Exception as error:
+                if (
+                    native_supplements
+                    and self._system_message_capability is _SystemMessageCapability.UNKNOWN
+                    and self._unsupported_system_message(error)
+                ):
+                    self._system_message_capability = _SystemMessageCapability.FALLBACK
+                    request = self._request(model_request, native_supplements=False)
+                    stream = await self.client.messages.create(**request)
+                else:
+                    raise
+            else:
+                if (
+                    native_supplements
+                    and self._system_message_capability is _SystemMessageCapability.UNKNOWN
+                ):
+                    self._system_message_capability = _SystemMessageCapability.NATIVE
+
             async for event in stream:
                 event_type = str(_field(event, "type", ""))
                 if completed:
@@ -225,6 +352,8 @@ class AnthropicProvider:
                             False,
                         )
                     message_started = True
+                    message = _field(event, "message")
+                    usage = _merge_usage(usage, _field(message, "usage"))
                     continue
 
                 if event_type == "content_block_start":
@@ -427,6 +556,7 @@ class AnthropicProvider:
                     delta = _field(event, "delta")
                     value = _field(delta, "stop_reason", "")
                     provider_reason = "" if value is None else str(value)
+                    usage = _merge_usage(usage, _field(event, "usage"))
                     continue
 
                 if event_type == "message_stop":
@@ -450,7 +580,7 @@ class AnthropicProvider:
 
         if not completed:
             raise ProviderError("stream", "Anthropic 响应流意外结束，请重试。", True)
-        yield StreamEnd(self._stop_reason(provider_reason), provider_reason)
+        yield StreamEnd(self._stop_reason(provider_reason), provider_reason, usage)
 
     async def close(self) -> None:
         if self._closed:

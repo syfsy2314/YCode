@@ -34,6 +34,9 @@ where = ["."]
 include = ["ycode*"]
 exclude = ["tests*"]
 
+[tool.setuptools.package-data]
+"ycode.prompt.resources" = ["*.md"]
+
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
 asyncio_mode = "auto"

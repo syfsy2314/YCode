@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from ycode.agent.contracts import AgentMode
 from ycode.core.messages import ChatMessage, ToolCallBlock
+from ycode.security.models import PermissionDecision, PermissionMode
 from ycode.tools.contracts import ToolExecutionRecord
 
 
@@ -66,6 +67,19 @@ class ToolExecutionStarted:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolApprovalRequested:
+    round_number: int
+    position: int
+    decision: PermissionDecision
+
+    def __post_init__(self) -> None:
+        _validate_round(self.round_number)
+        _validate_position(self.position)
+        if not isinstance(self.decision, PermissionDecision):
+            raise TypeError("工具审批事件必须携带权限决策")
+
+
+@dataclass(frozen=True, slots=True)
 class ToolExecutionCompleted:
     round_number: int
     record: ToolExecutionRecord
@@ -97,6 +111,31 @@ class ModeChangedEvent:
     def __post_init__(self) -> None:
         if not isinstance(self.previous_mode, AgentMode) or not isinstance(self.mode, AgentMode):
             raise TypeError("模式事件必须携带 AgentMode")
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionModeChangedEvent:
+    previous_mode: PermissionMode
+    mode: PermissionMode
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.previous_mode, PermissionMode) or not isinstance(
+            self.mode, PermissionMode
+        ):
+            raise TypeError("权限模式事件必须携带 PermissionMode")
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionGrantsClearedEvent:
+    cleared_count: int
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.cleared_count, int)
+            or isinstance(self.cleared_count, bool)
+            or self.cleared_count < 0
+        ):
+            raise ValueError("清除的会话授权数量必须是非负整数")
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,10 +186,13 @@ type AgentEvent = (
     UserMessageEvent
     | AgentThinkingDelta
     | AgentTextDelta
+    | ToolApprovalRequested
     | ToolExecutionStarted
     | ToolExecutionCompleted
     | ToolExecutionCancelled
     | ModeChangedEvent
+    | PermissionModeChangedEvent
+    | PermissionGrantsClearedEvent
     | FinalResponseEvent
     | AgentLimitReachedEvent
     | AgentCancelledEvent

@@ -25,7 +25,10 @@ class EditFileArguments(BaseModel):
 class EditFileTool:
     definition = ToolDefinition(
         name="edit_file",
-        description="按字面原文唯一匹配编辑 UTF-8 文件，并保留 BOM 与换行风格。",
+        description=(
+            "按字面原文唯一匹配编辑 UTF-8 文件，并保留 BOM 与换行风格；"
+            "编辑前必须先使用 read_file 读取目标内容。"
+        ),
         access=ToolAccess.WRITE,
         arguments_model=EditFileArguments,
     )

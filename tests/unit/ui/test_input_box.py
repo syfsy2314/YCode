@@ -9,6 +9,14 @@ from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
 from ycode.agent import AgentMode
+from ycode.core.messages import ToolCallBlock
+from ycode.security import (
+    ApprovalChoice,
+    PermissionAction,
+    PermissionDecision,
+    PermissionMode,
+    PermissionSubject,
+)
 from ycode.ui.input_box import (
     ASCII_INDICATOR,
     HELP_HINT,
@@ -95,6 +103,11 @@ def test_hint_places_mode_on_right_and_prioritizes_it_when_narrow() -> None:
     assert format_hint(15, AgentMode.PLAN_ONLY) == "mode: plan-only"
     assert format_hint(9, AgentMode.PLAN_ONLY) == "plan-only"
     assert format_hint(1, AgentMode.PLAN_ONLY) == "P"
+    assert "permission: strict" in format_hint(
+        60,
+        AgentMode.AGENT,
+        PermissionMode.STRICT,
+    )
 
 
 @pytest.mark.asyncio
@@ -123,3 +136,29 @@ async def test_question_mark_is_plain_input() -> None:
         pipe_input.send_text("?\r")
 
         assert await box.read() == "?"
+
+
+@pytest.mark.asyncio
+async def test_approval_accepts_only_direct_three_way_choice() -> None:
+    subject = PermissionSubject(
+        ToolCallBlock("call-1", "run_command", {"command": "git status"}),
+        {"command": "git status", "cwd": "."},
+        {"tool": "run_command", "command": "git status", "cwd": "."},
+        "command:\ngit status",
+    )
+    decision = PermissionDecision(
+        PermissionAction.ASK,
+        subject,
+        "mode_default",
+        "需要用户确认。",
+    )
+    with create_pipe_input() as pipe_input:
+        box = InputBox(
+            console=console(),
+            unicode_supported=True,
+            input=pipe_input,
+            output=DummyOutput(),
+        )
+        pipe_input.send_text("2")
+
+        assert await box.read_approval(decision) is ApprovalChoice.ALLOW_ONCE

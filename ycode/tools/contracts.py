@@ -19,6 +19,7 @@ class ToolAccess(StrEnum):
 
     READ = "read"
     WRITE = "write"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True, slots=True)

@@ -444,6 +444,9 @@ def test_windows_terminal_agent_executes_six_tools(
         output = reader.wait_for("mode: agen", timeout=15)
         assert "Send a message..." in output
         process.write("use every tool\r")
+        for approval_tool in ("write_file", "edit_file", "run_command"):
+            reader.wait_for(f"工具审批：{approval_tool}", timeout=20)
+            process.write("2")
         for tool_name in (
             "read_file",
             "glob",
@@ -468,7 +471,13 @@ def test_windows_terminal_agent_executes_six_tools(
 
     assert (project / "new.txt").read_text(encoding="utf-8") == "after\n"
     assert len(sse_server.requests) == 2
-    tool_results = sse_server.requests[1].json["messages"][-1]["content"]
+    tool_results = [
+        block
+        for message in sse_server.requests[1].json["messages"]
+        if message["role"] == "user" and isinstance(message["content"], list)
+        for block in message["content"]
+        if block["type"] == "tool_result"
+    ]
     assert [result["tool_use_id"] for result in tool_results] == [
         "read-1",
         "glob-1",
@@ -477,6 +486,169 @@ def test_windows_terminal_agent_executes_six_tools(
         "edit-1",
         "command-1",
     ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
+def test_windows_terminal_dangerous_command_is_denied_without_approval(
+    tmp_path: Path,
+    sse_server: SSETestServer,
+) -> None:
+    project = tmp_path / "dangerous-command"
+    project.mkdir()
+    sse_server.enqueue(
+        anthropic_tool_response(
+            [
+                (
+                    "danger-1",
+                    "run_command",
+                    {"command": "git reset --hard HEAD~1"},
+                )
+            ]
+        )
+    )
+    sse_server.enqueue(anthropic_text_response("dangerous command refused"))
+    write_anthropic_config(
+        project / ".ycode" / "config.yaml",
+        sse_server,
+        thinking=False,
+    )
+    process, reader = spawn_ycode(project)
+    try:
+        reader.wait_for("Send a message...", timeout=15)
+        process.write("/permission strict\r")
+        reader.wait_for("permission: strict", timeout=15)
+        reader.wait_for("Send a message...", timeout=15, count=2)
+        assert sse_server.requests == []
+        process.write("/permission allow\r")
+        reader.wait_for("permission: allow", timeout=15)
+        reader.wait_for("Send a message...", timeout=15, count=3)
+        assert sse_server.requests == []
+        process.write("run a dangerous command\r")
+        output = reader.wait_for("禁止高破坏性 Git 操作", timeout=20)
+        reader.wait_for("dangerous command refused", timeout=20)
+        reader.wait_for("Send a message...", timeout=15, count=4)
+        assert "工具审批：run_command" not in output
+        process.write("/exit\r")
+        wait_for_exit(process)
+        assert "Traceback" not in reader.snapshot()
+    finally:
+        stop_process(process)
+
+    assert len(sse_server.requests) == 2
+    result = next(
+        block
+        for message in sse_server.requests[1].json["messages"]
+        if message["role"] == "user" and isinstance(message["content"], list)
+        for block in message["content"]
+        if block["type"] == "tool_result"
+    )
+    assert result["is_error"] is True
+    assert "permission_denied" in result["content"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
+def test_windows_terminal_session_grant_reuse_change_and_clear(
+    tmp_path: Path,
+    sse_server: SSETestServer,
+) -> None:
+    project = tmp_path / "session-grant"
+    project.mkdir()
+    for call_id, command, final_text in (
+        ("run-1", "Write-Output one", "first command done"),
+        ("run-2", "Write-Output one", "second command done"),
+        ("run-3", "Write-Output two", "changed command refused"),
+    ):
+        sse_server.enqueue(
+            anthropic_tool_response([(call_id, "run_command", {"command": command})])
+        )
+        sse_server.enqueue(anthropic_text_response(final_text))
+    write_anthropic_config(
+        project / ".ycode" / "config.yaml",
+        sse_server,
+        thinking=False,
+    )
+    process, reader = spawn_ycode(project)
+    try:
+        reader.wait_for("Send a message...", timeout=15)
+
+        process.write("run first\r")
+        reader.wait_for("工具审批：run_command", timeout=20, count=1)
+        process.write("3")
+        reader.wait_for("first command done", timeout=20)
+        reader.wait_for("Send a message...", timeout=15, count=2)
+
+        process.write("run same\r")
+        reader.wait_for("second command done", timeout=20)
+        reader.wait_for("Send a message...", timeout=15, count=3)
+        assert reader.snapshot().count("工具审批：run_command") == 1
+
+        process.write("run changed\r")
+        reader.wait_for("工具审批：run_command", timeout=20, count=2)
+        process.write("1")
+        reader.wait_for("changed command refused", timeout=20)
+        reader.wait_for("Send a message...", timeout=15, count=4)
+
+        request_count = len(sse_server.requests)
+        process.write("/permission clear\r")
+        reader.wait_for("permission grants cleared:", timeout=15)
+        reader.wait_for("Send a message...", timeout=15, count=5)
+        assert len(sse_server.requests) == request_count
+
+        process.write("/exit\r")
+        wait_for_exit(process)
+        assert "Traceback" not in reader.snapshot()
+    finally:
+        stop_process(process)
+
+    assert len(sse_server.requests) == 6
+
+
+@pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
+def test_windows_terminal_ctrl_c_during_approval_cancels_entire_batch(
+    tmp_path: Path,
+    sse_server: SSETestServer,
+) -> None:
+    project = tmp_path / "approval-cancel"
+    project.mkdir()
+    sse_server.enqueue(
+        anthropic_tool_response(
+            [
+                ("run-1", "run_command", {"command": "Write-Output safe"}),
+                (
+                    "write-1",
+                    "write_file",
+                    {"path": "must-not-exist.txt", "content": "unsafe"},
+                ),
+            ]
+        )
+    )
+    sse_server.enqueue(anthropic_text_response("recovered after approval cancel"))
+    write_anthropic_config(
+        project / ".ycode" / "config.yaml",
+        sse_server,
+        thinking=False,
+    )
+    process, reader = spawn_ycode(project)
+    try:
+        reader.wait_for("Send a message...", timeout=15)
+        process.write("request two tools\r")
+        reader.wait_for("工具审批：run_command", timeout=20)
+        process.write("\x03")
+        reader.wait_for("已取消", timeout=15)
+        reader.wait_for("Send a message...", timeout=15, count=2)
+        assert not (project / "must-not-exist.txt").exists()
+        assert "工具审批：write_file" not in reader.snapshot()
+
+        process.write("recover\r")
+        reader.wait_for("recovered after approval cancel", timeout=20)
+        reader.wait_for("Send a message...", timeout=15, count=3)
+        process.write("/exit\r")
+        wait_for_exit(process)
+        assert "Traceback" not in reader.snapshot()
+    finally:
+        stop_process(process)
+
+    assert len(sse_server.requests) == 2
 
 
 @pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
@@ -527,8 +699,20 @@ def test_windows_terminal_plan_mode_and_tool_filter(
         "glob",
         "grep",
     ]
-    assert "Plan-only mode" in request["system"]
-    assert sse_server.requests[1].json["messages"][-1]["content"][0]["is_error"] is True
+    assert any(
+        message["role"] == "system"
+        and "<task_mode>" in message["content"]
+        and "Current task mode: plan-only" in message["content"]
+        for message in request["messages"]
+    )
+    error_results = [
+        block
+        for message in sse_server.requests[1].json["messages"]
+        if message["role"] == "user" and isinstance(message["content"], list)
+        for block in message["content"]
+        if block["type"] == "tool_result"
+    ]
+    assert error_results[-1]["is_error"] is True
     assert not (project / "forbidden.txt").exists()
 
 
@@ -591,7 +775,9 @@ def test_windows_terminal_ctrl_c_cancels_active_command_and_recovers(
     try:
         reader.wait_for("Send a message...", timeout=15)
         process.write("run a long command\r")
-        reader.wait_for("run_command", timeout=15)
+        reader.wait_for("工具审批：run_command", timeout=15)
+        process.write("2")
+        reader.wait_for("◇ run_command", timeout=15)
         process.sendintr()
         reader.wait_for("已取消", timeout=15)
         reader.wait_for("Send a message...", timeout=15, count=2)
@@ -605,7 +791,16 @@ def test_windows_terminal_ctrl_c_cancels_active_command_and_recovers(
         stop_process(process)
 
     assert len(sse_server.requests) == 2
-    assert sse_server.requests[1].json["messages"] == [{"role": "user", "content": "retry"}]
+    retry_messages = sse_server.requests[1].json["messages"]
+    assert [
+        message
+        for message in retry_messages
+        if message["role"] == "user" and isinstance(message["content"], str)
+    ] == [{"role": "user", "content": "retry"}]
+    assert any(
+        message["role"] == "system" and "<environment_context>" in message["content"]
+        for message in retry_messages
+    )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")

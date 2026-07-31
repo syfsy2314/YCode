@@ -4,6 +4,7 @@ import pytest
 
 from tests.support.fake_provider import FakeProvider
 from ycode.core import (
+    AgentModelRequest,
     ChatMessage,
     ChatProvider,
     RedactedThinkingBlock,
@@ -14,6 +15,7 @@ from ycode.core import (
     ThinkingBlock,
     ThinkingComplete,
     ThinkingDelta,
+    TokenUsage,
     ToolCallBlock,
     ToolCallComplete,
     ToolCallDelta,
@@ -89,6 +91,32 @@ def test_stream_end_keeps_only_stop_reasons() -> None:
     assert not hasattr(event, "message")
     assert not hasattr(event, "content")
     assert not hasattr(event, "kind")
+    assert event.usage == TokenUsage()
+
+
+def test_token_usage_adds_provider_neutral_counters() -> None:
+    first = TokenUsage(10, 2, 5, 0)
+    second = TokenUsage(3, 4, 0, 8)
+
+    combined = first + second
+
+    assert combined == TokenUsage(13, 6, 5, 8)
+    assert combined.total_input_tokens == 26
+    with pytest.raises(ValueError, match="非负"):
+        TokenUsage(input_tokens=-1)
+
+
+def test_agent_model_request_freezes_separate_channels() -> None:
+    user = ChatMessage.user_text("hello")
+    request = AgentModelRequest(
+        messages=(user,),
+        system_prompt=("stable",),
+        supplements=("<environment_context>context</environment_context>",),
+    )
+
+    assert request.messages == (user,)
+    assert request.system_prompt == ("stable",)
+    assert request.supplements[0].startswith("<environment_context>")
 
 
 def test_semantic_events_have_precise_payloads() -> None:

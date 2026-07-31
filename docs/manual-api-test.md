@@ -33,6 +33,68 @@ YCode 只完整校验并解析 `active` 指向的配置。测试某一家 API �
 
 如所选模型不支持 adaptive extended thinking，YCode 应明确报错。可将 `thinking` 改为 `false` 后重启，验证普通文本流。
 
+### Anthropic 缓存验证（开发验收）
+
+保持 Anthropic 为活动配置并已设置 `ANTHROPIC_API_KEY`，在项目根目录运行：
+
+```powershell
+@'
+import asyncio
+import uuid
+from pathlib import Path
+
+from ycode.config.discovery import discover_config
+from ycode.config.loader import load_config
+from ycode.core import AgentModelRequest, ChatMessage, StreamEnd
+from ycode.providers.anthropic import AnthropicProvider
+from ycode.prompt import build_builtin_prompt
+from ycode.tools import create_builtin_registry
+from ycode.tools.command import PowerShellCommandRunner
+from ycode.tools.paths import WorkspacePathResolver
+from ycode.tools.text_files import TextFileService
+
+
+async def main() -> None:
+    workspace = Path.cwd().resolve()
+    config = load_config(discover_config()).active_provider
+    provider = AnthropicProvider(config)
+    registry = create_builtin_registry(
+        WorkspacePathResolver(workspace),
+        TextFileService(),
+        PowerShellCommandRunner(),
+    )
+    marker = f"Cache verification: {uuid.uuid4()}"
+    stable = (*build_builtin_prompt().content_blocks, marker)
+    try:
+        for index in range(2):
+            request = AgentModelRequest(
+                messages=(ChatMessage.user_text("Reply with OK only."),),
+                system_prompt=stable,
+                supplements=(
+                    f"<environment_context>cache-test-run={index}</environment_context>",
+                ),
+                tools=registry.definitions(),
+            )
+            async for event in provider.stream_agent(request):
+                if isinstance(event, StreamEnd):
+                    usage = event.usage
+                    print(
+                        f"run={index + 1} "
+                        f"create={usage.cache_creation_input_tokens} "
+                        f"read={usage.cache_read_input_tokens}"
+                    )
+    finally:
+        await provider.close()
+
+
+asyncio.run(main())
+'@ | .venv\Scripts\python.exe -
+```
+
+预期第一次请求的 `create` 大于零，紧接着的第二次请求 `read` 大于零。两次请求使用相同
+的工具和稳定 System Prompt，但动态环境补充不同。若两项始终为零，先确认所选模型支持
+Prompt Caching，且稳定前缀达到该模型的最小可缓存长度。
+
 ## OpenAI
 
 1. 在当前 PowerShell 会话设置 Key：

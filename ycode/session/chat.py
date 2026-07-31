@@ -17,9 +17,12 @@ from ycode.agent.events import (
     AgentLimitReachedEvent,
     FinalResponseEvent,
     ModeChangedEvent,
+    PermissionGrantsClearedEvent,
+    PermissionModeChangedEvent,
     UserMessageEvent,
 )
 from ycode.core.messages import ChatMessage
+from ycode.security import ApprovalChoice, PermissionMode, PermissionSession
 
 type _TerminalEvent = (
     FinalResponseEvent | AgentLimitReachedEvent | AgentCancelledEvent | AgentErrorEvent
@@ -27,10 +30,15 @@ type _TerminalEvent = (
 
 
 class ChatSession:
-    def __init__(self, runner: ConversationRunner) -> None:
+    def __init__(
+        self,
+        runner: ConversationRunner,
+        permission_session: PermissionSession | None = None,
+    ) -> None:
         self._runner = runner
         self._history: list[ChatMessage] = []
         self._mode = AgentMode.AGENT
+        self._permission_session = permission_session
         self._active_turn: AgentTurn | None = None
         self._turn_finished = asyncio.Event()
         self._turn_finished.set()
@@ -43,6 +51,10 @@ class ChatSession:
     @property
     def mode(self) -> AgentMode:
         return self._mode
+
+    @property
+    def permission_mode(self) -> PermissionMode | None:
+        return self._permission_session.mode if self._permission_session is not None else None
 
     async def stream_reply(self, user_text: str) -> AsyncIterator[AgentEvent]:
         if not user_text.strip():
@@ -66,6 +78,39 @@ class ChatSession:
             previous = self._mode
             self._mode = target
             yield ModeChangedEvent(previous, target)
+            return
+        if self._permission_session is not None and command.startswith("/permission"):
+            yield UserMessageEvent(user_message)
+            parts = command.split()
+            if len(parts) == 1:
+                yield PermissionModeChangedEvent(
+                    self._permission_session.mode,
+                    self._permission_session.mode,
+                )
+                return
+            if len(parts) != 2:
+                yield AgentErrorEvent(
+                    "invalid_permission_command",
+                    "用法：/permission [strict|default|allow|clear]",
+                )
+                return
+            argument = parts[1]
+            if argument == "clear":
+                count = self._permission_session.grant_count
+                self._permission_session.clear()
+                yield PermissionGrantsClearedEvent(count)
+                return
+            try:
+                target_permission = PermissionMode(argument)
+            except ValueError:
+                yield AgentErrorEvent(
+                    "invalid_permission_command",
+                    "用法：/permission [strict|default|allow|clear]",
+                )
+                return
+            previous_permission = self._permission_session.mode
+            self._permission_session.set_mode(target_permission)
+            yield PermissionModeChangedEvent(previous_permission, target_permission)
             return
 
         turn = self._runner.start_turn(
@@ -110,6 +155,11 @@ class ChatSession:
     def cancel_active_turn(self) -> None:
         if self._active_turn is not None:
             self._active_turn.cancel()
+
+    def submit_approval(self, choice: ApprovalChoice) -> None:
+        if self._active_turn is None:
+            raise RuntimeError("当前没有运行中的 Agent 回合")
+        self._active_turn.submit_approval(choice)
 
     async def close(self) -> None:
         if self._closed:

@@ -3,6 +3,7 @@ from io import StringIO
 from rich.console import Console
 
 from ycode.config.models import ProviderConfig
+from ycode.security import PermissionMode
 from ycode.ui.header import render_header
 
 
@@ -41,3 +42,12 @@ def test_narrow_header_stacks_details_below_cat() -> None:
     output = render(35)
     assert output.index("Provider") > output.index("> ^ <")
     assert "local-claude" in output
+
+
+def test_anthropic_header_can_show_permission_mode() -> None:
+    target = StringIO()
+    console = Console(file=target, width=100, color_system=None)
+    console.print(render_header(config(), 100, PermissionMode.DEFAULT))
+
+    assert "Permission" in target.getvalue()
+    assert "default" in target.getvalue()

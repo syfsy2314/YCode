@@ -79,6 +79,7 @@ def create_scheduler(
     registry = ToolRegistry()
     registry.register(ClassifiedTool("read_tool", ToolAccess.READ))
     registry.register(ClassifiedTool("write_tool", ToolAccess.WRITE))
+    registry.register(ClassifiedTool("unknown_tool", ToolAccess.UNKNOWN))
     return ToolScheduler(registry, executor)  # type: ignore[arg-type]
 
 
@@ -181,6 +182,59 @@ async def test_multiple_writes_are_serial(tmp_path: Path) -> None:
     executor.releases["call-1"].set()
     await task
     assert executor.max_running == 1
+
+
+@pytest.mark.asyncio
+async def test_unknown_tools_are_serial_barriers(tmp_path: Path) -> None:
+    executor = ControlledExecutor()
+    for call_id in ("call-0", "call-1", "call-2"):
+        executor.add(call_id)
+    scheduler = create_scheduler(executor)
+
+    async def consume() -> None:
+        async for _ in scheduler.stream(
+            calls("read_tool", "unknown_tool", "read_tool"),
+            context(tmp_path),
+            frozenset({ToolAccess.READ, ToolAccess.UNKNOWN}),
+        ):
+            pass
+
+    task = asyncio.create_task(consume())
+    assert await executor.started.get() == "call-0"
+    executor.releases["call-0"].set()
+    assert await executor.started.get() == "call-1"
+    assert executor.started.empty()
+    executor.releases["call-1"].set()
+    assert await executor.started.get() == "call-2"
+    executor.releases["call-2"].set()
+    await task
+    assert executor.max_running == 1
+
+
+@pytest.mark.asyncio
+async def test_precomputed_denial_never_calls_executor(tmp_path: Path) -> None:
+    executor = ControlledExecutor()
+    scheduler = create_scheduler(executor)
+    denied = ToolExecutionResult(
+        content="用户拒绝了工具调用。",
+        is_error=True,
+        metadata={"code": "permission_denied"},
+    )
+    events = [
+        event
+        async for event in scheduler.stream(
+            calls("write_tool"),
+            context(tmp_path),
+            frozenset({ToolAccess.WRITE}),
+            {0: denied},
+        )
+    ]
+
+    assert executor.started.empty()
+    completed = next(event for event in events if isinstance(event, ScheduledToolCompleted))
+    assert completed.record.position == 0
+    assert completed.record.result is denied
+    assert completed.record.elapsed_seconds == 0
 
 
 @pytest.mark.asyncio

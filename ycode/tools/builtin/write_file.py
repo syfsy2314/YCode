@@ -24,7 +24,10 @@ class WriteFileArguments(BaseModel):
 class WriteFileTool:
     definition = ToolDefinition(
         name="write_file",
-        description="创建 UTF-8 文本文件，或在明确允许时完整覆盖已有文件。",
+        description=(
+            "创建 UTF-8 文本文件，或在明确允许时完整覆盖已有文件；"
+            "覆盖已有文件前必须先使用 read_file 读取。"
+        ),
         access=ToolAccess.WRITE,
         arguments_model=WriteFileArguments,
     )

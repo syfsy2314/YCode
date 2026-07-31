@@ -72,6 +72,7 @@ class PlainChatRunner:
                     termination=AgentTermination.COMPLETED,
                     messages=(user_message, assistant_message),
                     final_message=assistant_message,
+                    usage=assembler.usage,
                 )
             )
             yield FinalResponseEvent(assistant_message)

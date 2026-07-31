@@ -10,11 +10,14 @@ from ycode.agent import (
     AgentTextDelta,
     FinalResponseEvent,
     ModeChangedEvent,
+    PermissionGrantsClearedEvent,
+    PermissionModeChangedEvent,
     PlainChatRunner,
     UserMessageEvent,
 )
 from ycode.core import StopReason, StreamEnd, TextDelta
 from ycode.errors import ProviderError
+from ycode.security import PermissionMode, PermissionSession
 from ycode.session.chat import ChatSession
 
 
@@ -164,6 +167,42 @@ async def test_non_exact_plan_text_is_sent_as_user_message() -> None:
     await collect(session, "/plan this")
 
     assert provider.requests[0][0].text == "/plan this"
+
+
+@pytest.mark.asyncio
+async def test_permission_commands_change_runtime_state_without_provider_call() -> None:
+    provider = FakeProvider([])
+    permission = PermissionSession(PermissionMode.DEFAULT)
+    permission.grant({"tool": "read_file", "path": "a.txt"})
+    session = ChatSession(PlainChatRunner(provider), permission)
+
+    status = await collect(session, "/permission")
+    strict = await collect(session, "/permission strict")
+    cleared = await collect(session, "/permission clear")
+
+    assert status[-1] == PermissionModeChangedEvent(
+        PermissionMode.DEFAULT,
+        PermissionMode.DEFAULT,
+    )
+    assert strict[-1] == PermissionModeChangedEvent(
+        PermissionMode.DEFAULT,
+        PermissionMode.STRICT,
+    )
+    assert permission.mode is PermissionMode.STRICT
+    assert cleared[-1] == PermissionGrantsClearedEvent(1)
+    assert permission.grant_count == 0
+    assert provider.requests == []
+    assert session.history == ()
+
+
+@pytest.mark.asyncio
+async def test_plain_session_keeps_permission_text_as_normal_user_message() -> None:
+    provider = FakeProvider([text_response("answer")])
+    session = session_with(provider)
+
+    await collect(session, "/permission allow")
+
+    assert provider.requests[0][0].text == "/permission allow"
 
 
 @pytest.mark.asyncio

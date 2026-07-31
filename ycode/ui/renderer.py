@@ -161,6 +161,23 @@ class LiveResponseRenderer:
         self._update()
         self._stop_live()
 
+    async def pause(self) -> None:
+        await self._stop_refresh()
+        self._stop_live()
+
+    async def resume(self) -> None:
+        if self._live is not None:
+            return
+        self._live = Live(
+            self.renderable(),
+            console=self._console,
+            refresh_per_second=10,
+            transient=False,
+            auto_refresh=False,
+        )
+        self._live.start(refresh=True)
+        self._refresh_task = asyncio.create_task(self._refresh_timer())
+
     def _stop_live(self) -> None:
         if self._live is not None:
             self._live.stop()

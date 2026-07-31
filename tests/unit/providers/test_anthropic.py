@@ -2,11 +2,14 @@ from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import anthropic
+import httpx
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
 
 from ycode.config.models import ProviderConfig
 from ycode.core import (
+    AgentModelRequest,
     ChatMessage,
     RedactedThinkingBlock,
     StopReason,
@@ -16,6 +19,7 @@ from ycode.core import (
     ThinkingBlock,
     ThinkingComplete,
     ThinkingDelta,
+    TokenUsage,
     ToolCallBlock,
     ToolCallComplete,
     ToolCallDelta,
@@ -139,16 +143,33 @@ async def test_agent_request_adds_system_and_provider_neutral_tools() -> None:
 
     events = [
         event
-        async for event in provider.stream_chat(
-            [ChatMessage.user_text("hi")],
-            system_prompt="minimal agent prompt",
-            tools=(READ_DEFINITION,),
+        async for event in provider.stream_agent(
+            AgentModelRequest(
+                messages=(ChatMessage.user_text("hi"),),
+                system_prompt=("identity", "tool rules"),
+                supplements=("<environment_context>workspace</environment_context>",),
+                tools=(READ_DEFINITION,),
+            )
         )
     ]
 
     assert events[-1] == StreamEnd(StopReason.END_TURN, "end_turn")
     request = client.messages.create.await_args.kwargs
-    assert request["system"] == "minimal agent prompt"
+    assert request["system"] == [
+        {"type": "text", "text": "identity"},
+        {
+            "type": "text",
+            "text": "tool rules",
+            "cache_control": {"type": "ephemeral", "ttl": "5m"},
+        },
+    ]
+    assert request["messages"] == [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "system",
+            "content": "<environment_context>workspace</environment_context>",
+        },
+    ]
     assert request["tools"] == [
         {
             "name": "read_file",
@@ -157,6 +178,104 @@ async def test_agent_request_adds_system_and_provider_neutral_tools() -> None:
         }
     ]
     assert isinstance(request["tools"][0]["input_schema"], dict)
+
+
+@pytest.mark.asyncio
+async def test_stream_merges_cache_usage_without_breaking_missing_fields() -> None:
+    client = client_with(
+        event(
+            "message_start",
+            message=SimpleNamespace(
+                usage=SimpleNamespace(
+                    input_tokens=10,
+                    output_tokens=1,
+                    cache_creation_input_tokens=7,
+                    cache_read_input_tokens=0,
+                )
+            ),
+        ),
+        block_start(0, "text", text="answer"),
+        event("content_block_stop", index=0),
+        event(
+            "message_delta",
+            delta=SimpleNamespace(stop_reason="end_turn"),
+            usage=SimpleNamespace(output_tokens=4),
+        ),
+        event("message_stop"),
+    )
+    provider = AnthropicProvider(config(), client=client)
+
+    events = [event async for event in provider.stream_chat([ChatMessage.user_text("hi")])]
+
+    assert events[-1] == StreamEnd(
+        StopReason.END_TURN,
+        "end_turn",
+        TokenUsage(
+            input_tokens=10,
+            output_tokens=4,
+            cache_creation_input_tokens=7,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_unsupported_system_message_falls_back_once_and_is_remembered() -> None:
+    response = httpx.Response(
+        400,
+        request=httpx.Request("POST", "http://localhost/v1/messages"),
+    )
+    unsupported = anthropic.BadRequestError(
+        "messages role system is not supported",
+        response=response,
+        body={
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "messages role system is not supported",
+            },
+        },
+    )
+    successful_events = (
+        event("message_start"),
+        block_start(0, "text", text="answer"),
+        event("content_block_stop", index=0),
+        *completed(),
+    )
+    create = AsyncMock(
+        side_effect=[
+            unsupported,
+            AsyncEvents(*successful_events),
+            AsyncEvents(*successful_events),
+        ]
+    )
+    client = SimpleNamespace(messages=SimpleNamespace(create=create), close=AsyncMock())
+    provider = AnthropicProvider(config(), client=client)
+    request = AgentModelRequest(
+        messages=(ChatMessage.user_text("hi"),),
+        system_prompt=("stable",),
+        supplements=("<task_mode>agent</task_mode>",),
+    )
+
+    first = [event async for event in provider.stream_agent(request)]
+    second = [event async for event in provider.stream_agent(request)]
+
+    assert isinstance(first[-1], StreamEnd)
+    assert isinstance(second[-1], StreamEnd)
+    assert create.await_count == 3
+    first_attempt, fallback_attempt, remembered_attempt = [
+        call.kwargs for call in create.await_args_list
+    ]
+    assert first_attempt["messages"][-1]["role"] == "system"
+    assert all(item["role"] != "system" for item in fallback_attempt["messages"])
+    assert fallback_attempt["system"] == [
+        {
+            "type": "text",
+            "text": "stable",
+            "cache_control": {"type": "ephemeral", "ttl": "5m"},
+        },
+        {"type": "text", "text": "<task_mode>agent</task_mode>"},
+    ]
+    assert remembered_attempt == fallback_attempt
 
 
 @pytest.mark.asyncio

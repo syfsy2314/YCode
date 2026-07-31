@@ -1,6 +1,6 @@
 """供应商无关的语义流事件。"""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 
 from ycode.core.messages import RedactedThinkingBlock, ThinkingBlock, ToolCallBlock
@@ -13,6 +13,40 @@ class StopReason(StrEnum):
     STOP_SEQUENCE = "stop_sequence"
     CONTENT_FILTER = "content_filter"
     UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class TokenUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        for value in (
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_creation_input_tokens,
+            self.cache_read_input_tokens,
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError("Token 使用量必须是非负整数")
+
+    def __add__(self, other: object) -> "TokenUsage":
+        if not isinstance(other, TokenUsage):
+            return NotImplemented
+        return TokenUsage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            cache_creation_input_tokens=(
+                self.cache_creation_input_tokens + other.cache_creation_input_tokens
+            ),
+            cache_read_input_tokens=(self.cache_read_input_tokens + other.cache_read_input_tokens),
+        )
+
+    @property
+    def total_input_tokens(self) -> int:
+        return self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens
 
 
 def _validate_index(index: int) -> None:
@@ -95,10 +129,13 @@ class ToolCallComplete:
 class StreamEnd:
     stop_reason: StopReason
     provider_reason: str = ""
+    usage: TokenUsage = field(default_factory=TokenUsage)
 
     def __post_init__(self) -> None:
         if not isinstance(self.stop_reason, StopReason):
             raise TypeError("响应结束事件必须携带 StopReason")
+        if not isinstance(self.usage, TokenUsage):
+            raise TypeError("响应结束事件必须携带 TokenUsage")
 
 
 type StreamEvent = (

@@ -14,6 +14,9 @@ from ycode.agent import (
     AgentThinkingDelta,
     FinalResponseEvent,
     ModeChangedEvent,
+    PermissionGrantsClearedEvent,
+    PermissionModeChangedEvent,
+    ToolApprovalRequested,
     ToolExecutionCancelled,
     ToolExecutionCompleted,
     ToolExecutionStarted,
@@ -52,10 +55,22 @@ class TerminalUI:
         )
 
     async def run(self) -> None:
-        self._console.print(render_header(self._config, self._console.width))
+        self._console.print(
+            render_header(
+                self._config,
+                self._console.width,
+                self._session.permission_mode,
+            )
+        )
         while True:
             try:
-                user_text = await self._input.read(self._session.mode)
+                if self._session.permission_mode is None:
+                    user_text = await self._input.read(self._session.mode)
+                else:
+                    user_text = await self._input.read(
+                        self._session.mode,
+                        self._session.permission_mode,
+                    )
             except (EOFError, KeyboardInterrupt):
                 return
 
@@ -66,6 +81,7 @@ class TerminalUI:
 
             renderer = self._renderer_factory(self._console)
             started = False
+            approvals: asyncio.Queue[ToolApprovalRequested] = asyncio.Queue()
 
             async def ensure_started(active_renderer: Any = renderer) -> None:
                 nonlocal started
@@ -76,6 +92,7 @@ class TerminalUI:
             async def consume_turn(
                 active_user_text: str = user_text,
                 active_renderer: Any = renderer,
+                active_approvals: asyncio.Queue[ToolApprovalRequested] = approvals,
             ) -> None:
                 async for event in self._session.stream_reply(active_user_text):
                     if isinstance(event, UserMessageEvent):
@@ -101,8 +118,18 @@ class TerminalUI:
                     elif isinstance(event, ToolExecutionCancelled):
                         await ensure_started()
                         active_renderer.add_tool_status(f"– {event.call.name}  已取消")
+                    elif isinstance(event, ToolApprovalRequested):
+                        await ensure_started()
+                        active_renderer.add_tool_status(
+                            f"? {event.decision.subject.call.name}  等待用户确认"
+                        )
+                        await active_approvals.put(event)
                     elif isinstance(event, ModeChangedEvent):
                         self._console.print(f"mode: {event.mode.value}")
+                    elif isinstance(event, PermissionModeChangedEvent):
+                        self._console.print(f"permission: {event.mode.value}")
+                    elif isinstance(event, PermissionGrantsClearedEvent):
+                        self._console.print(f"permission grants cleared: {event.cleared_count}")
                     elif isinstance(event, FinalResponseEvent):
                         await ensure_started()
                         await active_renderer.complete(event.message)
@@ -115,21 +142,58 @@ class TerminalUI:
                         self._console.print(event.message)
 
             interrupt_task: asyncio.Task[None] | None = None
+            approval_task: asyncio.Task[ToolApprovalRequested] | None = None
             turn_task: asyncio.Task[None] | None = None
             try:
                 wait_for_interrupt = getattr(self._input, "wait_for_interrupt", None)
+                read_approval = getattr(self._input, "read_approval", None)
+                turn_task = asyncio.create_task(consume_turn())
+                approval_task = asyncio.create_task(approvals.get())
                 if callable(wait_for_interrupt):
-                    turn_task = asyncio.create_task(consume_turn())
                     interrupt_task = asyncio.create_task(wait_for_interrupt())
+                while True:
+                    waiting = {turn_task, approval_task}
+                    if interrupt_task is not None:
+                        waiting.add(interrupt_task)
                     done, _ = await asyncio.wait(
-                        {turn_task, interrupt_task},
+                        waiting,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
-                    if interrupt_task in done and turn_task not in done:
+                    if turn_task in done:
+                        await turn_task
+                        break
+                    if interrupt_task is not None and interrupt_task in done:
                         self._session.cancel_active_turn()
-                    await turn_task
-                else:
-                    await consume_turn()
+                        await turn_task
+                        break
+                    if approval_task in done:
+                        request = approval_task.result()
+                        if interrupt_task is not None:
+                            interrupt_task.cancel()
+                            await asyncio.gather(
+                                interrupt_task,
+                                return_exceptions=True,
+                            )
+                            interrupt_task = None
+                        pause = getattr(renderer, "pause", None)
+                        if callable(pause):
+                            await pause()
+                        if not callable(read_approval):
+                            self._session.cancel_active_turn()
+                            await turn_task
+                            break
+                        try:
+                            choice = await read_approval(request.decision)
+                        except KeyboardInterrupt:
+                            self._session.cancel_active_turn()
+                        else:
+                            self._session.submit_approval(choice)
+                        resume = getattr(renderer, "resume", None)
+                        if callable(resume) and not turn_task.done():
+                            await resume()
+                        approval_task = asyncio.create_task(approvals.get())
+                        if callable(wait_for_interrupt) and not turn_task.done():
+                            interrupt_task = asyncio.create_task(wait_for_interrupt())
             except KeyboardInterrupt:
                 self._session.cancel_active_turn()
                 if started:
@@ -144,6 +208,9 @@ class TerminalUI:
                 if interrupt_task is not None and not interrupt_task.done():
                     interrupt_task.cancel()
                     await asyncio.gather(interrupt_task, return_exceptions=True)
+                if approval_task is not None and not approval_task.done():
+                    approval_task.cancel()
+                    await asyncio.gather(approval_task, return_exceptions=True)
                 if turn_task is not None and not turn_task.done():
                     self._session.cancel_active_turn()
                     turn_task.cancel()

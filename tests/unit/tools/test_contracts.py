@@ -83,6 +83,17 @@ def test_definition_rejects_invalid_metadata() -> None:
         )
 
 
+def test_definition_accepts_unknown_access_for_adapted_tools() -> None:
+    definition = ToolDefinition(
+        name="adapted_tool",
+        description="未知安全分类的适配工具",
+        access=ToolAccess.UNKNOWN,
+        arguments_model=ExampleArguments,
+    )
+
+    assert definition.access is ToolAccess.UNKNOWN
+
+
 @pytest.mark.asyncio
 async def test_plain_class_structurally_satisfies_tool_protocol(tmp_path: Path) -> None:
     tool = ExampleTool()

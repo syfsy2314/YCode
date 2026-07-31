@@ -73,7 +73,8 @@ async def test_app_assembles_anthropic_agent_with_builtin_tools(tmp_path: Path) 
         ui_factory=FakeUI,
     )
 
-    assert [definition.name for definition in provider.tool_definitions[0]] == [
+    request = provider.agent_requests[0]
+    assert [definition.name for definition in request.tools] == [
         "read_file",
         "write_file",
         "edit_file",
@@ -81,8 +82,44 @@ async def test_app_assembles_anthropic_agent_with_builtin_tools(tmp_path: Path) 
         "glob",
         "grep",
     ]
-    assert f"Workspace: {tmp_path}" in provider.system_prompts[0]
+    assert any(f"Workspace: {tmp_path}" in item for item in request.supplements)
+    assert any(
+        "<tool_state>" in item and "permission mode: default" in item
+        for item in request.supplements
+    )
+    assert all("Workspace:" not in block for block in request.system_prompt)
+    assert all("permission mode:" not in block for block in request.system_prompt)
     assert provider.closed is True
+
+
+@pytest.mark.asyncio
+async def test_anthropic_loads_project_permission_mode_once(tmp_path: Path) -> None:
+    path = tmp_path / ".ycode" / "config.yaml"
+    write_config(path, "anthropic")
+    (tmp_path / ".ycode" / "security.yaml").write_text(
+        "mode: allow\n",
+        encoding="utf-8",
+    )
+    provider = FakeProvider([[TextDelta(0, "done"), StreamEnd(StopReason.END_TURN)]])
+    seen_modes = []
+
+    class FakeUI:
+        def __init__(self, config: object, session: object) -> None:
+            self._session = session
+            seen_modes.append(session.permission_mode)
+
+        async def run(self) -> None:
+            async for _ in self._session.stream_reply("hello"):
+                pass
+
+    await run_app(
+        start_dir=tmp_path,
+        provider_factory=lambda config: provider,
+        ui_factory=FakeUI,
+    )
+
+    assert [mode.value for mode in seen_modes] == ["allow"]
+    assert any("permission mode: allow" in item for item in provider.agent_requests[0].supplements)
 
 
 @pytest.mark.asyncio
