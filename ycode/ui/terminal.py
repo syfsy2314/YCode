@@ -13,6 +13,7 @@ from ycode.agent import (
     AgentTextDelta,
     AgentThinkingDelta,
     FinalResponseEvent,
+    McpStatusEvent,
     ModeChangedEvent,
     PermissionGrantsClearedEvent,
     PermissionModeChangedEvent,
@@ -27,6 +28,7 @@ from ycode.core.messages import thaw_json
 from ycode.session.chat import ChatSession
 from ycode.ui.header import render_header
 from ycode.ui.input_box import InputBox
+from ycode.ui.mcp_status import render_mcp_status, render_mcp_summary
 from ycode.ui.renderer import LiveResponseRenderer
 from ycode.ui.user_message import render_user_message
 
@@ -62,6 +64,9 @@ class TerminalUI:
                 self._session.permission_mode,
             )
         )
+        mcp_status = self._session.mcp_status
+        if mcp_status is not None:
+            self._console.print(render_mcp_summary(mcp_status))
         while True:
             try:
                 if self._session.permission_mode is None:
@@ -130,6 +135,8 @@ class TerminalUI:
                         self._console.print(f"permission: {event.mode.value}")
                     elif isinstance(event, PermissionGrantsClearedEvent):
                         self._console.print(f"permission grants cleared: {event.cleared_count}")
+                    elif isinstance(event, McpStatusEvent):
+                        self._console.print(render_mcp_status(event.report))
                     elif isinstance(event, FinalResponseEvent):
                         await ensure_started()
                         await active_renderer.complete(event.message)

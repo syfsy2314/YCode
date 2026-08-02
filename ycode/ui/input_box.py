@@ -180,7 +180,11 @@ class InputBox:
             f"\n工具审批：{decision.subject.call.name}\n"
             f"原因：{decision.message}\n"
             f"{decision.subject.approval_summary}\n"
-            "[1] 拒绝  [2] 本次允许  [3] 本会话允许"
+            + (
+                "[1] 拒绝  [2] 本次允许  [3] 本会话允许"
+                if decision.allow_session
+                else "[1] 拒绝  [2] 本次允许"
+            )
         )
         bindings = KeyBindings()
 
@@ -192,9 +196,11 @@ class InputBox:
         def allow_once(event) -> None:
             event.app.exit(result=ApprovalChoice.ALLOW_ONCE)
 
-        @bindings.add("3")
-        def allow_session(event) -> None:
-            event.app.exit(result=ApprovalChoice.ALLOW_SESSION)
+        if decision.allow_session:
+
+            @bindings.add("3")
+            def allow_session(event) -> None:
+                event.app.exit(result=ApprovalChoice.ALLOW_SESSION)
 
         @bindings.add("c-c")
         def cancel(event) -> None:
@@ -208,7 +214,11 @@ class InputBox:
                             [
                                 (
                                     "class:input-hint",
-                                    "请选择 1、2 或 3（Ctrl+C 取消）",
+                                    (
+                                        "请选择 1、2 或 3（Ctrl+C 取消）"
+                                        if decision.allow_session
+                                        else "请选择 1 或 2（Ctrl+C 取消）"
+                                    ),
                                 )
                             ]
                         )

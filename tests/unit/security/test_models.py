@@ -10,6 +10,8 @@ from ycode.security import (
     PermissionSession,
     PermissionSubject,
     SecurityConfig,
+    SecurityConfigLoadResult,
+    SecurityConfigWarning,
     SecurityRule,
 )
 
@@ -26,6 +28,13 @@ def test_security_config_rejects_invalid_matchers_and_duplicate_ids() -> None:
                 SecurityRule(id="same", action="deny", tool="read_file"),
             )
         )
+
+
+def test_security_load_result_has_typed_immutable_warnings() -> None:
+    warning = SecurityConfigWarning("unavailable", "mcp_demo_echo", "当前不可用")
+    result = SecurityConfigLoadResult(SecurityConfig(), (warning,))
+
+    assert result.warnings == (warning,)
 
 
 def test_permission_subject_freezes_inputs_without_aliasing() -> None:

@@ -11,6 +11,8 @@ from ycode.security.models import (
     PermissionSession,
     PermissionSubject,
     SecurityConfig,
+    SecurityConfigLoadResult,
+    SecurityConfigWarning,
     SecurityRule,
 )
 from ycode.security.powershell import (
@@ -32,6 +34,8 @@ __all__ = [
     "PermissionSubject",
     "PowerShellSafetyChecker",
     "SecurityConfig",
+    "SecurityConfigLoadResult",
+    "SecurityConfigWarning",
     "SecurityRule",
     "discover_security_config",
     "load_security_config",

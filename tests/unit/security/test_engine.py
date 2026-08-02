@@ -14,6 +14,7 @@ from ycode.security import (
     SecurityRule,
 )
 from ycode.tools import (
+    PydanticToolArguments,
     ToolAccess,
     ToolContext,
     ToolDefinition,
@@ -52,7 +53,26 @@ class UnknownTool:
         name="unknown_adapter",
         description="安全分类未知的工具",
         access=ToolAccess.UNKNOWN,
-        arguments_model=UnknownArguments,
+        arguments=PydanticToolArguments(UnknownArguments),
+    )
+    timeout_seconds = 1.0
+
+    async def execute(
+        self,
+        arguments: UnknownArguments,
+        context: ToolContext,
+    ) -> ToolExecutionResult:
+        return ToolExecutionResult(content=arguments.value)
+
+
+class McpUnknownTool:
+    definition = ToolDefinition(
+        name="mcp_demo_echo",
+        description="MCP 测试工具",
+        access=ToolAccess.UNKNOWN,
+        arguments=PydanticToolArguments(UnknownArguments),
+        defer_loading=True,
+        timeout_error_code="mcp_timeout",
     )
     timeout_seconds = 1.0
 
@@ -77,6 +97,7 @@ def make_engine(
         FakeCommandRunner(),
     )
     registry.register(UnknownTool())
+    registry.register(McpUnknownTool())
     return PermissionEngine(
         registry,
         resolver,
@@ -276,6 +297,53 @@ async def test_plan_only_and_outside_path_are_hard_denials(tmp_path: Path) -> No
     assert plan_only.reason_code == "access_not_available"
     assert outside.action is PermissionAction.DENY
     assert outside.reason_code == "invalid_or_unsafe_arguments"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", list(PermissionMode))
+async def test_plan_only_mcp_always_asks_without_session_grant(
+    tmp_path: Path, mode: PermissionMode
+) -> None:
+    config = SecurityConfig(
+        mode=mode,
+        rules=(SecurityRule(id="allow-mcp", action="allow", tool="mcp_demo_echo"),),
+        plan_only={"allow_mcp_tools": ("mcp_demo_echo",)},
+    )
+    engine = make_engine(tmp_path, config=config)
+    session = PermissionSession(mode)
+    session.grant({"tool": "mcp_demo_echo", "arguments": {"value": "x", "count": 1}})
+
+    decision = await engine.evaluate(
+        ToolCallBlock(
+            id="mcp",
+            name="mcp_demo_echo",
+            arguments={"value": "x"},
+        ),
+        session,
+        allowed_access=frozenset({ToolAccess.READ}),
+        plan_only=True,
+    )
+
+    assert decision.action is PermissionAction.ASK
+    assert decision.reason_code == "plan_only_mcp_approval"
+    assert decision.allow_session is False
+
+
+@pytest.mark.asyncio
+async def test_plan_only_mcp_project_deny_still_wins(tmp_path: Path) -> None:
+    config = SecurityConfig(
+        rules=(SecurityRule(id="deny-mcp", action="deny", tool="mcp_demo_echo"),),
+        plan_only={"allow_mcp_tools": ("mcp_demo_echo",)},
+    )
+    decision = await make_engine(tmp_path, config=config).evaluate(
+        ToolCallBlock(id="mcp", name="mcp_demo_echo", arguments={"value": "x"}),
+        PermissionSession(),
+        allowed_access=frozenset({ToolAccess.READ}),
+        plan_only=True,
+    )
+
+    assert decision.action is PermissionAction.DENY
+    assert decision.rule_id == "deny-mcp"
 
 
 @pytest.mark.asyncio

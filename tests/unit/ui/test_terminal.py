@@ -17,6 +17,12 @@ from ycode.core import (
     ToolCallBlock,
 )
 from ycode.errors import ProviderError
+from ycode.mcp.models import (
+    McpConnectionState,
+    McpErrorSummary,
+    McpServerStatus,
+    McpStatusReport,
+)
 from ycode.session.chat import ChatSession
 from ycode.tools import ToolExecutionRecord, ToolExecutionResult
 from ycode.ui.terminal import TerminalUI, _tool_result_summary, _tool_start_summary
@@ -213,3 +219,39 @@ def test_tool_summaries_hide_write_content_and_show_result_metadata() -> None:
     assert _tool_start_summary(call) == "◇ write_file  a.txt"
     assert "MUST-NOT-APPEAR" not in _tool_start_summary(call)
     assert _tool_result_summary(ToolExecutionCompleted(1, record)) == "✓ write_file  完成"
+
+
+@pytest.mark.asyncio
+async def test_terminal_renders_mcp_startup_summary_and_status_command() -> None:
+    report = McpStatusReport(
+        (
+            McpServerStatus("ready", "stdio", McpConnectionState.READY, 2),
+            McpServerStatus(
+                "entry_2",
+                "invalid",
+                McpConnectionState.INVALID,
+                0,
+                McpErrorSummary("invalid_config", "配置无效"),
+            ),
+        )
+    )
+
+    class StatusProvider:
+        def snapshot(self) -> McpStatusReport:
+            return report
+
+    target = StringIO()
+    ui = TerminalUI(
+        config(),
+        ChatSession(PlainChatRunner(FakeProvider([])), mcp_status_provider=StatusProvider()),
+        console=Console(file=target, width=80, color_system=None),
+        input_factory=lambda _: FakeInput(["/mcp", "/exit"]),
+    )
+
+    await ui.run()
+
+    output = target.getvalue()
+    assert "MCP: 可用 1 / 失败 1 / 未启用 0" in output
+    assert "MCP Servers" in output
+    assert "entry_2" in output
+    assert "invalid_config" in output

@@ -9,6 +9,7 @@ from ycode.config.discovery import discover_config
 from ycode.config.loader import load_config
 from ycode.config.models import ProviderConfig, ProviderProtocol
 from ycode.core.provider import AgentChatProvider, ChatProvider
+from ycode.mcp.manager import McpManager
 from ycode.prompt import EnvironmentCollector, PromptRuntimeContext, build_builtin_prompt
 from ycode.providers.factory import create_provider
 from ycode.security import (
@@ -19,6 +20,7 @@ from ycode.security import (
 )
 from ycode.session.chat import ChatSession
 from ycode.tools import ToolContext, ToolExecutor, ToolScheduler, create_builtin_registry
+from ycode.tools.builtin.tool_search import ToolSearchTool
 from ycode.tools.command import PowerShellCommandRunner
 from ycode.tools.paths import WorkspacePathResolver
 from ycode.tools.text_files import TextFileService
@@ -44,38 +46,55 @@ async def run_app(
     provider = provider_factory(config.active_provider)
     workspace = _resolve_workspace(start_dir)
     permission_session: PermissionSession | None = None
-    if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
-        resolver = WorkspacePathResolver(workspace)
-        registry = create_builtin_registry(
-            resolver,
-            TextFileService(),
-            PowerShellCommandRunner(),
-        )
-        executor = ToolExecutor(registry)
-        security_config = load_security_config(workspace, registry)
-        permission_session = PermissionSession(security_config.mode)
-        permission_engine = PermissionEngine(
-            registry,
-            resolver,
-            security_config,
-            PowerShellSafetyChecker(workspace),
-        )
-        runner = AgentLoop(
-            cast(AgentChatProvider, provider),
-            registry,
-            ToolScheduler(registry, executor),
-            build_builtin_prompt(),
-            PromptRuntimeContext(),
-            EnvironmentCollector(workspace),
-            ToolContext(workspace),
-            permission_engine=permission_engine,
-            permission_session=permission_session,
-        )
-    else:
-        runner = PlainChatRunner(provider)
-    session = ChatSession(runner, permission_session)
+    manager: McpManager | None = None
+    session: ChatSession | None = None
     try:
+        if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
+            resolver = WorkspacePathResolver(workspace)
+            registry = create_builtin_registry(
+                resolver,
+                TextFileService(),
+                PowerShellCommandRunner(),
+            )
+            if config.mcp.servers or config.mcp.issues:
+                manager = McpManager(config.mcp, registry, config.redactor)
+                await manager.start()
+                if any(server.enabled for server in config.mcp.servers):
+                    registry.register(ToolSearchTool(registry))
+            security_result = load_security_config(workspace, registry)
+            if manager is not None:
+                manager.set_security_warnings(security_result.warnings)
+            permission_session = PermissionSession(security_result.config.mode)
+            permission_engine = PermissionEngine(
+                registry,
+                resolver,
+                security_result.config,
+                PowerShellSafetyChecker(workspace),
+            )
+            runner = AgentLoop(
+                cast(AgentChatProvider, provider),
+                registry,
+                ToolScheduler(registry, ToolExecutor(registry)),
+                build_builtin_prompt(),
+                PromptRuntimeContext(),
+                EnvironmentCollector(workspace),
+                ToolContext(workspace),
+                permission_engine=permission_engine,
+                permission_session=permission_session,
+                plan_only_mcp_tools=frozenset(security_result.config.plan_only.allow_mcp_tools),
+                resource_manager=manager,
+            )
+        else:
+            runner = PlainChatRunner(provider)
+        session = ChatSession(runner, permission_session, manager)
         ui = ui_factory(config.active_provider, session)
         await ui.run()
     finally:
-        await session.close()
+        if session is not None:
+            await session.close()
+        else:
+            try:
+                if manager is not None:
+                    await manager.close()
+            finally:
+                await provider.close()

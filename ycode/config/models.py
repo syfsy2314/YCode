@@ -61,6 +61,7 @@ class AppConfig(BaseModel):
 
     active: str = Field(min_length=1)
     providers: list[ProviderEntry] = Field(min_length=1)
+    mcp_servers: list[Any] = Field(default_factory=list)
     _active_provider: ProviderConfig | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")

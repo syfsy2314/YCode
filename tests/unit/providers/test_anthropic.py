@@ -28,7 +28,7 @@ from ycode.core import (
 )
 from ycode.errors import ProviderError
 from ycode.providers.anthropic import MAX_TOKENS, AnthropicProvider
-from ycode.tools import ToolAccess, ToolDefinition
+from ycode.tools import PydanticToolArguments, ToolAccess, ToolDefinition
 
 
 class ReadArguments(BaseModel):
@@ -41,7 +41,7 @@ READ_DEFINITION = ToolDefinition(
     name="read_file",
     description="读取文件",
     access=ToolAccess.READ,
-    arguments_model=ReadArguments,
+    arguments=PydanticToolArguments(ReadArguments),
 )
 
 

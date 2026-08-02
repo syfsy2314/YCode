@@ -1,3 +1,4 @@
+import asyncio
 from io import StringIO
 
 import pytest
@@ -162,3 +163,34 @@ async def test_approval_accepts_only_direct_three_way_choice() -> None:
         pipe_input.send_text("2")
 
         assert await box.read_approval(decision) is ApprovalChoice.ALLOW_ONCE
+
+
+@pytest.mark.asyncio
+async def test_approval_without_session_option_does_not_bind_three() -> None:
+    subject = PermissionSubject(
+        ToolCallBlock("call-1", "mcp_demo_echo", {}),
+        {},
+        {"tool": "mcp_demo_echo", "arguments": {}},
+        "{}",
+    )
+    decision = PermissionDecision(
+        PermissionAction.ASK,
+        subject,
+        "plan_only_mcp_approval",
+        "每次确认。",
+        allow_session=False,
+    )
+    with create_pipe_input() as pipe_input:
+        box = InputBox(
+            console=console(),
+            unicode_supported=True,
+            input=pipe_input,
+            output=DummyOutput(),
+        )
+        task = asyncio.create_task(box.read_approval(decision))
+        pipe_input.send_text("3")
+        await asyncio.sleep(0.05)
+
+        assert not task.done()
+        pipe_input.send_text("2")
+        assert await task is ApprovalChoice.ALLOW_ONCE

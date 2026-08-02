@@ -2,6 +2,7 @@
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ycode.tools.arguments import PydanticToolArguments
 from ycode.tools.contracts import (
     ToolAccess,
     ToolContext,
@@ -29,7 +30,7 @@ class WriteFileTool:
             "覆盖已有文件前必须先使用 read_file 读取。"
         ),
         access=ToolAccess.WRITE,
-        arguments_model=WriteFileArguments,
+        arguments=PydanticToolArguments(WriteFileArguments),
     )
     timeout_seconds = 30.0
 

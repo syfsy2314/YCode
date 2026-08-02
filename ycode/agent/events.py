@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from ycode.agent.contracts import AgentMode
 from ycode.core.messages import ChatMessage, ToolCallBlock
+from ycode.mcp.models import McpStatusReport
 from ycode.security.models import PermissionDecision, PermissionMode
 from ycode.tools.contracts import ToolExecutionRecord
 
@@ -182,6 +183,15 @@ class AgentErrorEvent:
             raise ValueError("Agent 错误码和消息不能为空")
 
 
+@dataclass(frozen=True, slots=True)
+class McpStatusEvent:
+    report: McpStatusReport
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.report, McpStatusReport):
+            raise TypeError("MCP 状态事件必须携带 McpStatusReport")
+
+
 type AgentEvent = (
     UserMessageEvent
     | AgentThinkingDelta
@@ -197,4 +207,5 @@ type AgentEvent = (
     | AgentLimitReachedEvent
     | AgentCancelledEvent
     | AgentErrorEvent
+    | McpStatusEvent
 )

@@ -5,11 +5,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol, runtime_checkable
-
-from pydantic import BaseModel
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from ycode.core.messages import FrozenJsonObject, ToolCallBlock, freeze_json
+from ycode.tools.arguments import ToolArguments
+
+if TYPE_CHECKING:
+    from ycode.tools.exposure import ToolExposureSession
 
 _TOOL_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 
@@ -23,14 +25,15 @@ class ToolAccess(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class ToolDefinition[ArgumentsT: BaseModel]:
-    """工具元信息及其唯一参数模型。"""
+class ToolDefinition[ArgumentsT]:
+    """工具元信息及其参数适配器。"""
 
     name: str
     description: str
     access: ToolAccess
-    arguments_model: type[ArgumentsT]
-    _input_schema: FrozenJsonObject = field(init=False, repr=False)
+    arguments: ToolArguments[ArgumentsT]
+    defer_loading: bool = False
+    timeout_error_code: str = "timeout"
 
     def __post_init__(self) -> None:
         if not _TOOL_NAME_PATTERN.fullmatch(self.name):
@@ -39,19 +42,19 @@ class ToolDefinition[ArgumentsT: BaseModel]:
             raise ValueError("工具描述不能为空")
         if not isinstance(self.access, ToolAccess):
             raise TypeError("工具访问分类必须是 ToolAccess")
-        if not isinstance(self.arguments_model, type) or not issubclass(
-            self.arguments_model, BaseModel
-        ):
-            raise TypeError("工具参数模型必须继承 Pydantic BaseModel")
-
-        schema = freeze_json(self.arguments_model.model_json_schema())
-        if not isinstance(schema, Mapping):
-            raise TypeError("工具参数 Schema 必须是 JSON object")
-        object.__setattr__(self, "_input_schema", schema)
+        if not isinstance(self.arguments, ToolArguments):
+            raise TypeError("工具参数必须满足 ToolArguments 协议")
+        if not isinstance(self.defer_loading, bool):
+            raise TypeError("延迟加载标记必须是布尔值")
+        if not self.timeout_error_code:
+            raise ValueError("超时错误码不能为空")
 
     @property
     def input_schema(self) -> FrozenJsonObject:
-        return self._input_schema
+        schema = freeze_json(self.arguments.input_schema)
+        if not isinstance(schema, Mapping):
+            raise TypeError("工具参数 Schema 必须是 JSON object")
+        return schema
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +62,7 @@ class ToolContext:
     """单次工具执行共享的工作区上下文。"""
 
     workspace: Path
+    exposure: "ToolExposureSession | None" = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.workspace, Path):
@@ -113,7 +117,7 @@ class ToolExecutionRecord:
 
 
 @runtime_checkable
-class Tool[ArgumentsT: BaseModel](Protocol):
+class Tool[ArgumentsT](Protocol):
     """所有工具必须结构化满足的统一接口。"""
 
     definition: ToolDefinition[ArgumentsT]

@@ -2,6 +2,7 @@
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ycode.tools.arguments import PydanticToolArguments
 from ycode.tools.command import CommandRunner
 from ycode.tools.contracts import (
     ToolAccess,
@@ -27,7 +28,7 @@ class RunCommandTool:
             "存在专用文件或搜索工具时应优先使用专用工具。"
         ),
         access=ToolAccess.WRITE,
-        arguments_model=RunCommandArguments,
+        arguments=PydanticToolArguments(RunCommandArguments),
     )
     timeout_seconds = 120.0
 

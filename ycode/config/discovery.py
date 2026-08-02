@@ -7,6 +7,15 @@ from ycode.errors import ConfigError
 CONFIG_RELATIVE_PATH = Path(".ycode") / "config.yaml"
 
 
+def resolve_project_root(config_path: str | Path) -> Path:
+    """根据实际使用的配置文件路径确定项目根目录。"""
+
+    path = Path(config_path).expanduser().resolve()
+    if path.name == "config.yaml" and path.parent.name == ".ycode":
+        return path.parent.parent
+    return path.parent
+
+
 def discover_config(
     explicit_path: str | Path | None = None,
     *,

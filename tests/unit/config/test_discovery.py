@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from ycode.config.discovery import discover_config
+from ycode.config.discovery import discover_config, resolve_project_root
 from ycode.errors import ConfigError
 
 
@@ -39,3 +39,19 @@ def test_search_failure_reports_start_and_target(tmp_path: Path) -> None:
     message = str(caught.value)
     assert str(tmp_path.resolve()) in message
     assert ".ycode/config.yaml" in message
+
+
+def test_resolves_project_root_for_standard_config(tmp_path: Path) -> None:
+    config_path = tmp_path / ".ycode" / "config.yaml"
+    config_path.parent.mkdir()
+    config_path.touch()
+
+    assert resolve_project_root(config_path) == tmp_path.resolve()
+
+
+def test_resolves_project_root_for_custom_config(tmp_path: Path) -> None:
+    config_path = tmp_path / "settings" / "custom.yaml"
+    config_path.parent.mkdir()
+    config_path.touch()
+
+    assert resolve_project_root(config_path) == config_path.parent.resolve()

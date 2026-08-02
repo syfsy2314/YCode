@@ -5,8 +5,6 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-from pydantic import ValidationError
-
 from ycode.core.messages import ToolCallBlock, freeze_json, thaw_json
 from ycode.security.models import (
     ArgumentMatcher,
@@ -20,6 +18,7 @@ from ycode.security.models import (
 )
 from ycode.security.powershell import PowerShellSafetyChecker
 from ycode.tools import ToolAccess, ToolRegistry
+from ycode.tools.arguments import ToolArgumentValidationError
 from ycode.tools.errors import ToolError
 from ycode.tools.paths import WorkspacePathResolver
 
@@ -39,6 +38,7 @@ class PermissionEngine:
         self._resolver = resolver
         self._config = config
         self._command_checker = command_checker
+        self._plan_only_mcp_tools = frozenset(config.plan_only.allow_mcp_tools)
 
     async def evaluate(
         self,
@@ -46,6 +46,7 @@ class PermissionEngine:
         session: PermissionSession,
         *,
         allowed_access: frozenset[ToolAccess],
+        plan_only: bool = False,
     ) -> PermissionDecision:
         try:
             tool = self._registry.get(call.name)
@@ -68,11 +69,39 @@ class PermissionEngine:
                         safety.message,
                     )
             if tool.definition.access not in allowed_access:
+                if not (
+                    plan_only
+                    and tool.definition.name in self._plan_only_mcp_tools
+                    and tool.definition.access is ToolAccess.UNKNOWN
+                    and tool.definition.defer_loading
+                ):
+                    return PermissionDecision(
+                        PermissionAction.DENY,
+                        subject,
+                        "access_not_available",
+                        "当前模式不允许执行该工具。",
+                    )
+            rule = self._first_matching_rule(call.name, subject.normalized_arguments)
+            if rule is not None and rule.action is PermissionAction.DENY:
                 return PermissionDecision(
-                    PermissionAction.DENY,
+                    rule.action,
                     subject,
-                    "access_not_available",
-                    "当前模式不允许执行该工具。",
+                    "project_rule",
+                    _action_message(rule.action, f"项目规则 {rule.id}"),
+                    rule.id,
+                )
+            if (
+                plan_only
+                and tool.definition.name in self._plan_only_mcp_tools
+                and tool.definition.access is ToolAccess.UNKNOWN
+                and tool.definition.defer_loading
+            ):
+                return PermissionDecision(
+                    PermissionAction.ASK,
+                    subject,
+                    "plan_only_mcp_approval",
+                    "plan-only 模式下 MCP 工具每次都需要确认。",
+                    allow_session=False,
                 )
             if session.allows(subject.session_key):
                 return PermissionDecision(
@@ -81,7 +110,6 @@ class PermissionEngine:
                     "session_grant",
                     "本会话已允许相同工具调用。",
                 )
-            rule = self._first_matching_rule(call.name, subject.normalized_arguments)
             if rule is not None:
                 return PermissionDecision(
                     rule.action,
@@ -97,7 +125,7 @@ class PermissionEngine:
                 f"mode_{session.mode.value}",
                 _action_message(action, f"{session.mode.value} 权限模式"),
             )
-        except (ToolError, ValidationError, TypeError, ValueError, KeyError):
+        except (ToolArgumentValidationError, ToolError, TypeError, ValueError, KeyError):
             return self._fallback_denial(
                 call,
                 "invalid_or_unsafe_arguments",
@@ -119,7 +147,12 @@ class PermissionEngine:
         if tool is None:
             raise ValueError("工具未注册")
         raw = thaw_json(call.arguments)
-        arguments = tool.definition.arguments_model.model_validate(raw).model_dump(mode="python")
+        if not isinstance(raw, Mapping):
+            raise TypeError("工具参数必须是 JSON object")
+        validated = tool.definition.arguments.validate(raw)
+        arguments = thaw_json(tool.definition.arguments.to_mapping(validated))
+        if not isinstance(arguments, dict):
+            raise TypeError("规范化参数不是 JSON object")
         self._normalize_paths(call.name, arguments)
         session_key = _session_key(call.name, arguments, access)
         normalized = freeze_json(arguments)

@@ -38,6 +38,14 @@ YCode 默认从当前工作目录开始逐级向上寻找最近的 `.ycode/confi
 ycode --config D:\path\to\config.yaml
 ```
 
+### MCP 工具
+
+Anthropic 配置可在顶层使用 `mcp_servers` 接入本地 `stdio` 或远程 `streamable_http` MCP Server。项目根是标准 `.ycode/config.yaml` 的上级目录；显式使用其他 YAML 时则是该文件所在目录。项目根目录的 `.env` 会自动读取，系统环境变量优先于 `.env`；不要提交真实 `.env`。`${VARIABLE}` 可用于 stdio 的 `env` 值和 HTTP `headers` 值，变量只传给对应 Server。每个 Server 可设置 `enabled`、`startup_timeout_seconds`（默认 10 秒）和 `tool_timeout_seconds`（默认 60 秒）。
+
+发现的工具以 `mcp_<server>_<tool>` 名称注册，并默认延迟加载：模型先通过 `tool_search` 搜索需要的名称，下一轮才会收到完整 Schema。输入 `/mcp` 可查看本地连接状态；工具目录只在启动时发现，修改 Server 后需重启。
+
+plan-only 默认不显示 MCP 工具。可在 `.ycode/security.yaml` 配置 `plan_only.allow_mcp_tools` 精确白名单；即使在白名单内，每一次 MCP 调用仍需要人工确认，不能授予会话永久权限。首版不支持 OAuth、Resources、Prompts，也不向 OpenAI 路径接入 MCP。
+
 ## 启动
 
 ```powershell

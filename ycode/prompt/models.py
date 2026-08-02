@@ -64,6 +64,7 @@ class SupplementKind(StrEnum):
     TOOL_STATE = "tool_state"
     MEMORY = "memory"
     REMINDER = "reminder"
+    TOOL_CATALOG = "tool_catalog"
 
 
 class SupplementScope(StrEnum):

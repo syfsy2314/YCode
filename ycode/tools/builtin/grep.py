@@ -8,6 +8,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ycode.tools.arguments import PydanticToolArguments
 from ycode.tools.async_utils import check_thread_cancelled, run_cancellable_thread
 from ycode.tools.contracts import (
     ToolAccess,
@@ -48,7 +49,7 @@ class GrepTool:
         name="grep",
         description="使用 Python 正则逐行搜索工作区 UTF-8 文本，并遵循根 .gitignore。",
         access=ToolAccess.READ,
-        arguments_model=GrepArguments,
+        arguments=PydanticToolArguments(GrepArguments),
     )
     timeout_seconds = 30.0
 

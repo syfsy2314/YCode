@@ -9,13 +9,18 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
-from ycode.config.models import AppConfig, ProviderConfig
+from ycode.config.discovery import resolve_project_root
+from ycode.config.environment import EnvironmentResolver, SecretRedactor, load_project_dotenv
+from ycode.config.mcp import LoadedAppConfig, McpConfigSet, load_mcp_servers
+from ycode.config.models import AppConfig, ProviderConfig, ProviderProtocol
 from ycode.errors import ConfigError
 
 _ENV_REFERENCE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
 
-def _expand_active_api_key(data: dict[str, Any], index: int) -> dict[str, Any]:
+def _expand_active_api_key(
+    data: dict[str, Any], index: int, resolver: EnvironmentResolver | None = None
+) -> dict[str, Any]:
     expanded = copy.deepcopy(data)
     raw_key = expanded.get("api_key")
     if not isinstance(raw_key, str):
@@ -26,6 +31,13 @@ def _expand_active_api_key(data: dict[str, Any], index: int) -> dict[str, Any]:
         return expanded
 
     variable_name = match.group(1)
+    if resolver is not None:
+        try:
+            expanded["api_key"] = resolver.interpolate(raw_key)
+        except ConfigError as error:
+            raise ConfigError(f"providers[{index}].api_key {error}") from error
+        return expanded
+
     value = os.environ.get(variable_name)
     if value is None:
         raise ConfigError(f"providers[{index}].api_key 引用的环境变量不存在：{variable_name}")
@@ -42,8 +54,8 @@ def _format_validation_error(error: ValidationError, prefix: tuple[str | int, ..
     return "；".join(details)
 
 
-def load_config(path: str | Path) -> AppConfig:
-    """读取指定 YAML 文件，展开 Key 引用并返回校验后的配置。"""
+def load_config(path: str | Path) -> LoadedAppConfig:
+    """读取指定 YAML 文件并返回包含 MCP 加载结果的配置。"""
 
     config_path = Path(path)
     try:
@@ -68,7 +80,15 @@ def load_config(path: str | Path) -> AppConfig:
     active_index = next(
         index for index, provider in enumerate(config.providers) if provider.name == config.active
     )
-    active_data = _expand_active_api_key(config.providers[active_index].as_mapping(), active_index)
+    active_data = config.providers[active_index].as_mapping()
+    redactor = SecretRedactor()
+    project_root = resolve_project_root(config_path)
+    resolver: EnvironmentResolver | None = None
+
+    if active_data.get("protocol") == ProviderProtocol.ANTHROPIC:
+        resolver = EnvironmentResolver(load_project_dotenv(project_root))
+
+    active_data = _expand_active_api_key(active_data, active_index, resolver)
 
     try:
         active_provider = ProviderConfig.model_validate(active_data)
@@ -77,4 +97,17 @@ def load_config(path: str | Path) -> AppConfig:
             f"配置校验失败：{_format_validation_error(error, ('providers', active_index))}"
         ) from error
 
-    return config.with_active_provider(active_provider)
+    redactor.add(active_provider.api_key)
+    loaded_app = config.with_active_provider(active_provider)
+    mcp = (
+        load_mcp_servers(config.mcp_servers, resolver, redactor)
+        if resolver is not None
+        else McpConfigSet()
+    )
+    return LoadedAppConfig(
+        app=loaded_app,
+        active_provider=active_provider,
+        project_root=project_root,
+        mcp=mcp,
+        redactor=redactor,
+    )

@@ -3,9 +3,8 @@
 import asyncio
 from collections.abc import Mapping
 
-from pydantic import ValidationError
-
 from ycode.core.messages import ToolCallBlock, thaw_json
+from ycode.tools.arguments import ToolArgumentValidationError
 from ycode.tools.contracts import (
     ToolAccess,
     ToolContext,
@@ -35,15 +34,11 @@ class ToolExecutor:
         if not isinstance(arguments, Mapping):
             return _error_result("invalid_arguments", "工具参数必须是 JSON object。")
         try:
-            validated = tool.definition.arguments_model.model_validate(dict(arguments))
-        except ValidationError as error:
+            validated = tool.definition.arguments.validate(dict(arguments))
+        except ToolArgumentValidationError as error:
             details = [
-                {
-                    "field": ".".join(str(item) for item in issue["loc"]),
-                    "message": issue["msg"],
-                    "type": issue["type"],
-                }
-                for issue in error.errors(include_url=False, include_input=False)
+                {"field": detail.field, "message": detail.message, "type": detail.type}
+                for detail in error.details
             ]
             return _error_result(
                 "invalid_arguments",
@@ -58,7 +53,7 @@ class ToolExecutor:
             raise
         except TimeoutError:
             return _error_result(
-                "timeout",
+                tool.definition.timeout_error_code,
                 "工具执行超时。",
                 metadata={"timeout_seconds": tool.timeout_seconds},
             )

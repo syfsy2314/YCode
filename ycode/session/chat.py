@@ -16,12 +16,14 @@ from ycode.agent.events import (
     AgentEvent,
     AgentLimitReachedEvent,
     FinalResponseEvent,
+    McpStatusEvent,
     ModeChangedEvent,
     PermissionGrantsClearedEvent,
     PermissionModeChangedEvent,
     UserMessageEvent,
 )
 from ycode.core.messages import ChatMessage
+from ycode.mcp.models import McpStatusProvider
 from ycode.security import ApprovalChoice, PermissionMode, PermissionSession
 
 type _TerminalEvent = (
@@ -34,11 +36,13 @@ class ChatSession:
         self,
         runner: ConversationRunner,
         permission_session: PermissionSession | None = None,
+        mcp_status_provider: McpStatusProvider | None = None,
     ) -> None:
         self._runner = runner
         self._history: list[ChatMessage] = []
         self._mode = AgentMode.AGENT
         self._permission_session = permission_session
+        self._mcp_status_provider = mcp_status_provider
         self._active_turn: AgentTurn | None = None
         self._turn_finished = asyncio.Event()
         self._turn_finished.set()
@@ -55,6 +59,12 @@ class ChatSession:
     @property
     def permission_mode(self) -> PermissionMode | None:
         return self._permission_session.mode if self._permission_session is not None else None
+
+    @property
+    def mcp_status(self):
+        if self._mcp_status_provider is None:
+            return None
+        return self._mcp_status_provider.snapshot()
 
     async def stream_reply(self, user_text: str) -> AsyncIterator[AgentEvent]:
         if not user_text.strip():
@@ -78,6 +88,13 @@ class ChatSession:
             previous = self._mode
             self._mode = target
             yield ModeChangedEvent(previous, target)
+            return
+        if command == "/mcp":
+            yield UserMessageEvent(user_message)
+            if self._mcp_status_provider is None:
+                yield AgentErrorEvent("mcp_unavailable", "当前没有 MCP 状态信息。")
+            else:
+                yield McpStatusEvent(self._mcp_status_provider.snapshot())
             return
         if self._permission_session is not None and command.startswith("/permission"):
             yield UserMessageEvent(user_message)

@@ -11,6 +11,7 @@ from ycode.security import (
     load_security_config,
 )
 from ycode.tools import (
+    PydanticToolArguments,
     ToolAccess,
     ToolContext,
     ToolDefinition,
@@ -30,7 +31,7 @@ class ExampleTool:
         name="example_tool",
         description="测试工具",
         access=ToolAccess.READ,
-        arguments_model=ExampleArguments,
+        arguments=PydanticToolArguments(ExampleArguments),
     )
     timeout_seconds = 1.0
 
@@ -53,7 +54,8 @@ def test_missing_config_uses_default_mode_and_empty_rules(
     tmp_path: Path,
     registry: ToolRegistry,
 ) -> None:
-    config = load_security_config(tmp_path, registry)
+    result = load_security_config(tmp_path, registry)
+    config = result.config
 
     assert config.mode is PermissionMode.DEFAULT
     assert config.rules == ()
@@ -93,11 +95,45 @@ rules:
         encoding="utf-8",
     )
 
-    config = load_security_config(tmp_path, registry)
+    result = load_security_config(tmp_path, registry)
+    config = result.config
 
     assert config.mode is PermissionMode.STRICT
     assert config.rules[0].action is PermissionAction.ALLOW
     assert config.rules[0].arguments["path"].glob == "*.md"
+    assert result.warnings == ()
+
+
+def test_unavailable_mcp_references_warn_and_continue(
+    tmp_path: Path,
+    registry: ToolRegistry,
+) -> None:
+    config_path = tmp_path / ".ycode" / "security.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text(
+        """
+rules:
+  - id: allow-later
+    action: allow
+    tool: mcp_later_echo
+    arguments:
+      not_yet_known:
+        exact: x
+plan_only:
+  allow_mcp_tools:
+    - mcp_later_echo
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = load_security_config(tmp_path, registry)
+
+    assert result.config.rules[0].tool == "mcp_later_echo"
+    assert [warning.code for warning in result.warnings] == [
+        "mcp_rule_tool_unavailable",
+        "plan_only_mcp_tool_unavailable",
+    ]
+    assert all(warning.tool_name == "mcp_later_echo" for warning in result.warnings)
 
 
 @pytest.mark.parametrize(

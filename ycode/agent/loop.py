@@ -3,6 +3,7 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator, Sequence
+from typing import Protocol
 
 from ycode.agent.contracts import (
     AgentMode,
@@ -48,6 +49,7 @@ from ycode.tools.contracts import (
     ToolExecutionRecord,
     ToolExecutionResult,
 )
+from ycode.tools.exposure import ToolExposureSession
 from ycode.tools.registry import ToolRegistry
 from ycode.tools.scheduler import (
     ScheduledToolCancelled,
@@ -72,6 +74,8 @@ class AgentLoop:
         *,
         permission_engine: PermissionEngine | None = None,
         permission_session: PermissionSession | None = None,
+        plan_only_mcp_tools: frozenset[str] = frozenset(),
+        resource_manager: "_AsyncCloseable | None" = None,
         max_rounds: int = 10,
     ) -> None:
         if not isinstance(max_rounds, int) or isinstance(max_rounds, bool) or max_rounds < 1:
@@ -87,6 +91,9 @@ class AgentLoop:
             raise ValueError("权限引擎和权限会话必须同时提供")
         self._permission_engine = permission_engine
         self._permission_session = permission_session
+        self._plan_only_mcp_tools = plan_only_mcp_tools
+        self._resource_manager = resource_manager
+        self._close_task: asyncio.Task[None] | None = None
         self._max_rounds = max_rounds
 
     def start_turn(
@@ -103,7 +110,16 @@ class AgentLoop:
         return AgentTurnStream(lambda turn: self._run(turn, history_snapshot, user_message, mode))
 
     async def close(self) -> None:
-        await self._provider.close()
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close())
+        await self._close_task
+
+    async def _close(self) -> None:
+        try:
+            if self._resource_manager is not None:
+                await self._resource_manager.close()
+        finally:
+            await self._provider.close()
 
     async def _run(
         self,
@@ -119,12 +135,32 @@ class AgentLoop:
             if mode is AgentMode.PLAN_ONLY
             else frozenset({ToolAccess.READ, ToolAccess.WRITE, ToolAccess.UNKNOWN})
         )
-        definitions = self._registry.definitions(allowed_access)
+        execution_access = (
+            allowed_access | frozenset({ToolAccess.UNKNOWN})
+            if mode is AgentMode.PLAN_ONLY and self._plan_only_mcp_tools
+            else allowed_access
+        )
+        deferred_names = frozenset(
+            tool.definition.name
+            for tool in self._registry
+            if tool.definition.defer_loading
+            and (mode is AgentMode.AGENT or tool.definition.name in self._plan_only_mcp_tools)
+        )
+        exposure = ToolExposureSession(deferred_names)
+        context = ToolContext(self._context.workspace, exposure)
         usage = TokenUsage()
 
         try:
             environment = await turn.run_child(self._environment.collect())
             request_supplements = [environment.to_supplement()]
+            if deferred_names:
+                request_supplements.append(
+                    SystemSupplement(
+                        SupplementKind.TOOL_CATALOG,
+                        "Available deferred MCP tools (use tool_search before calling): "
+                        + ", ".join(sorted(deferred_names)),
+                    )
+                )
             if self._permission_session is not None:
                 request_supplements.append(
                     SystemSupplement(
@@ -141,6 +177,12 @@ class AgentLoop:
                 supplement.tagged_content for supplement in prompt_context.supplements
             )
             for round_number in range(1, self._max_rounds + 1):
+                definitions = self._registry.definitions(allowed_access, exposure.exposed_names)
+                if mode is AgentMode.PLAN_ONLY and not deferred_names:
+                    definitions = tuple(
+                        definition for definition in definitions if definition.name != "tool_search"
+                    )
+                advertised_names = frozenset(definition.name for definition in definitions)
                 assembler = ResponseAssembler()
                 stream = self._provider.stream_agent(
                     AgentModelRequest(
@@ -212,14 +254,25 @@ class AgentLoop:
                     )
                     return
 
-                denied_results: dict[int, ToolExecutionResult] = {}
+                denied_results = {
+                    position: _tool_not_discovered_result()
+                    for position, call in enumerate(tool_calls)
+                    if (
+                        (tool := self._registry.get(call.name)) is not None
+                        and tool.definition.defer_loading
+                        and call.name not in advertised_names
+                    )
+                }
                 if self._permission_engine is not None and self._permission_session is not None:
                     for position, call in enumerate(tool_calls):
+                        if position in denied_results:
+                            continue
                         decision = await turn.run_child(
                             self._permission_engine.evaluate(
                                 call,
                                 self._permission_session,
                                 allowed_access=allowed_access,
+                                plan_only=mode is AgentMode.PLAN_ONLY,
                             )
                         )
                         if decision.action is PermissionAction.ALLOW:
@@ -232,7 +285,7 @@ class AgentLoop:
                                 decision,
                             )
                             choice = await turn.run_child(turn.consume_approval())
-                            if choice is ApprovalChoice.ALLOW_SESSION:
+                            if choice is ApprovalChoice.ALLOW_SESSION and decision.allow_session:
                                 self._permission_session.grant(decision.subject.session_key)
                                 continue
                             if choice is ApprovalChoice.ALLOW_ONCE:
@@ -242,8 +295,8 @@ class AgentLoop:
                 records: list[ToolExecutionRecord] = []
                 scheduled = self._scheduler.stream(
                     tool_calls,
-                    self._context,
-                    allowed_access,
+                    context,
+                    execution_access,
                     denied_results,
                 )
                 while True:
@@ -341,6 +394,8 @@ class AgentLoop:
                 "Agent 运行时发生内部错误。",
                 usage,
             )
+        finally:
+            exposure.clear()
 
     @staticmethod
     def _finish_error(
@@ -387,3 +442,15 @@ def _permission_denied_result(decision: object) -> ToolExecutionResult:
             "rule_id": decision.rule_id,
         },
     )
+
+
+def _tool_not_discovered_result() -> ToolExecutionResult:
+    return ToolExecutionResult(
+        content="MCP 工具尚未通过 tool_search 发现。",
+        is_error=True,
+        metadata={"code": "tool_not_discovered"},
+    )
+
+
+class _AsyncCloseable(Protocol):
+    async def close(self) -> None: ...

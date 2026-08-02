@@ -2,6 +2,7 @@
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ycode.tools.arguments import PydanticToolArguments
 from ycode.tools.builtin.read_file import _newline_name
 from ycode.tools.contracts import (
     ToolAccess,
@@ -30,7 +31,7 @@ class EditFileTool:
             "编辑前必须先使用 read_file 读取目标内容。"
         ),
         access=ToolAccess.WRITE,
-        arguments_model=EditFileArguments,
+        arguments=PydanticToolArguments(EditFileArguments),
     )
     timeout_seconds = 30.0
 

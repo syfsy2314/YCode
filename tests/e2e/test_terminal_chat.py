@@ -921,6 +921,67 @@ def test_windows_terminal_recovers_after_interrupted_stream(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
+def test_windows_terminal_mcp_deferred_flow(tmp_path: Path, sse_server: SSETestServer) -> None:
+    project = tmp_path / "mcp-flow"
+    project.mkdir()
+    state_file = project / "mcp-state.jsonl"
+    python = Path.cwd() / ".venv" / "Scripts" / "python.exe"
+    mcp_server = Path.cwd() / "tests" / "support" / "mcp_stdio_server.py"
+    config_path = project / ".ycode" / "config.yaml"
+    write_anthropic_config(config_path, sse_server, thinking=False)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "mcp_servers:\n"
+        "  - name: fixture\n"
+        "    transport: stdio\n"
+        f"    command: '{python}'\n"
+        "    args:\n"
+        f"      - '{mcp_server}'\n"
+        "    env:\n"
+        "      YCODE_MCP_STATE_FILE: ${MCP_STATE_FILE}\n"
+        "      YCODE_MCP_TEST_SECRET: ${MCP_TEST_SECRET}\n",
+        encoding="utf-8",
+    )
+    (project / ".env").write_text(
+        f"MCP_STATE_FILE={state_file}\nMCP_TEST_SECRET=terminal-secret\n",
+        encoding="utf-8",
+    )
+    sse_server.enqueue(
+        anthropic_tool_response([("search", "tool_search", {"tool_names": ["mcp_fixture_echo"]})])
+    )
+    sse_server.enqueue(
+        anthropic_tool_response([("remote", "mcp_fixture_echo", {"value": "terminal-mcp"})])
+    )
+    sse_server.enqueue(anthropic_text_response("MCP flow completed"))
+    process, reader = spawn_ycode(project)
+    try:
+        reader.wait_for("可用 1 / 失败 0 / 未启用 0", timeout=25)
+        reader.wait_for("Send a message...", timeout=20)
+        process.write("/mcp\r")
+        reader.wait_for("MCP Servers", timeout=15)
+        reader.wait_for("fixture", timeout=15)
+        process.write("use MCP echo\r")
+        reader.wait_for("tool_search", timeout=20)
+        reader.wait_for("工具审批：mcp_fixture_echo", timeout=20)
+        process.write("2")
+        reader.wait_for("MCP flow completed", timeout=20)
+        reader.wait_for("Send a message...", timeout=15, count=3)
+        process.write("/exit\r")
+        wait_for_exit(process, timeout=15)
+        output = reader.snapshot()
+        assert "terminal-secret" not in output
+        assert "Traceback" not in output
+    finally:
+        stop_process(process)
+
+    state = [json.loads(line) for line in state_file.read_text(encoding="utf-8").splitlines()]
+    assert any(item.get("event") == "call" and item.get("tool") == "echo" for item in state)
+    assert state[-1]["event"] == "stopped"
+    assert [tool["name"] for tool in sse_server.requests[0].json["tools"]][-1] == ("tool_search")
+    assert "mcp_fixture_echo" not in {tool["name"] for tool in sse_server.requests[0].json["tools"]}
+    assert "mcp_fixture_echo" in {tool["name"] for tool in sse_server.requests[1].json["tools"]}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
 def test_windows_terminal_narrow_header_stacks_details(
     tmp_path: Path, sse_server: SSETestServer
 ) -> None:

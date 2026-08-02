@@ -44,6 +44,7 @@ from ycode.security import (
     SecurityConfig,
 )
 from ycode.tools import (
+    PydanticToolArguments,
     ToolAccess,
     ToolContext,
     ToolDefinition,
@@ -52,6 +53,7 @@ from ycode.tools import (
     ToolRegistry,
     ToolScheduler,
 )
+from ycode.tools.builtin.tool_search import ToolSearchTool
 from ycode.tools.paths import WorkspacePathResolver
 
 
@@ -62,12 +64,20 @@ class NoArguments(BaseModel):
 class CountingTool:
     timeout_seconds = 1.0
 
-    def __init__(self, name: str, access: ToolAccess, *, fail: bool = False) -> None:
+    def __init__(
+        self,
+        name: str,
+        access: ToolAccess,
+        *,
+        fail: bool = False,
+        defer_loading: bool = False,
+    ) -> None:
         self.definition = ToolDefinition(
             name=name,
             description=f"{name} 测试工具",
             access=access,
-            arguments_model=NoArguments,
+            arguments=PydanticToolArguments(NoArguments),
+            defer_loading=defer_loading,
         )
         self.calls = 0
         self.fail = fail
@@ -110,10 +120,13 @@ def create_loop(
     *tools: CountingTool,
     max_rounds: int = 10,
     permission_mode: PermissionMode | None = None,
+    plan_only_mcp_tools: frozenset[str] = frozenset(),
 ) -> AgentLoop:
     registry = ToolRegistry()
     for tool in tools:
         registry.register(tool)
+    if any(tool.definition.defer_loading for tool in tools):
+        registry.register(ToolSearchTool(registry))
     executor = ToolExecutor(registry)
     permission_session = PermissionSession(permission_mode) if permission_mode is not None else None
 
@@ -126,7 +139,10 @@ def create_loop(
         permission_engine = PermissionEngine(
             registry,
             WorkspacePathResolver(tmp_path),
-            SecurityConfig(mode=permission_mode),
+            SecurityConfig(
+                mode=permission_mode,
+                plan_only={"allow_mcp_tools": tuple(plan_only_mcp_tools)},
+            ),
             SafeChecker(),  # type: ignore[arg-type]
         )
 
@@ -144,6 +160,7 @@ def create_loop(
         ToolContext(workspace=tmp_path.resolve()),
         permission_engine=permission_engine,
         permission_session=permission_session,
+        plan_only_mcp_tools=plan_only_mcp_tools,
         max_rounds=max_rounds,
     )
 
@@ -160,6 +177,34 @@ def multi_tool_turn(*calls: tuple[str, str]):
             [
                 ToolCallStart(index, call_id, name),
                 ToolCallDelta(index, "{}"),
+                ToolCallComplete(index, block),
+            ]
+        )
+    events.append(StreamEnd(StopReason.TOOL_USE, StopReason.TOOL_USE.value))
+    return events
+
+
+def tool_turn_with_arguments(call_id: str, name: str, arguments: dict[str, object]):
+    block = ToolCallBlock(call_id, name, arguments)
+    encoded = json.dumps(arguments)
+    return [
+        ToolCallStart(0, call_id, name),
+        ToolCallDelta(0, encoded),
+        ToolCallComplete(0, block),
+        StreamEnd(StopReason.TOOL_USE, StopReason.TOOL_USE.value),
+    ]
+
+
+def multi_tool_turn_with_arguments(
+    *calls: tuple[str, str, dict[str, object]],
+):
+    events = []
+    for index, (call_id, name, arguments) in enumerate(calls):
+        block = ToolCallBlock(call_id, name, arguments)
+        events.extend(
+            [
+                ToolCallStart(index, call_id, name),
+                ToolCallDelta(index, json.dumps(arguments)),
                 ToolCallComplete(index, block),
             ]
         )
@@ -431,6 +476,144 @@ async def test_plan_only_advertises_reads_and_blocks_forged_write(tmp_path: Path
     blocked = provider.requests[1][-1].blocks(ToolResultBlock)[0]
     assert blocked.is_error
     assert "access_denied" in blocked.content
+
+
+@pytest.mark.asyncio
+async def test_deferred_tool_appears_on_next_round_after_search(tmp_path: Path) -> None:
+    tool = CountingTool("mcp_demo_echo", ToolAccess.UNKNOWN, defer_loading=True)
+    provider = FakeProvider(
+        [
+            tool_turn_with_arguments("search-1", "tool_search", {"tool_names": ["mcp_demo_echo"]}),
+            tool_turn("call-1", "mcp_demo_echo"),
+            final_turn(),
+        ]
+    )
+    loop = create_loop(tmp_path, provider, tool)
+
+    await consume(loop.start_turn((), ChatMessage.user_text("use MCP"), AgentMode.AGENT))
+
+    first_names = [item.name for item in provider.agent_requests[0].tools]
+    second_names = [item.name for item in provider.agent_requests[1].tools]
+    assert first_names == ["tool_search"]
+    assert second_names == ["mcp_demo_echo", "tool_search"]
+    assert tool.calls == 1
+    assert provider.agent_requests[0].supplements == provider.agent_requests[1].supplements
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("search_first", [True, False])
+async def test_same_batch_hidden_tool_is_not_discovered(tmp_path: Path, search_first: bool) -> None:
+    tool = CountingTool("mcp_demo_echo", ToolAccess.UNKNOWN, defer_loading=True)
+    search = ("search-1", "tool_search", {"tool_names": ["mcp_demo_echo"]})
+    hidden = ("call-1", "mcp_demo_echo", {})
+    calls = (search, hidden) if search_first else (hidden, search)
+    provider = FakeProvider([multi_tool_turn_with_arguments(*calls), final_turn()])
+
+    await consume(
+        create_loop(tmp_path, provider, tool).start_turn(
+            (), ChatMessage.user_text("use MCP"), AgentMode.AGENT
+        )
+    )
+
+    assert tool.calls == 0
+    results = provider.requests[1][-1].blocks(ToolResultBlock)
+    hidden_result = next(item for item in results if item.tool_call_id == "call-1")
+    assert json.loads(hidden_result.content)["metadata"]["code"] == "tool_not_discovered"
+    assert "mcp_demo_echo" in [item.name for item in provider.agent_requests[1].tools]
+
+
+@pytest.mark.asyncio
+async def test_deferred_exposure_resets_between_tasks(tmp_path: Path) -> None:
+    tool = CountingTool("mcp_demo_echo", ToolAccess.UNKNOWN, defer_loading=True)
+    provider = FakeProvider(
+        [
+            tool_turn_with_arguments("search-1", "tool_search", {"tool_names": ["mcp_demo_echo"]}),
+            final_turn("first"),
+            final_turn("second"),
+        ]
+    )
+    loop = create_loop(tmp_path, provider, tool)
+
+    await consume(loop.start_turn((), ChatMessage.user_text("first"), AgentMode.AGENT))
+    await consume(loop.start_turn((), ChatMessage.user_text("second"), AgentMode.AGENT))
+
+    assert "mcp_demo_echo" in [item.name for item in provider.agent_requests[1].tools]
+    assert "mcp_demo_echo" not in [item.name for item in provider.agent_requests[2].tools]
+
+
+@pytest.mark.asyncio
+async def test_plan_only_mcp_catalog_uses_whitelist(tmp_path: Path) -> None:
+    allowed = CountingTool("mcp_demo_allowed", ToolAccess.UNKNOWN, defer_loading=True)
+    hidden = CountingTool("mcp_demo_hidden", ToolAccess.UNKNOWN, defer_loading=True)
+    empty_provider = FakeProvider([final_turn()])
+
+    await consume(
+        create_loop(tmp_path, empty_provider, allowed, hidden).start_turn(
+            (), ChatMessage.user_text("plan"), AgentMode.PLAN_ONLY
+        )
+    )
+
+    assert [item.name for item in empty_provider.agent_requests[0].tools] == []
+    assert not any(
+        "mcp_demo_" in supplement for supplement in empty_provider.agent_requests[0].supplements
+    )
+
+    provider = FakeProvider(
+        [
+            tool_turn_with_arguments(
+                "search-1", "tool_search", {"tool_names": ["mcp_demo_allowed"]}
+            ),
+            final_turn(),
+        ]
+    )
+    await consume(
+        create_loop(
+            tmp_path,
+            provider,
+            allowed,
+            hidden,
+            plan_only_mcp_tools=frozenset({"mcp_demo_allowed"}),
+        ).start_turn((), ChatMessage.user_text("plan"), AgentMode.PLAN_ONLY)
+    )
+
+    assert [item.name for item in provider.agent_requests[0].tools] == ["tool_search"]
+    assert "mcp_demo_allowed" in provider.agent_requests[0].supplements[1]
+    assert "mcp_demo_hidden" not in provider.agent_requests[0].supplements[1]
+    assert [item.name for item in provider.agent_requests[1].tools] == [
+        "mcp_demo_allowed",
+        "tool_search",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_plan_only_whitelisted_mcp_executes_after_one_time_approval(
+    tmp_path: Path,
+) -> None:
+    tool = CountingTool("mcp_demo_allowed", ToolAccess.UNKNOWN, defer_loading=True)
+    provider = FakeProvider(
+        [
+            tool_turn_with_arguments("search", "tool_search", {"tool_names": ["mcp_demo_allowed"]}),
+            tool_turn("remote", "mcp_demo_allowed"),
+            final_turn(),
+        ]
+    )
+    turn = create_loop(
+        tmp_path,
+        provider,
+        tool,
+        permission_mode=PermissionMode.ALLOW,
+        plan_only_mcp_tools=frozenset({"mcp_demo_allowed"}),
+    ).start_turn((), ChatMessage.user_text("plan"), AgentMode.PLAN_ONLY)
+
+    events = []
+    async for event in turn:
+        events.append(event)
+        if isinstance(event, ToolApprovalRequested):
+            assert event.decision.allow_session is False
+            turn.submit_approval(ApprovalChoice.ALLOW_ONCE)
+
+    assert sum(isinstance(event, ToolApprovalRequested) for event in events) == 1
+    assert tool.calls == 1
 
 
 @pytest.mark.asyncio

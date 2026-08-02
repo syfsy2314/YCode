@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict
 
 from ycode.core.messages import ToolCallBlock
 from ycode.tools import (
+    PydanticToolArguments,
     ScheduledToolCancelled,
     ScheduledToolCompleted,
     ScheduledToolStarted,
@@ -30,7 +31,7 @@ class ClassifiedTool:
             name=name,
             description=f"{name} 测试工具",
             access=access,
-            arguments_model=NoArguments,
+            arguments=PydanticToolArguments(NoArguments),
         )
 
     async def execute(

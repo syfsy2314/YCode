@@ -5,6 +5,7 @@ import threading
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ycode.tools.arguments import PydanticToolArguments
 from ycode.tools.async_utils import run_cancellable_thread
 from ycode.tools.contracts import (
     ToolAccess,
@@ -28,7 +29,7 @@ class GlobTool:
         name="glob",
         description="按工作区相对 POSIX Glob 查找文件，并遵循根 .gitignore。",
         access=ToolAccess.READ,
-        arguments_model=GlobArguments,
+        arguments=PydanticToolArguments(GlobArguments),
     )
     timeout_seconds = 30.0
 

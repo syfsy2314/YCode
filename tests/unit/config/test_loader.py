@@ -75,7 +75,7 @@ def test_inactive_provider_is_not_fully_validated_or_expanded(tmp_path: Path) ->
     config = load_config(path)
 
     assert config.active_provider.name == "local"
-    assert config.providers[1].as_mapping()["protocol"] == "future-protocol"
+    assert config.app.providers[1].as_mapping()["protocol"] == "future-protocol"
     assert path.read_text(encoding="utf-8") == original
 
 
@@ -145,4 +145,51 @@ def test_top_level_must_be_mapping(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text("- invalid", encoding="utf-8")
     with pytest.raises(ConfigError, match="顶层"):
+        load_config(path)
+
+
+def test_anthropic_loads_dotenv_from_project_root(tmp_path: Path) -> None:
+    path = tmp_path / ".ycode" / "config.yaml"
+    path.parent.mkdir()
+    write_config(path, "${YCODE_TEST_KEY}")
+    (tmp_path / ".env").write_text("YCODE_TEST_KEY=dotenv-secret\n", encoding="utf-8")
+
+    loaded = load_config(path)
+
+    assert loaded.project_root == tmp_path.resolve()
+    assert loaded.active_provider.api_key.get_secret_value() == "dotenv-secret"
+    assert loaded.redactor.redact_text("dotenv-secret") == "[REDACTED]"
+
+
+def test_anthropic_mcp_issues_are_isolated(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    write_config(path)
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + "\nmcp_servers:\n"
+        + "  - name: valid\n    transport: stdio\n    command: python\n"
+        + "  - name: bad\n    transport: stdio\n    command: ''\n",
+        encoding="utf-8",
+    )
+
+    loaded = load_config(path)
+
+    assert [server.name for server in loaded.mcp.servers] == ["valid"]
+    assert [issue.server_name for issue in loaded.mcp.issues] == ["bad"]
+
+
+def test_openai_keeps_os_environment_behavior_and_ignores_mcp(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "active: local\nproviders:\n  - name: local\n    protocol: openai\n"
+        "    model: gpt-test\n    base_url: http://localhost:9000\n"
+        "    api_key: ${OPENAI_TEST_KEY}\n"
+        "mcp_servers:\n  - name: ignored\n    transport: stdio\n    command: python\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text(
+        "OPENAI_TEST_KEY=dotenv-secret\ninvalid env line\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigError, match="OPENAI_TEST_KEY"):
         load_config(path)

@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ycode.core.messages import ToolCallBlock, thaw_json
 from ycode.tools import (
+    PydanticToolArguments,
     Tool,
     ToolAccess,
     ToolContext,
@@ -26,7 +27,7 @@ EXAMPLE_DEFINITION = ToolDefinition(
     name="example_tool",
     description="用于测试的工具",
     access=ToolAccess.READ,
-    arguments_model=ExampleArguments,
+    arguments=PydanticToolArguments(ExampleArguments),
 )
 
 
@@ -61,7 +62,7 @@ def test_definition_rejects_non_snake_case_name(name: str) -> None:
             name=name,
             description="描述",
             access=ToolAccess.READ,
-            arguments_model=ExampleArguments,
+            arguments=PydanticToolArguments(ExampleArguments),
         )
 
 
@@ -71,15 +72,15 @@ def test_definition_rejects_invalid_metadata() -> None:
             name="empty_description",
             description=" ",
             access=ToolAccess.READ,
-            arguments_model=ExampleArguments,
+            arguments=PydanticToolArguments(ExampleArguments),
         )
 
-    with pytest.raises(TypeError, match="BaseModel"):
+    with pytest.raises(TypeError, match="ToolArguments"):
         ToolDefinition(
             name="invalid_model",
             description="描述",
             access=ToolAccess.READ,
-            arguments_model=dict,  # type: ignore[arg-type]
+            arguments=dict,  # type: ignore[arg-type]
         )
 
 
@@ -88,7 +89,7 @@ def test_definition_accepts_unknown_access_for_adapted_tools() -> None:
         name="adapted_tool",
         description="未知安全分类的适配工具",
         access=ToolAccess.UNKNOWN,
-        arguments_model=ExampleArguments,
+        arguments=PydanticToolArguments(ExampleArguments),
     )
 
     assert definition.access is ToolAccess.UNKNOWN

@@ -9,6 +9,7 @@ from ycode.agent import (
     AgentMode,
     AgentTextDelta,
     FinalResponseEvent,
+    McpStatusEvent,
     ModeChangedEvent,
     PermissionGrantsClearedEvent,
     PermissionModeChangedEvent,
@@ -17,6 +18,7 @@ from ycode.agent import (
 )
 from ycode.core import StopReason, StreamEnd, TextDelta
 from ycode.errors import ProviderError
+from ycode.mcp.models import McpConnectionState, McpServerStatus, McpStatusReport
 from ycode.security import PermissionMode, PermissionSession
 from ycode.session.chat import ChatSession
 
@@ -203,6 +205,41 @@ async def test_plain_session_keeps_permission_text_as_normal_user_message() -> N
     await collect(session, "/permission allow")
 
     assert provider.requests[0][0].text == "/permission allow"
+
+
+@pytest.mark.asyncio
+async def test_mcp_command_returns_snapshot_without_model_or_history() -> None:
+    provider = FakeProvider([])
+    report = McpStatusReport((McpServerStatus("demo", "stdio", McpConnectionState.READY, 2),))
+
+    class StatusProvider:
+        def snapshot(self) -> McpStatusReport:
+            return report
+
+    session = ChatSession(PlainChatRunner(provider), mcp_status_provider=StatusProvider())
+
+    events = await collect(session, "/MCP")
+
+    assert isinstance(events[0], UserMessageEvent)
+    assert events[1] == McpStatusEvent(report)
+    assert provider.requests == []
+    assert session.history == ()
+
+
+@pytest.mark.asyncio
+async def test_mcp_without_provider_is_local_error_but_non_exact_is_message() -> None:
+    unavailable_provider = FakeProvider([])
+    unavailable = session_with(unavailable_provider)
+
+    events = await collect(unavailable, "/mcp")
+
+    assert events[-1] == AgentErrorEvent("mcp_unavailable", "当前没有 MCP 状态信息。")
+    assert unavailable_provider.requests == []
+
+    normal_provider = FakeProvider([text_response("answer")])
+    normal = session_with(normal_provider)
+    await collect(normal, "/mcp status")
+    assert normal_provider.requests[0][0].text == "/mcp status"
 
 
 @pytest.mark.asyncio

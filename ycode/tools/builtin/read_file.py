@@ -2,6 +2,7 @@
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ycode.tools.arguments import PydanticToolArguments
 from ycode.tools.contracts import (
     ToolAccess,
     ToolContext,
@@ -27,7 +28,7 @@ class ReadFileTool:
         name="read_file",
         description="读取工作区内的 UTF-8 文本文件，返回带行号的分页内容。",
         access=ToolAccess.READ,
-        arguments_model=ReadFileArguments,
+        arguments=PydanticToolArguments(ReadFileArguments),
     )
     timeout_seconds = 30.0
 

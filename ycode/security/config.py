@@ -6,7 +6,11 @@ import yaml
 from pydantic import ValidationError
 
 from ycode.errors import ConfigError
-from ycode.security.models import SecurityConfig
+from ycode.security.models import (
+    SecurityConfig,
+    SecurityConfigLoadResult,
+    SecurityConfigWarning,
+)
 from ycode.tools.registry import ToolRegistry
 
 SECURITY_RELATIVE_PATH = Path(".ycode") / "security.yaml"
@@ -23,10 +27,10 @@ def discover_security_config(start_dir: str | Path) -> Path | None:
     return None
 
 
-def load_security_config(start_dir: str | Path, registry: ToolRegistry) -> SecurityConfig:
+def load_security_config(start_dir: str | Path, registry: ToolRegistry) -> SecurityConfigLoadResult:
     path = discover_security_config(start_dir)
     if path is None:
-        return SecurityConfig()
+        return SecurityConfigLoadResult(SecurityConfig())
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     except OSError as error:
@@ -46,15 +50,33 @@ def load_security_config(start_dir: str | Path, registry: ToolRegistry) -> Secur
         )
         raise ConfigError(f"安全配置校验失败：{details}") from error
 
+    warnings: list[SecurityConfigWarning] = []
     for rule in config.rules:
         tool = registry.get(rule.tool)
         if tool is None:
+            if rule.tool.startswith("mcp_"):
+                warnings.append(
+                    SecurityConfigWarning(
+                        "mcp_rule_tool_unavailable",
+                        rule.tool,
+                        f"安全规则 {rule.id} 引用的 MCP 工具当前不可用。",
+                    )
+                )
+                continue
             raise ConfigError(f"安全规则 {rule.id} 引用了未知工具：{rule.tool}")
-        fields = tool.definition.arguments_model.model_fields
-        unknown = sorted(set(rule.arguments) - set(fields))
+        unknown = sorted(set(rule.arguments) - tool.definition.arguments.field_names)
         if unknown:
             raise ConfigError(f"安全规则 {rule.id} 引用了未知参数：{', '.join(unknown)}")
-    return config
+    for name in config.plan_only.allow_mcp_tools:
+        if registry.get(name) is None:
+            warnings.append(
+                SecurityConfigWarning(
+                    "plan_only_mcp_tool_unavailable",
+                    name,
+                    "plan-only 白名单引用的 MCP 工具当前不可用。",
+                )
+            )
+    return SecurityConfigLoadResult(config, tuple(warnings))
 
 
 def _format_validation_error(item: dict[str, object]) -> str:

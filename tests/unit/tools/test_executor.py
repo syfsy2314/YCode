@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ycode.core.messages import ToolCallBlock
 from ycode.tools import (
+    PydanticToolArguments,
     ToolAccess,
     ToolContext,
     ToolDefinition,
@@ -28,7 +29,7 @@ class FakeTool:
         name="fake_tool",
         description="测试统一执行器",
         access=ToolAccess.READ,
-        arguments_model=FakeArguments,
+        arguments=PydanticToolArguments(FakeArguments),
     )
     timeout_seconds = 1.0
 
@@ -85,6 +86,16 @@ class SlowTool(FakeTool):
         finally:
             self.cleaned.set()
         return ToolExecutionResult(content="never")
+
+
+class McpLikeSlowTool(SlowTool):
+    definition = ToolDefinition(
+        name="mcp_like_slow_tool",
+        description="测试 MCP 超时错误码",
+        access=ToolAccess.UNKNOWN,
+        arguments=PydanticToolArguments(FakeArguments),
+        timeout_error_code="mcp_timeout",
+    )
 
 
 def executor_with(tool: FakeTool) -> ToolExecutor:
@@ -205,3 +216,16 @@ async def test_executor_propagates_external_cancellation(tmp_path: Path) -> None
     with pytest.raises(asyncio.CancelledError):
         await task
     assert tool.cleaned.is_set()
+
+
+@pytest.mark.asyncio
+async def test_executor_uses_definition_timeout_error_code(tmp_path: Path) -> None:
+    tool = McpLikeSlowTool()
+
+    result = await executor_with(tool).execute(
+        ToolCallBlock(id="1", name="mcp_like_slow_tool", arguments={"value": "ok"}),
+        context(tmp_path),
+        frozenset({ToolAccess.UNKNOWN}),
+    )
+
+    assert result.metadata["error_code"] == "mcp_timeout"

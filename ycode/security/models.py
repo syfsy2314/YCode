@@ -55,11 +55,25 @@ class SecurityRule(BaseModel):
     arguments: dict[str, ArgumentMatcher] = Field(default_factory=dict)
 
 
+class PlanOnlySecurityConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    allow_mcp_tools: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_names(self) -> "PlanOnlySecurityConfig":
+        if len(set(self.allow_mcp_tools)) != len(self.allow_mcp_tools):
+            raise ValueError("allow_mcp_tools 不允许重复")
+        if any(not name.startswith("mcp_") for name in self.allow_mcp_tools):
+            raise ValueError("allow_mcp_tools 只能包含 mcp_* 工具")
+        return self
+
+
 class SecurityConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: PermissionMode = PermissionMode.DEFAULT
     rules: tuple[SecurityRule, ...] = ()
+    plan_only: PlanOnlySecurityConfig = Field(default_factory=PlanOnlySecurityConfig)
 
     @model_validator(mode="after")
     def validate_rule_ids(self) -> "SecurityConfig":
@@ -68,6 +82,23 @@ class SecurityConfig(BaseModel):
         if duplicates:
             raise ValueError(f"安全规则 ID 重复：{', '.join(duplicates)}")
         return self
+
+
+@dataclass(frozen=True, slots=True)
+class SecurityConfigWarning:
+    code: str
+    tool_name: str
+    message: str
+
+    def __post_init__(self) -> None:
+        if not self.code or not self.tool_name or not self.message:
+            raise ValueError("安全配置警告必须包含错误码、工具名和消息")
+
+
+@dataclass(frozen=True, slots=True)
+class SecurityConfigLoadResult:
+    config: SecurityConfig
+    warnings: tuple[SecurityConfigWarning, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +128,7 @@ class PermissionDecision:
     reason_code: str
     message: str
     rule_id: str = ""
+    allow_session: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.action, PermissionAction):

@@ -34,6 +34,7 @@ from ycode.providers.anthropic import AnthropicProvider
 from ycode.session.assembler import ResponseAssembler
 from ycode.session.chat import ChatSession
 from ycode.tools import (
+    PydanticToolArguments,
     ToolAccess,
     ToolContext,
     ToolDefinition,
@@ -56,7 +57,7 @@ READ_DEFINITION = ToolDefinition(
     name="read_file",
     description="读取文件",
     access=ToolAccess.READ,
-    arguments_model=ReadArguments,
+    arguments=PydanticToolArguments(ReadArguments),
 )
 
 

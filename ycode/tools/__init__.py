@@ -1,5 +1,12 @@
 """供应商无关的工具契约。"""
 
+from ycode.tools.arguments import (
+    JsonSchemaToolArguments,
+    PydanticToolArguments,
+    ToolArgumentIssue,
+    ToolArguments,
+    ToolArgumentValidationError,
+)
 from ycode.tools.contracts import (
     Tool,
     ToolAccess,
@@ -21,6 +28,10 @@ from ycode.tools.scheduler import (
 
 __all__ = [
     "Tool",
+    "JsonSchemaToolArguments",
+    "ToolArgumentIssue",
+    "ToolArgumentValidationError",
+    "ToolArguments",
     "ToolAccess",
     "ToolContext",
     "ToolDefinition",
@@ -29,6 +40,7 @@ __all__ = [
     "ToolExecutionRecord",
     "ToolExecutionResult",
     "ToolRegistry",
+    "PydanticToolArguments",
     "ToolScheduler",
     "ScheduledToolCancelled",
     "ScheduledToolCompleted",

@@ -35,11 +35,17 @@ class ToolRegistry:
     def definitions(
         self,
         allowed_access: frozenset[ToolAccess] | None = None,
+        exposed_deferred: frozenset[str] = frozenset(),
     ) -> tuple[ToolDefinition[Any], ...]:
         return tuple(
             tool.definition
             for tool in self._tools.values()
-            if allowed_access is None or tool.definition.access in allowed_access
+            if (
+                allowed_access is None
+                or tool.definition.access in allowed_access
+                or (tool.definition.defer_loading and tool.definition.name in exposed_deferred)
+            )
+            and (not tool.definition.defer_loading or tool.definition.name in exposed_deferred)
         )
 
     def __iter__(self) -> Iterator[Tool[Any]]:
