@@ -10,6 +10,16 @@ from ycode.prompt.models import (
 )
 
 _SUPPORTED_MODES = frozenset({"agent", "plan-only"})
+_SESSION_SUPPLEMENT_ORDER = {
+    SupplementKind.PROJECT_INSTRUCTIONS: 0,
+    SupplementKind.PROJECT_MEMORY: 1,
+    SupplementKind.MEMORY: 2,
+    SupplementKind.TOOL_STATE: 3,
+    SupplementKind.REMINDER: 4,
+    SupplementKind.ENVIRONMENT: 5,
+    SupplementKind.MODE: 6,
+    SupplementKind.TOOL_CATALOG: 7,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,7 +65,10 @@ class PromptRuntimeContext:
     def session_supplements(self) -> tuple[SystemSupplement, ...]:
         return tuple(
             self._session_supplements[kind]
-            for kind in sorted(self._session_supplements, key=lambda item: item.value)
+            for kind in sorted(
+                self._session_supplements,
+                key=lambda item: (_SESSION_SUPPLEMENT_ORDER[item], item.value),
+            )
         )
 
     def set_session_supplement(self, supplement: SystemSupplement) -> None:
@@ -69,6 +82,11 @@ class PromptRuntimeContext:
         if not isinstance(kind, SupplementKind):
             raise TypeError("会话补充类型必须是 SupplementKind")
         self._session_supplements.pop(kind, None)
+
+    def reset_mode(self) -> None:
+        """会话切换后让下一轮重新注入完整模式说明。"""
+
+        self._last_mode = None
 
     def begin_turn(
         self,

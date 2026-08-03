@@ -12,13 +12,22 @@ from ycode.errors import ConfigError, UIError
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ycode", description="YCode 终端 AI 助手")
     parser.add_argument("--config", help="显式指定 YAML 配置文件")
+    parser.add_argument(
+        "--continue",
+        dest="continue_session",
+        action="store_true",
+        help="恢复最近一次会话",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        asyncio.run(run_app(args.config))
+        if args.continue_session:
+            asyncio.run(run_app(args.config, continue_session=True))
+        else:
+            asyncio.run(run_app(args.config))
     except (ConfigError, UIError) as error:
         print(f"YCode: {error}", file=sys.stderr)
         return 2

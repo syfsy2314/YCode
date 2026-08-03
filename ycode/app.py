@@ -15,8 +15,15 @@ from ycode.context import (
     ConversationCompactor,
 )
 from ycode.core.provider import AgentChatProvider, ChatProvider
+from ycode.errors import ConfigError
 from ycode.mcp.manager import McpManager
-from ycode.prompt import EnvironmentCollector, PromptRuntimeContext, build_builtin_prompt
+from ycode.memory import MemoryStore, MemoryUpdater
+from ycode.prompt import (
+    EnvironmentCollector,
+    ProjectContextLoader,
+    PromptRuntimeContext,
+    build_builtin_prompt,
+)
 from ycode.providers.factory import create_provider
 from ycode.security import (
     PermissionEngine,
@@ -25,6 +32,7 @@ from ycode.security import (
     load_security_config,
 )
 from ycode.session.chat import ChatSession
+from ycode.session.manager import SessionManager
 from ycode.tools import ToolContext, ToolExecutor, ToolScheduler, create_builtin_registry
 from ycode.tools.builtin.tool_search import ToolSearchTool
 from ycode.tools.command import PowerShellCommandRunner
@@ -36,27 +44,32 @@ ProviderFactory = Callable[[ProviderConfig], ChatProvider]
 UIFactory = Callable[[ProviderConfig, ChatSession], Any]
 
 
-def _resolve_workspace(start_dir: str | Path | None) -> Path:
-    return Path(start_dir or Path.cwd()).resolve()
-
-
 async def run_app(
     config_path: str | Path | None = None,
     *,
     start_dir: str | Path | None = None,
     provider_factory: ProviderFactory = create_provider,
     ui_factory: UIFactory = TerminalUI,
+    continue_session: bool = False,
 ) -> None:
     path = discover_config(config_path, start_dir=start_dir)
     config = load_config(path)
+    if continue_session and config.active_provider.protocol is ProviderProtocol.OPENAI:
+        raise ConfigError("--continue 当前仅支持 Anthropic 会话")
     provider = provider_factory(config.active_provider)
-    workspace = _resolve_workspace(start_dir)
+    workspace = config.project_root
     permission_session: PermissionSession | None = None
     manager: McpManager | None = None
     context_manager: ContextManager | None = None
     session: ChatSession | None = None
     try:
         if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
+            memory_store = MemoryStore(workspace)
+            project_context = ProjectContextLoader(workspace, memory_store).load()
+            prompt_runtime = PromptRuntimeContext()
+            for supplement in project_context.supplements:
+                prompt_runtime.set_session_supplement(supplement)
+            session_manager = SessionManager(workspace)
             policy = ContextPolicy(config.app.context_window_tokens)
             context_manager = ContextManager(
                 policy,
@@ -89,7 +102,7 @@ async def run_app(
                 registry,
                 ToolScheduler(registry, ToolExecutor(registry)),
                 build_builtin_prompt(),
-                PromptRuntimeContext(),
+                prompt_runtime,
                 EnvironmentCollector(workspace),
                 ToolContext(workspace),
                 permission_engine=permission_engine,
@@ -100,7 +113,25 @@ async def run_app(
             )
         else:
             runner = PlainChatRunner(provider)
-        session = ChatSession(runner, permission_session, manager, context_manager)
+        if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
+            session = ChatSession(
+                runner,
+                permission_session,
+                manager,
+                context_manager,
+                session_manager=session_manager,
+                prompt_runtime=prompt_runtime,
+                memory_store=memory_store,
+                memory_updater=MemoryUpdater(cast(AgentChatProvider, provider)),
+                startup_warnings=tuple(warning.message for warning in project_context.warnings),
+            )
+            if continue_session:
+                try:
+                    await session.restore()
+                except Exception as error:
+                    raise ConfigError("最近会话恢复失败") from error
+        else:
+            session = ChatSession(runner, permission_session, manager, context_manager)
         ui = ui_factory(config.active_provider, session)
         await ui.run()
     finally:

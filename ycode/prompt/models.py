@@ -63,6 +63,8 @@ class SupplementKind(StrEnum):
     MODE = "task_mode"
     TOOL_STATE = "tool_state"
     MEMORY = "memory"
+    PROJECT_INSTRUCTIONS = "project_instructions"
+    PROJECT_MEMORY = "project_memory"
     REMINDER = "reminder"
     TOOL_CATALOG = "tool_catalog"
 
@@ -90,3 +92,32 @@ class SystemSupplement:
     def tagged_content(self) -> str:
         tag = self.kind.value
         return f"<{tag}>\n{self.content}\n</{tag}>"
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectContextWarning:
+    """项目上下文加载时可忽略的告警。"""
+
+    code: str
+    path: str
+    message: str
+
+    def __post_init__(self) -> None:
+        if not self.code.strip():
+            raise ValueError("项目上下文告警 code 不能为空")
+        if not self.path.strip():
+            raise ValueError("项目上下文告警 path 不能为空")
+        if not self.message.strip():
+            raise ValueError("项目上下文告警 message 不能为空")
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectContextSnapshot:
+    """应用启动时读取的项目上下文快照。"""
+
+    supplements: tuple[SystemSupplement, ...] = ()
+    warnings: tuple[ProjectContextWarning, ...] = ()
+
+    def __post_init__(self) -> None:
+        if any(item.scope is not SupplementScope.SESSION for item in self.supplements):
+            raise ValueError("项目上下文补充消息必须使用 session 作用域")

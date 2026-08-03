@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import suppress
+from datetime import UTC, datetime
 
 from ycode.agent.contracts import (
     AgentMode,
@@ -23,16 +24,28 @@ from ycode.agent.events import (
     ModeChangedEvent,
     PermissionGrantsClearedEvent,
     PermissionModeChangedEvent,
+    SessionRestoredEvent,
     UserMessageEvent,
 )
 from ycode.context import (
     ContextCompactionError,
     ContextCompactionNotNeeded,
     ContextManager,
+    RestoreContextResult,
 )
 from ycode.core.messages import ChatMessage
 from ycode.mcp.models import McpStatusProvider
+from ycode.memory import (
+    MemoryStore,
+    MemoryUpdater,
+    MemoryUpdateReport,
+    MemoryUpdateStatus,
+)
+from ycode.prompt import PromptRuntimeContext
+from ycode.prompt.models import SupplementKind, SystemSupplement
 from ycode.security import ApprovalChoice, PermissionMode, PermissionSession
+from ycode.session.manager import SessionManager
+from ycode.session.models import SessionCommit, SessionStorageError
 
 type _TerminalEvent = (
     FinalResponseEvent | AgentLimitReachedEvent | AgentCancelledEvent | AgentErrorEvent
@@ -46,6 +59,11 @@ class ChatSession:
         permission_session: PermissionSession | None = None,
         mcp_status_provider: McpStatusProvider | None = None,
         context_manager: ContextManager | None = None,
+        session_manager: SessionManager | None = None,
+        prompt_runtime: PromptRuntimeContext | None = None,
+        memory_store: MemoryStore | None = None,
+        memory_updater: MemoryUpdater | None = None,
+        startup_warnings: tuple[str, ...] = (),
     ) -> None:
         self._runner = runner
         self._history: list[ChatMessage] = []
@@ -53,11 +71,19 @@ class ChatSession:
         self._permission_session = permission_session
         self._mcp_status_provider = mcp_status_provider
         self._context_manager = context_manager
+        self._session_manager = session_manager
+        self._prompt_runtime = prompt_runtime
+        self._memory_store = memory_store
+        self._memory_updater = memory_updater
+        self._startup_warnings = tuple(startup_warnings)
         self._active_turn: AgentTurn | None = None
         self._active_compaction: asyncio.Task[object] | None = None
         self._turn_finished = asyncio.Event()
         self._turn_finished.set()
         self._closed = False
+        self._new_commits: list[SessionCommit] = []
+        self._memory_update_task: asyncio.Task[MemoryUpdateReport] | None = None
+        self._startup_restore_event: SessionRestoredEvent | None = None
 
     @property
     def history(self) -> tuple[ChatMessage, ...]:
@@ -77,6 +103,74 @@ class ChatSession:
             return None
         return self._mcp_status_provider.snapshot()
 
+    @property
+    def new_commits(self) -> tuple[SessionCommit, ...]:
+        return tuple(self._new_commits)
+
+    @property
+    def startup_warnings(self) -> tuple[str, ...]:
+        return self._startup_warnings
+
+    @property
+    def startup_restore_event(self) -> SessionRestoredEvent | None:
+        return self._startup_restore_event
+
+    async def restore(self, session_id: str | None = None) -> SessionRestoredEvent:
+        if self._session_manager is None:
+            raise SessionStorageError("当前对话未启用持久化会话")
+        snapshot = (
+            await self._session_manager.load(session_id)
+            if session_id is not None
+            else await self._session_manager.load_latest()
+        )
+        candidate = (
+            await self._context_manager.prepare_restore(snapshot.history, snapshot.memory)
+            if self._context_manager is not None
+            else RestoreContextResult(snapshot.history, snapshot.memory)
+        )
+        if candidate.checkpoint_required:
+            assert candidate.memory is not None
+            await self._session_manager.append_checkpoint(
+                candidate.memory,
+                candidate.history,
+                session_id=snapshot.session_id,
+                covered_turn_id=snapshot.last_turn_id,
+            )
+        self._session_manager.activate(snapshot)
+        if self._context_manager is not None:
+            self._context_manager.activate_restore(candidate)
+        self._history[:] = candidate.history
+        self._mode = AgentMode.AGENT
+        if self._permission_session is not None:
+            self._permission_session.clear()
+        if self._prompt_runtime is not None:
+            self._prompt_runtime.reset_mode()
+        now = datetime.now(UTC)
+        clear_queued = getattr(self._runner, "clear_queued_request_supplements", None)
+        if callable(clear_queued):
+            clear_queued(SupplementKind.REMINDER)
+        elapsed = now - snapshot.last_active_at
+        if elapsed.total_seconds() >= 24 * 60 * 60:
+            queue = getattr(self._runner, "queue_request_supplement", None)
+            if callable(queue):
+                last_active = snapshot.last_active_at.astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+                current = now.astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+                queue(
+                    SystemSupplement(
+                        SupplementKind.REMINDER,
+                        "This restored session has a long time gap. "
+                        f"Last active: {last_active}; current time: {current}; "
+                        f"elapsed: {elapsed.days} days. Re-check time-sensitive facts.",
+                    )
+                )
+        event = SessionRestoredEvent(
+            snapshot.session_id,
+            len(candidate.history),
+            tuple(warning.message for warning in snapshot.warnings),
+        )
+        self._startup_restore_event = event
+        return event
+
     async def stream_reply(self, user_text: str) -> AsyncIterator[AgentEvent]:
         if not user_text.strip():
             raise ValueError("消息不能为空")
@@ -86,7 +180,19 @@ class ChatSession:
             raise RuntimeError("已有 Agent 回合正在运行")
 
         user_message = ChatMessage.user_text(user_text)
-        command = user_text.strip().lower()
+        stripped = user_text.strip()
+        command = stripped.lower()
+        if command == "/resume" or command.startswith("/resume "):
+            yield UserMessageEvent(user_message)
+            session_id = stripped[len("/resume") :].strip()
+            if not session_id:
+                yield AgentErrorEvent("invalid_resume_command", "用法：/resume <session-id>")
+                return
+            try:
+                yield await self.restore(session_id)
+            except (SessionStorageError, ValueError):
+                yield AgentErrorEvent("session_restore_failed", "会话恢复失败，当前会话未改变。")
+            return
         if command in {"/plan", "/agent"}:
             yield UserMessageEvent(user_message)
             target = AgentMode.PLAN_ONLY if command == "/plan" else AgentMode.AGENT
@@ -110,13 +216,13 @@ class ChatSession:
         if command == "/compact" and self._context_manager is not None:
             yield UserMessageEvent(user_message)
             task = asyncio.create_task(
-                self._context_manager.compact_committed_history(tuple(self._history))
+                self._context_manager.prepare_manual_compaction(tuple(self._history))
             )
             self._active_compaction = task
             self._turn_finished.clear()
             try:
                 try:
-                    report = await task
+                    candidate = await task
                 except ContextCompactionNotNeeded:
                     yield ContextCompactionNotNeededEvent()
                 except ContextCompactionError as error:
@@ -124,8 +230,21 @@ class ChatSession:
                 except asyncio.CancelledError:
                     yield AgentCancelledEvent("当前上下文压缩已取消。")
                 else:
-                    self._history.clear()
-                    yield ContextCompactedEvent(report)
+                    try:
+                        if self._session_manager is not None:
+                            await self._session_manager.append_checkpoint(
+                                candidate.memory,
+                                candidate.history,
+                            )
+                    except (SessionStorageError, ValueError):
+                        yield AgentErrorEvent(
+                            "session_storage_error",
+                            "上下文检查点保存失败，当前历史未改变。",
+                        )
+                    else:
+                        self._context_manager.activate_compaction(candidate)
+                        self._history[:] = candidate.history
+                        yield ContextCompactedEvent(candidate.report)
             finally:
                 if not task.done():
                     task.cancel()
@@ -194,6 +313,29 @@ class ChatSession:
             if result is None:
                 raise RuntimeError("AgentTurn 结束时缺少结果")
             if result.termination is AgentTermination.COMPLETED:
+                if self._session_manager is not None:
+                    checkpoint = None
+                    if (
+                        result.context_commit is not None
+                        and result.context_commit.checkpoint_required
+                        and result.context_commit.memory is not None
+                    ):
+                        checkpoint = (
+                            result.context_commit.memory,
+                            result.context_commit.history,
+                        )
+                    try:
+                        commit = await self._session_manager.commit_turn(
+                            result.turn_messages,
+                            checkpoint=checkpoint,
+                        )
+                    except (SessionStorageError, ValueError):
+                        yield AgentErrorEvent(
+                            "session_storage_error",
+                            "会话保存失败，本轮未提交到当前历史。",
+                        )
+                        return
+                    self._new_commits.append(commit)
                 if result.context_commit is not None and self._context_manager is not None:
                     self._context_manager.commit(result.context_commit)
                     self._history[:] = result.context_commit.history
@@ -221,6 +363,35 @@ class ChatSession:
         if self._active_turn is None:
             raise RuntimeError("当前没有运行中的 Agent 回合")
         self._active_turn.submit_approval(choice)
+
+    async def finalize_memory(self) -> MemoryUpdateReport:
+        """幂等地整理本次进程中新提交的会话记忆。"""
+
+        if self._memory_update_task is None:
+            self._memory_update_task = asyncio.create_task(self._finalize_memory())
+        return await asyncio.shield(self._memory_update_task)
+
+    async def _finalize_memory(self) -> MemoryUpdateReport:
+        if not self._new_commits or self._memory_store is None or self._memory_updater is None:
+            return MemoryUpdateReport(MemoryUpdateStatus.SKIPPED, message="本次运行没有新增对话")
+        try:
+            current = await asyncio.to_thread(self._memory_store.load)
+            plan = await asyncio.wait_for(
+                self._memory_updater.analyze(current, tuple(self._new_commits)),
+                timeout=30,
+            )
+            if not plan.operations:
+                return MemoryUpdateReport(MemoryUpdateStatus.NO_CHANGE, message="无需更新项目记忆")
+            await asyncio.to_thread(self._memory_store.apply, plan)
+            return MemoryUpdateReport(
+                MemoryUpdateStatus.UPDATED,
+                len(plan.operations),
+                "项目记忆已更新",
+            )
+        except TimeoutError:
+            return MemoryUpdateReport(MemoryUpdateStatus.TIMEOUT, message="项目记忆整理超时")
+        except Exception:
+            return MemoryUpdateReport(MemoryUpdateStatus.FAILED, message="项目记忆整理失败")
 
     async def close(self) -> None:
         if self._closed:

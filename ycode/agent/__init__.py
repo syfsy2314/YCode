@@ -7,6 +7,7 @@ from ycode.agent.contracts import (
     AgentTurnResult,
     AgentTurnStream,
     ConversationRunner,
+    TurnMessage,
 )
 from ycode.agent.events import (
     AgentCancelledEvent,
@@ -23,6 +24,7 @@ from ycode.agent.events import (
     ModeChangedEvent,
     PermissionGrantsClearedEvent,
     PermissionModeChangedEvent,
+    SessionRestoredEvent,
     ToolApprovalRequested,
     ToolExecutionCancelled,
     ToolExecutionCompleted,
@@ -55,9 +57,11 @@ __all__ = [
     "PermissionGrantsClearedEvent",
     "PermissionModeChangedEvent",
     "PlainChatRunner",
+    "SessionRestoredEvent",
     "ToolExecutionCancelled",
     "ToolApprovalRequested",
     "ToolExecutionCompleted",
     "ToolExecutionStarted",
+    "TurnMessage",
     "UserMessageEvent",
 ]

@@ -221,6 +221,27 @@ class ContextCompactionNotNeededEvent:
             raise ValueError("无需压缩事件字段不能为空")
 
 
+@dataclass(frozen=True, slots=True)
+class SessionRestoredEvent:
+    session_id: str
+    message_count: int
+    warnings: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.session_id:
+            raise ValueError("恢复事件会话 ID 不能为空")
+        if (
+            not isinstance(self.message_count, int)
+            or isinstance(self.message_count, bool)
+            or self.message_count < 0
+        ):
+            raise ValueError("恢复事件消息数必须是非负整数")
+        warnings = tuple(self.warnings)
+        if any(not isinstance(item, str) or not item.strip() for item in warnings):
+            raise ValueError("恢复事件警告必须是非空摘要")
+        object.__setattr__(self, "warnings", warnings)
+
+
 type AgentEvent = (
     UserMessageEvent
     | AgentThinkingDelta
@@ -240,4 +261,5 @@ type AgentEvent = (
     | ContextCompactedEvent
     | ContextCompactionFailedEvent
     | ContextCompactionNotNeededEvent
+    | SessionRestoredEvent
 )

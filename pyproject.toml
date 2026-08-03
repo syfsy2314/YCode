@@ -41,6 +41,7 @@ exclude = ["tests*"]
 [tool.setuptools.package-data]
 "ycode.prompt.resources" = ["*.md"]
 "ycode.context.resources" = ["*.md"]
+"ycode.memory.resources" = ["*.md"]
 
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"

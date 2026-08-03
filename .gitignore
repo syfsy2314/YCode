@@ -1,6 +1,8 @@
 # YCode 本地配置（可能包含 API Key）
 .ycode/config.yaml
 .ycode/context/
+.ycode/sessions/
+.ycode/memory/
 
 # 本地环境变量文件；示例文件允许提交
 .env

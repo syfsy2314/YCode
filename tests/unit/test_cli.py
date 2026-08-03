@@ -14,6 +14,14 @@ def test_cli_passes_explicit_config(monkeypatch: pytest.MonkeyPatch) -> None:
     run_app.assert_awaited_once_with("custom.yaml")
 
 
+def test_cli_passes_continue_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    run_app = AsyncMock()
+    monkeypatch.setattr(ycode.cli, "run_app", run_app)
+
+    assert ycode.cli.main(["--continue"]) == 0
+    run_app.assert_awaited_once_with(None, continue_session=True)
+
+
 def test_cli_config_error_is_safe(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

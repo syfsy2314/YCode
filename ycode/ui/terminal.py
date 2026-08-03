@@ -20,6 +20,7 @@ from ycode.agent import (
     ModeChangedEvent,
     PermissionGrantsClearedEvent,
     PermissionModeChangedEvent,
+    SessionRestoredEvent,
     ToolApprovalRequested,
     ToolExecutionCancelled,
     ToolExecutionCompleted,
@@ -28,6 +29,7 @@ from ycode.agent import (
 )
 from ycode.config.models import ProviderConfig
 from ycode.core.messages import thaw_json
+from ycode.memory import MemoryUpdateStatus
 from ycode.session.chat import ChatSession
 from ycode.ui.header import render_header
 from ycode.ui.input_box import InputBox
@@ -70,6 +72,11 @@ class TerminalUI:
         mcp_status = self._session.mcp_status
         if mcp_status is not None:
             self._console.print(render_mcp_summary(mcp_status))
+        for warning in getattr(self._session, "startup_warnings", ()):
+            self._console.print(f"warning: {warning}")
+        restored = getattr(self._session, "startup_restore_event", None)
+        if restored is not None:
+            self._render_restored(restored)
         while True:
             try:
                 if self._session.permission_mode is None:
@@ -80,9 +87,11 @@ class TerminalUI:
                         self._session.permission_mode,
                     )
             except (EOFError, KeyboardInterrupt):
+                await self._finish_memory()
                 return
 
             if user_text.strip().lower() in {"/exit", "/quit"}:
+                await self._finish_memory()
                 return
             if not user_text.strip():
                 continue
@@ -152,6 +161,8 @@ class TerminalUI:
                         self._console.print(message)
                     elif isinstance(event, ContextCompactionNotNeededEvent):
                         self._console.print(event.message)
+                    elif isinstance(event, SessionRestoredEvent):
+                        self._render_restored(event)
                     elif isinstance(event, FinalResponseEvent):
                         await ensure_started()
                         await active_renderer.complete(event.message)
@@ -237,6 +248,25 @@ class TerminalUI:
                     self._session.cancel_active_turn()
                     turn_task.cancel()
                     await asyncio.gather(turn_task, return_exceptions=True)
+
+    async def _finish_memory(self) -> None:
+        finalize = getattr(self._session, "finalize_memory", None)
+        if not callable(finalize):
+            return
+        report = await finalize()
+        if report.status is MemoryUpdateStatus.SKIPPED:
+            return
+        if report.status is MemoryUpdateStatus.UPDATED:
+            self._console.print(f"{report.message}：{report.change_count} 项")
+        else:
+            self._console.print(report.message)
+
+    def _render_restored(self, event: SessionRestoredEvent) -> None:
+        self._console.print(
+            f"session restored: {event.session_id} ({event.message_count} messages)"
+        )
+        for warning in event.warnings:
+            self._console.print(f"warning: {warning}")
 
 
 def _tool_start_summary(call) -> str:

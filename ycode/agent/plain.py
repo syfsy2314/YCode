@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncIterator, Sequence
+from datetime import UTC, datetime
 
 from ycode.agent.contracts import (
     AgentMode,
@@ -9,6 +10,7 @@ from ycode.agent.contracts import (
     AgentTurn,
     AgentTurnResult,
     AgentTurnStream,
+    TurnMessage,
 )
 from ycode.agent.events import (
     AgentCancelledEvent,
@@ -53,6 +55,7 @@ class PlainChatRunner:
         user_message: ChatMessage,
     ) -> AsyncIterator[AgentEvent]:
         assembler = ResponseAssembler()
+        user_turn_message = TurnMessage(user_message, datetime.now(UTC))
         try:
             stream = self._provider.stream_chat((*history, user_message))
             while True:
@@ -67,10 +70,11 @@ class PlainChatRunner:
                     yield AgentTextDelta(1, event.index, event.text)
 
             assistant_message = assembler.finish()
+            assistant_turn_message = TurnMessage(assistant_message, datetime.now(UTC))
             turn.complete(
                 AgentTurnResult(
                     termination=AgentTermination.COMPLETED,
-                    messages=(user_message, assistant_message),
+                    turn_messages=(user_turn_message, assistant_turn_message),
                     final_message=assistant_message,
                     usage=assembler.usage,
                 )
@@ -83,7 +87,7 @@ class PlainChatRunner:
             turn.complete(
                 AgentTurnResult(
                     termination=AgentTermination.CANCELLED,
-                    messages=(user_message,),
+                    turn_messages=(user_turn_message,),
                     error_message=message,
                 )
             )
@@ -92,7 +96,7 @@ class PlainChatRunner:
             turn.complete(
                 AgentTurnResult(
                     termination=AgentTermination.ERROR,
-                    messages=(user_message,),
+                    turn_messages=(user_turn_message,),
                     error_code=error.code,
                     error_message=error.user_message,
                 )
@@ -103,7 +107,7 @@ class PlainChatRunner:
             turn.complete(
                 AgentTurnResult(
                     termination=AgentTermination.ERROR,
-                    messages=(user_message,),
+                    turn_messages=(user_turn_message,),
                     error_code="invalid_response",
                     error_message=message,
                 )

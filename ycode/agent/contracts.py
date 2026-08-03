@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
@@ -25,29 +26,77 @@ class AgentTermination(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class TurnMessage:
+    """Agent 回合内形成的一条带 UTC 时间的完整消息。"""
+
+    message: ChatMessage
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.message, ChatMessage):
+            raise TypeError("回合消息必须携带 ChatMessage")
+        if (
+            not isinstance(self.created_at, datetime)
+            or self.created_at.tzinfo is None
+            or self.created_at.utcoffset() != UTC.utcoffset(self.created_at)
+        ):
+            raise ValueError("回合消息时间必须是 UTC")
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class AgentTurnResult:
     termination: AgentTermination
-    messages: tuple[ChatMessage, ...]
+    turn_messages: tuple[TurnMessage, ...]
     final_message: ChatMessage | None = None
     error_code: str = ""
     error_message: str = ""
     usage: TokenUsage = field(default_factory=TokenUsage)
     context_commit: ContextCommit | None = None
 
+    def __init__(
+        self,
+        termination: AgentTermination,
+        turn_messages: Sequence[TurnMessage | ChatMessage] = (),
+        final_message: ChatMessage | None = None,
+        error_code: str = "",
+        error_message: str = "",
+        usage: TokenUsage | None = None,
+        context_commit: ContextCommit | None = None,
+        *,
+        messages: Sequence[ChatMessage] | None = None,
+    ) -> None:
+        if messages is not None:
+            if turn_messages:
+                raise ValueError("不能同时传入 turn_messages 和 messages")
+            turn_messages = messages
+        now = datetime.now(UTC)
+        normalized = tuple(
+            item if isinstance(item, TurnMessage) else TurnMessage(item, now)
+            for item in turn_messages
+        )
+        object.__setattr__(self, "termination", termination)
+        object.__setattr__(self, "turn_messages", normalized)
+        object.__setattr__(self, "final_message", final_message)
+        object.__setattr__(self, "error_code", error_code)
+        object.__setattr__(self, "error_message", error_message)
+        object.__setattr__(self, "usage", usage if usage is not None else TokenUsage())
+        object.__setattr__(self, "context_commit", context_commit)
+        self.__post_init__()
+
     def __post_init__(self) -> None:
         if not isinstance(self.termination, AgentTermination):
             raise TypeError("Agent 终止状态无效")
-        messages = tuple(self.messages)
-        if any(not isinstance(message, ChatMessage) for message in messages):
-            raise TypeError("Agent 回合结果只能包含 ChatMessage")
-        object.__setattr__(self, "messages", messages)
+        turn_messages = tuple(self.turn_messages)
+        if any(not isinstance(item, TurnMessage) for item in turn_messages):
+            raise TypeError("Agent 回合结果只能包含 TurnMessage")
+        object.__setattr__(self, "turn_messages", turn_messages)
         if not isinstance(self.usage, TokenUsage):
             raise TypeError("Agent 回合结果必须携带 TokenUsage")
 
         if self.termination is AgentTermination.COMPLETED:
             if self.final_message is None or self.final_message.role != "assistant":
                 raise ValueError("正常完成必须携带最终 Assistant 消息")
-            if not messages or messages[-1] != self.final_message:
+            if not turn_messages or turn_messages[-1].message != self.final_message:
                 raise ValueError("最终回复必须是本轮消息的最后一条")
         elif self.final_message is not None:
             raise ValueError("非正常完成不能携带最终回复")
@@ -58,6 +107,12 @@ class AgentTurnResult:
         if self.termination is AgentTermination.ERROR:
             if not self.error_code or not self.error_message:
                 raise ValueError("Agent 异常必须携带错误码和消息")
+
+    @property
+    def messages(self) -> tuple[ChatMessage, ...]:
+        """兼容仅消费消息内容的现有调用方。"""
+
+        return tuple(item.message for item in self.turn_messages)
 
 
 @runtime_checkable

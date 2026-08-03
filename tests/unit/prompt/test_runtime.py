@@ -75,6 +75,40 @@ def test_runtime_replaces_same_session_supplement_kind() -> None:
     assert runtime.session_supplements == (second,)
 
 
+def test_runtime_orders_project_context_before_other_session_supplements() -> None:
+    runtime = PromptRuntimeContext()
+    memory = SystemSupplement(
+        SupplementKind.PROJECT_MEMORY,
+        "memory",
+        SupplementScope.SESSION,
+    )
+    tool_state = SystemSupplement(
+        SupplementKind.TOOL_STATE,
+        "tools",
+        SupplementScope.SESSION,
+    )
+    instructions = SystemSupplement(
+        SupplementKind.PROJECT_INSTRUCTIONS,
+        "instructions",
+        SupplementScope.SESSION,
+    )
+
+    for supplement in (tool_state, memory, instructions):
+        runtime.set_session_supplement(supplement)
+
+    assert runtime.session_supplements == (instructions, memory, tool_state)
+
+
+def test_runtime_reset_mode_restores_full_instruction() -> None:
+    runtime = PromptRuntimeContext()
+    runtime.begin_turn("agent")
+    assert not runtime.begin_turn("agent").full_mode_instruction
+
+    runtime.reset_mode()
+
+    assert runtime.begin_turn("agent").full_mode_instruction
+
+
 def test_turn_context_is_reusable_without_runtime_growth() -> None:
     runtime = PromptRuntimeContext()
     turn = runtime.begin_turn("agent")

@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import FrozenInstanceError
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -17,7 +18,9 @@ from ycode.agent import (
     ContextCompactionNotNeededEvent,
     FinalResponseEvent,
     ModeChangedEvent,
+    SessionRestoredEvent,
     ToolApprovalRequested,
+    TurnMessage,
 )
 from ycode.context import (
     ContextCommit,
@@ -60,6 +63,8 @@ def test_completed_result_requires_final_message_at_end() -> None:
 
     assert result.final_message is final
     assert result.usage == TokenUsage(input_tokens=10, output_tokens=5)
+    assert result.messages == (user, final)
+    assert all(item.created_at.tzinfo is UTC for item in result.turn_messages)
     with pytest.raises(ValueError, match="最终"):
         AgentTurnResult(
             termination=AgentTermination.COMPLETED,
@@ -68,6 +73,16 @@ def test_completed_result_requires_final_message_at_end() -> None:
         )
     with pytest.raises(ValueError, match="错误码"):
         AgentTurnResult(termination=AgentTermination.ERROR, messages=())
+
+
+def test_turn_message_requires_utc_timestamp() -> None:
+    message = ChatMessage.user_text("question")
+    timestamp = datetime.now(UTC)
+    assert TurnMessage(message, timestamp).created_at == timestamp
+    with pytest.raises(ValueError, match="UTC"):
+        TurnMessage(message, datetime.now())
+    with pytest.raises(ValueError, match="UTC"):
+        TurnMessage(message, timestamp.astimezone(timezone(timedelta(hours=8))))
 
 
 def test_context_commit_is_only_allowed_for_completed_result() -> None:
@@ -100,6 +115,14 @@ def test_context_events_validate_reports() -> None:
     assert compacted.report.after_tokens == 50
     assert failed.report.failure_count == 1
     assert not_needed.code == "compact_not_needed"
+
+
+def test_session_restored_event_contains_only_safe_summary_fields() -> None:
+    event = SessionRestoredEvent("20260803-010203-title", 4, ("已跳过坏行",))
+    assert event.message_count == 4
+    assert not hasattr(event, "history")
+    with pytest.raises(ValueError, match="消息数"):
+        SessionRestoredEvent("session", -1)
 
 
 @pytest.mark.asyncio

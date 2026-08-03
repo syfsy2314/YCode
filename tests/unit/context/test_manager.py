@@ -71,7 +71,7 @@ async def test_auto_compaction_is_transactional_and_retains_latest_user(tmp_path
 
     assert prepared.messages == (latest,)
     assert prepared.compaction_report is not None
-    assert prepared.request.supplements[0].startswith("<memory>")
+    assert prepared.request.supplements[0].startswith("<conversation_memory>")
     assert prepared.request.supplements[-1].startswith("<reminder>")
     assert manager.memory is None
 
@@ -162,3 +162,47 @@ async def test_repeated_compaction_rolls_previous_memory_into_one_replacement(
     assert "second" in manager.memory.summary
     assert "first" not in manager.memory.summary
     assert "first" in provider.agent_requests[1].messages[0].text
+
+
+@pytest.mark.asyncio
+async def test_prepare_restore_does_not_mutate_until_activated(tmp_path: Path) -> None:
+    manager, _ = make_manager(
+        tmp_path,
+        [[TextDelta(0, summary_response()), StreamEnd(StopReason.END_TURN)]],
+    )
+    history = (ChatMessage.user_text("x" * 510_000),)
+
+    candidate = await manager.prepare_restore(history, None)
+
+    assert candidate.checkpoint_required
+    assert manager.memory is None
+    manager.activate_restore(candidate)
+    assert manager.memory is candidate.memory
+
+
+@pytest.mark.asyncio
+async def test_failed_restore_preserves_current_runtime_state(tmp_path: Path) -> None:
+    invalid = [TextDelta(0, "invalid"), StreamEnd(StopReason.END_TURN)]
+    manager, _ = make_manager(tmp_path, [invalid])
+    manager.failure_count = 2
+    manager.auto_compaction_fused = True
+
+    with pytest.raises(ContextCompactionError):
+        await manager.prepare_restore((ChatMessage.user_text("x" * 510_000),), None)
+
+    assert manager.failure_count == 2
+    assert manager.auto_compaction_fused
+
+
+@pytest.mark.asyncio
+async def test_manual_candidate_requires_explicit_activation(tmp_path: Path) -> None:
+    manager, _ = make_manager(
+        tmp_path,
+        [[TextDelta(0, summary_response()), StreamEnd(StopReason.END_TURN)]],
+    )
+
+    candidate = await manager.prepare_manual_compaction((ChatMessage.user_text("history"),))
+
+    assert manager.memory is None
+    manager.activate_compaction(candidate)
+    assert manager.memory is candidate.memory

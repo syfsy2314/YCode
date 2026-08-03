@@ -3,6 +3,7 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator, Sequence
+from datetime import UTC, datetime
 from typing import Protocol
 
 from ycode.agent.contracts import (
@@ -11,6 +12,7 @@ from ycode.agent.contracts import (
     AgentTurn,
     AgentTurnResult,
     AgentTurnStream,
+    TurnMessage,
 )
 from ycode.agent.events import (
     AgentCancelledEvent,
@@ -100,6 +102,17 @@ class AgentLoop:
         self._context_manager = context_manager
         self._close_task: asyncio.Task[None] | None = None
         self._max_rounds = max_rounds
+        self._queued_request_supplements: list[SystemSupplement] = []
+
+    def queue_request_supplement(self, supplement: SystemSupplement) -> None:
+        """排队一个只用于下一次普通请求的系统补充。"""
+
+        self._queued_request_supplements.append(supplement)
+
+    def clear_queued_request_supplements(self, kind: SupplementKind) -> None:
+        self._queued_request_supplements[:] = [
+            item for item in self._queued_request_supplements if item.kind is not kind
+        ]
 
     def start_turn(
         self,
@@ -112,7 +125,11 @@ class AgentLoop:
             raise ValueError("Agent 回合必须使用用户消息")
         if mode not in self.supported_modes:
             raise ValueError("AgentLoop 不支持当前模式")
-        return AgentTurnStream(lambda turn: self._run(turn, history_snapshot, user_message, mode))
+        queued = tuple(self._queued_request_supplements)
+        self._queued_request_supplements.clear()
+        return AgentTurnStream(
+            lambda turn: self._run(turn, history_snapshot, user_message, mode, queued)
+        )
 
     async def close(self) -> None:
         if self._close_task is None:
@@ -132,9 +149,10 @@ class AgentLoop:
         history: tuple[ChatMessage, ...],
         user_message: ChatMessage,
         mode: AgentMode,
+        queued_supplements: tuple[SystemSupplement, ...],
     ) -> AsyncIterator[AgentEvent]:
         working_messages = [*history, user_message]
-        turn_messages = [user_message]
+        turn_messages = [TurnMessage(user_message, datetime.now(UTC))]
         context_transaction = (
             self._context_manager.begin_turn(history, user_message)
             if self._context_manager is not None
@@ -162,7 +180,7 @@ class AgentLoop:
 
         try:
             environment = await turn.run_child(self._environment.collect())
-            request_supplements = [environment.to_supplement()]
+            request_supplements = [*queued_supplements, environment.to_supplement()]
             if deferred_names:
                 request_supplements.append(
                     SystemSupplement(
@@ -263,13 +281,13 @@ class AgentLoop:
                 stop_reason = assembler.stop_reason
                 tool_calls = assistant_message.blocks(ToolCallBlock)
                 working_messages.append(assistant_message)
-                turn_messages.append(assistant_message)
+                turn_messages.append(TurnMessage(assistant_message, datetime.now(UTC)))
 
                 if stop_reason is StopReason.END_TURN and not tool_calls:
                     turn.complete(
                         AgentTurnResult(
                             termination=AgentTermination.COMPLETED,
-                            messages=tuple(turn_messages),
+                            turn_messages=tuple(turn_messages),
                             final_message=assistant_message,
                             usage=usage,
                             context_commit=(
@@ -399,14 +417,14 @@ class AgentLoop:
                     )
                 )
                 working_messages.append(result_message)
-                turn_messages.append(result_message)
+                turn_messages.append(TurnMessage(result_message, datetime.now(UTC)))
 
                 if round_number == self._max_rounds:
                     message = f"Agent 已达到最大轮数 {self._max_rounds}。"
                     turn.complete(
                         AgentTurnResult(
                             termination=AgentTermination.LIMIT_REACHED,
-                            messages=tuple(turn_messages),
+                            turn_messages=tuple(turn_messages),
                             error_message=message,
                             usage=usage,
                         )
@@ -420,7 +438,7 @@ class AgentLoop:
             turn.complete(
                 AgentTurnResult(
                     termination=AgentTermination.CANCELLED,
-                    messages=tuple(turn_messages),
+                    turn_messages=tuple(turn_messages),
                     error_message=message,
                     usage=usage,
                 )
@@ -464,7 +482,7 @@ class AgentLoop:
     @staticmethod
     def _finish_error(
         turn: AgentTurnStream,
-        messages: list[ChatMessage],
+        messages: list[TurnMessage],
         code: str,
         message: str,
         usage: TokenUsage,
@@ -472,7 +490,7 @@ class AgentLoop:
         turn.complete(
             AgentTurnResult(
                 termination=AgentTermination.ERROR,
-                messages=tuple(messages),
+                turn_messages=tuple(messages),
                 error_code=code,
                 error_message=message,
                 usage=usage,

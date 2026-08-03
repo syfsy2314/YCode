@@ -59,7 +59,10 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
 
     try:
-        asyncio.run(run_app(args.config))
+        if args.continue_session:
+            asyncio.run(run_app(args.config, continue_session=True))
+        else:
+            asyncio.run(run_app(args.config))
     except (ConfigError, UIError) as error:
         print(f"YCode: {error}", file=sys.stderr)
         return 2
@@ -71,7 +74,7 @@ def main(argv=None) -> int:
 
 `main()` 负责：
 
-- 解析 `--config`。
+- 解析 `--config` 和 `--continue`。
 - 使用 `asyncio.run()` 启动异步应用。
 - 处理启动错误和 Ctrl+C。
 - 返回进程退出码。
@@ -85,11 +88,21 @@ def main(argv=None) -> int:
 
 ~~~python
 config = load_config(path)
+if continue_session and config.active_provider.protocol is ProviderProtocol.OPENAI:
+    raise ConfigError("--continue 当前仅支持 Anthropic 会话")
+
 provider = create_provider(config.active_provider)
-workspace = Path(start_dir or Path.cwd()).resolve()
-manager = None
+workspace = config.project_root
 
 if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
+    memory_store = MemoryStore(workspace)
+    project_context = ProjectContextLoader(workspace, memory_store).load()
+    prompt_runtime = PromptRuntimeContext()
+    for supplement in project_context.supplements:
+        prompt_runtime.set_session_supplement(supplement)
+
+    session_manager = SessionManager(workspace)
+    context_manager = ContextManager(...)
     resolver = WorkspacePathResolver(workspace)
     registry = create_builtin_registry(...)
 
@@ -109,7 +122,7 @@ if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
         registry,
         ToolScheduler(registry, ToolExecutor(registry)),
         build_builtin_prompt(),
-        PromptRuntimeContext(),
+        prompt_runtime,
         EnvironmentCollector(workspace),
         ToolContext(workspace),
         permission_engine=permission_engine,
@@ -118,12 +131,27 @@ if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
             security_result.config.plan_only.allow_mcp_tools
         ),
         resource_manager=manager,
+        context_manager=context_manager,
     )
 else:
     runner = PlainChatRunner(provider)
     permission_session = None
 
-session = ChatSession(runner, permission_session, manager)
+if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
+    session = ChatSession(
+        runner,
+        permission_session,
+        manager,
+        context_manager,
+        session_manager=session_manager,
+        prompt_runtime=prompt_runtime,
+        memory_store=memory_store,
+        memory_updater=MemoryUpdater(provider),
+    )
+    if continue_session:
+        await session.restore()
+else:
+    session = ChatSession(runner)
 ~~~
 
 Anthropic 的对象关系：
@@ -146,8 +174,13 @@ TerminalUI
                     │       └── PowerShellSafetyChecker
                     ├── PromptBundle
                     ├── PromptRuntimeContext
+                    ├── ProjectContextLoader
                     ├── EnvironmentCollector
+                    ├── ContextManager
                     └── ToolContext
+            ├── SessionManager
+            ├── MemoryStore
+            └── MemoryUpdater
 ~~~
 
 OpenAI 当前保持纯聊天：
@@ -163,7 +196,10 @@ TerminalUI
 
 - Anthropic 进入 AgentLoop，能够使用内建工具和 MCP 工具并进行多轮 ReAct
   循环。
+- Anthropic 使用 `config.project_root` 统一工具、项目指令、会话、上下文和记忆的路径
+  边界，并支持 `--continue`。
 - OpenAI 只通过 PlainChatRunner 发起一次模型请求，没有工具定义、Agent system prompt 或 plan-only 能力。
+- OpenAI 不装配持久化会话和项目记忆，使用 `--continue` 会在创建 Provider 前失败。
 
 退出时，`finally` 调用 `session.close()`。Session 再关闭 Runner，AgentLoop 先通过
 `resource_manager` 关闭 MCP 连接、HTTP Client 和 stdio 子进程，最后关闭 Provider。
@@ -278,6 +314,10 @@ AgentLoop 或 PlainChatRunner 把 Provider 事件转换为供应商无关的 Age
 | ModeChangedEvent | agent 与 plan-only 模式变化 |
 | PermissionModeChangedEvent | 权限模式查询或变化 |
 | PermissionGrantsClearedEvent | 会话授权已清除 |
+| SessionRestoredEvent | 会话恢复成功，包含 ID、消息数和安全警告摘要 |
+| ContextCompactedEvent | 自动或手动上下文压缩成功 |
+| ContextCompactionFailedEvent | 上下文压缩失败及熔断状态 |
+| ContextCompactionNotNeededEvent | 当前没有需要压缩的历史 |
 | FinalResponseEvent | Agent 正常完成后的最终回复 |
 | AgentLimitReachedEvent | 达到最大模型轮数 |
 | AgentCancelledEvent | 用户取消当前回合 |
@@ -394,6 +434,24 @@ Agent 对外只有四种终止结果：
 
 只有事件流完全消费结束后，`turn.result` 才可见。
 
+当前 `AgentTurnResult` 不再直接保存裸 `ChatMessage`，而是保存消息产生时刻：
+
+~~~python
+@dataclass(frozen=True, slots=True)
+class TurnMessage:
+    message: ChatMessage
+    created_at: datetime  # 必须为 UTC
+
+class AgentTurnResult:
+    turn_messages: tuple[TurnMessage, ...]
+
+    @property
+    def messages(self) -> tuple[ChatMessage, ...]: ...
+~~~
+
+`messages` 是只读兼容视图。用户消息、每条完整 Assistant 消息和工具结果消息分别在
+形成时记录 UTC 时间，后续由 `SessionManager` 原样写入 JSONL。
+
 ### 6. ChatSession
 
 ChatSession 负责：
@@ -403,6 +461,9 @@ ChatSession 负责：
 - 保存可选的 PermissionSession。
 - 保证同一时间只有一个活动 AgentTurn。
 - 处理 `/plan`、`/agent` 和 `/permission`。
+- 处理 `/compact` 和 `/resume <session-id>`。
+- 协调 `SessionManager`、`ContextManager`、`MemoryStore` 和 `MemoryUpdater`。
+- 累积本进程中新提交的 `SessionCommit`，只供退出记忆整理使用。
 - 把终端审批选择转交给当前 AgentTurn。
 - 传播取消和关闭。
 - 根据 AgentTurnResult 决定提交或回滚。
@@ -422,7 +483,7 @@ runner.start_turn(history_snapshot, user_message, mode)
     ↓
 读取 AgentTurnResult
     ↓
-COMPLETED：一次性提交 result.messages
+COMPLETED：先持久化 result.turn_messages，再提交上下文和内存历史
 其他状态：不提交本轮历史
     ↓
 最后向 UI 转发终态事件
@@ -430,7 +491,9 @@ COMPLETED：一次性提交 result.messages
 
 为什么终态事件要暂存？
 
-如果 UI 先看到 FinalResponseEvent，而历史还没有提交，上层会观察到“界面已完成、Session 仍未完成”的短暂不一致。因此 Session 先处理事务，再把终态事件交给 UI。
+如果 UI 先看到 FinalResponseEvent，而 JSONL 或历史还没有提交，上层会观察到“界面已
+完成、事实来源仍未完成”的不一致。因此 Session 暂存终态事件，严格按
+“JSONL 刷新 → ContextManager 提交 → 内存历史替换 → FinalResponseEvent”执行。
 
 一次完整 Agent 回合可能提交：
 
@@ -443,7 +506,8 @@ User(ToolResult)
 Assistant(Final Text)
 ~~~
 
-Provider 错误、响应组装错误、达到上限、用户取消或调用方提前停止消费时，本轮临时历史不提交。已经完成的文件或命令副作用不会自动回滚。
+Provider 错误、响应组装错误、达到上限、用户取消或调用方提前停止消费时，本轮临时
+历史既不进入内存，也不写入 JSONL。已经完成的文件或命令副作用不会自动回滚。
 
 ### 7. TerminalUI 与 Renderer
 
@@ -484,6 +548,7 @@ Anthropic 的 InputBox 右下角同时显示任务模式和权限模式。审批
 | AnthropicProvider / OpenAIProvider | 单次模型请求和供应商协议转换 |
 | PromptBuilder / PromptBundle | 加载、校验和稳定排列内置提示词章节 |
 | PromptRuntimeContext | 管理模式提醒和会话级动态补充 |
+| ProjectContextLoader | 启动时展开 `YCODE.md` 并组合有效记忆索引快照 |
 | EnvironmentCollector | 采集请求级环境与 Git 摘要 |
 | ResponseAssembler | 把单次 StreamEvent 流组装成 Assistant 消息 |
 | AgentLoop | 多轮判断、工具执行、结果回填和 Agent 终止 |
@@ -495,6 +560,10 @@ Anthropic 的 InputBox 右下角同时显示任务模式和权限模式。审批
 | ToolExecutor | 执行前再次查找、校验访问分类和参数，处理超时及工具错误 |
 | ToolScheduler | 合并预先拒绝结果，并保持读取并发和非读取屏障 |
 | ChatSession | 历史、任务模式、权限模式、活动回合和事务提交 |
+| SessionManager | 独占 `.ycode/sessions/`，负责 JSONL CRUD、提交、重放与修复 |
+| ContextManager | Token 预检、会话摘要、恢复候选和检查点状态 |
+| MemoryStore | 校验、规范化并安全应用 `.ycode/memory/` 内容 |
+| MemoryUpdater | 退出时发起隔离请求并解析结构化记忆操作 |
 | TerminalUI | 消费 AgentEvent 并控制输入、取消与展示 |
 | Renderer | 多轮内容、工具摘要、计时和最终 Markdown |
 
@@ -506,7 +575,8 @@ Prompt System 负责决定发什么系统上下文
 Assembler 负责拼装一次响应
 AgentLoop 负责多轮行动
 Tool 系统负责执行本地能力
-ChatSession 负责事务和模式
+SessionManager 负责磁盘会话事实
+ChatSession 负责跨组件事务和活动状态
 TerminalUI 负责交互与展示
 ~~~
 
@@ -526,7 +596,7 @@ YCode 使用两层供应商无关事件隔离职责：Provider 将 SDK SSE 转�
 | 内容 | 字段 | 生命周期 |
 |---|---|---|
 | 内置全局指令 | `system_prompt` | 应用启动后稳定 |
-| 环境、模式、工具状态、记忆 | `supplements` | 请求级或会话级 |
+| 环境、模式、工具状态、项目指令、项目记忆、会话摘要 | `supplements` | 请求级或会话级 |
 | 对话历史和当前输入 | `messages` | 由 Session 事务管理 |
 | 当前允许的工具定义 | `tools` | 随模式和工具状态变化 |
 
@@ -554,7 +624,8 @@ identity → behavior → tool-use → coding → safety → output
 
 `SystemSupplement` 包含：
 
-- `kind`：environment、task mode、tool state、memory 或 reminder。
+- `kind`：environment、task mode、tool state、project instructions、project memory、
+  conversation memory、reminder 或 tool catalog。
 - `scope`：`request` 或 `session`。
 - `content`：正文。
 
@@ -570,7 +641,12 @@ Operating system: Windows
 
 `PromptRuntimeContext` 按补充类型保存会话级内容；同一类型的新内容会替换旧内容。
 请求级内容只参加当前 `begin_turn()`。首次用户任务或模式变化后的任务使用完整模式
-指令，其余任务只发送精简提醒，不维护“第几轮”的计数。
+指令，其余任务只发送精简提醒，不维护“第几轮”的计数。恢复会话时调用
+`reset_mode()`，保证下一次请求重新得到完整模式说明。
+
+会话级补充采用显式顺序：项目指令、项目记忆、其他会话状态；如果存在上下文摘要，
+`ContextManager` 会把 `<conversation_memory>` 放在它们之前，并把“摘要不是代码事实”
+的边界提醒放在最后。三类长期信息不会再共用模糊的 `<memory>` 标签。
 
 `EnvironmentCollector` 每个用户任务采集一次工作区、操作系统、Shell、本地时间与时区。
 Git 通过两秒超时的只读 `git status --porcelain=v1 --branch` 获取分支和 staged、
@@ -638,6 +714,306 @@ YCode 用 `PromptBundle` 保存确定性排序的稳定指令，用 `SystemSuppl
 分离。AgentLoop 每个用户任务生成一次动态上下文并在工具轮次复用；AnthropicProvider
 只负责缓存断点、system message 兼容降级和 usage 解析，因此提示词策略没有泄漏到
 供应商协议层。
+
+## 项目上下文、会话持久化与项目记忆
+
+这一组功能只在 Anthropic 路径装配，但模型、JSONL 和记忆数据结构本身不依赖具体
+Provider。最重要的理解方式是先区分三个概念：
+
+| 概念 | 保存位置 | 作用 | 是否直接进入普通历史 |
+|---|---|---|---|
+| 会话历史 | `.ycode/sessions/*.jsonl` | 恢复用户、Assistant、Thinking 和工具链 | 恢复后成为 `ChatSession.history` |
+| 会话压缩摘要 | JSONL 的 `context_checkpoint` | 控制单个会话的 Token 大小 | 作为 `<conversation_memory>` 系统补充 |
+| 项目记忆 | `.ycode/memory/` | 跨会话保存偏好、纠正、项目知识和参考资料 | 只注入 `MEMORY.md` 索引 |
+
+项目指令 `YCODE.md` 是第四种独立来源：它是用户人工维护的项目规则，不属于自动记忆，
+也不属于会话历史。
+
+### 1. 项目根和启动快照
+
+所有新组件统一使用 `config.project_root`，不再把进程启动目录当作工作区：
+
+~~~text
+活动配置文件
+    ↓ resolve_project_root()
+config.project_root
+    ├── 工具 WorkspacePathResolver
+    ├── YCODE.md
+    ├── .ycode/sessions/
+    ├── .ycode/memory/
+    ├── .ycode/context/
+    └── .ycode/security.yaml
+~~~
+
+`ProjectContextLoader.load()` 在应用启动时生成一次 `ProjectContextSnapshot`：
+
+~~~text
+YCODE.md
+    → 递归展开独占行 @include
+    → PROJECT_INSTRUCTIONS
+
+.ycode/memory/MEMORY.md
+    → MemoryStore 校验索引和主题 frontmatter
+    → 重新生成只含有效条目的索引
+    → PROJECT_MEMORY
+~~~
+
+两者都以 `SESSION` 生命周期写入 `PromptRuntimeContext`，因此每次普通请求都会注入，
+但不会写入 `ChatMessage`、JSONL 或上下文摘要。运行期间修改文件不会热加载；下一次
+启动才会形成新快照。
+
+`@include` 的规则是：
+
+- 指令必须独占一行，路径相对当前包含文件解析。
+- 根 `YCODE.md` 是第 0 层，最多到第 5 层。
+- 使用活动递归栈检测循环；同一文件在不同分支重复引用仍允许。
+- 缺失文件、绝对路径、`..` 逃逸和符号链接逃逸都会抛出 `ConfigError`，阻止启动。
+- 记忆索引和主题文件不支持 `@include`。
+
+这里的失败策略有意不同：项目指令是明确规则，损坏时停止启动；项目记忆是可选辅助
+信息，损坏条目只形成 `ProjectContextWarning`，其余有效条目继续工作。
+
+### 2. 会话 ID 与延迟创建
+
+`SessionManager` 是 `.ycode/sessions/` 的唯一读写者。新启动调用 `begin_new()` 后并不
+立即创建空文件，第一次成功回合提交时才确定 ID：
+
+~~~text
+本地时间 YYYYMMDD-HHmmss
+    +
+第一条用户消息的小标题
+    ↓
+20260803-190810-read the project
+~~~
+
+标题保留中文和普通空格，连续空白折叠为一个空格，删除 Windows 文件名非法字符，
+最多保留 32 个字符；同秒同标题使用 `-2`、`-3` 后缀。因为 ID 本身可以包含空格，
+`/resume` 不能用普通 `split()` 取参数，而是把命令名之后的整段文本视为 ID。
+
+列出会话只扫描 `*.jsonl` 文件名并解析时间，不读取正文，因此会话数量增长不会让列表
+操作退化成全量历史扫描。删除只接受通过格式校验的精确 ID，并拒绝删除当前活动会话。
+
+### 3. JSONL 的三类记录
+
+每行是独立、版本化的单行 JSON：
+
+| `type` | 模型 | 关键字段 |
+|---|---|---|
+| `message` | `SessionMessageRecord` | session ID、turn ID、UTC 时间、完整 `ChatMessage` |
+| `turn_commit` | `TurnCommitRecord` | turn ID、UTC 时间、本轮消息数量 |
+| `context_checkpoint` | `ContextCheckpointRecord` | 覆盖回合、摘要、压缩后保留历史 |
+
+`session/codec.py` 显式编码 Text、Thinking、Redacted Thinking、Tool Use 和 Tool Result，
+而不是序列化 Python 对象内部状态。这样文件格式能独立演进，也能在恢复时拒绝未知版本、
+未知记录类型和多余字段。
+
+一个工具回合的物理顺序类似：
+
+~~~jsonl
+{"type":"message","turn_id":"000001","message":{"role":"user",...}}
+{"type":"message","turn_id":"000001","message":{"role":"assistant","content":[{"type":"tool_use",...}]}}
+{"type":"message","turn_id":"000001","message":{"role":"user","content":[{"type":"tool_result",...}]}}
+{"type":"message","turn_id":"000001","message":{"role":"assistant",...}}
+{"type":"turn_commit","turn_id":"000001","message_count":4,...}
+~~~
+
+消息时间来自 `TurnMessage.created_at`，以 UTC ISO 8601 `Z` 格式保存；会话文件名使用
+本地时间，二者用途不同。
+
+### 4. 写前提交为什么是核心事务边界
+
+正常 Agent 回合结束后，`ChatSession` 不会立刻修改历史：
+
+~~~text
+AgentTurnResult(COMPLETED)
+    ↓
+SessionManager.commit_turn(result.turn_messages)
+    1. 追加所有 message
+    2. 追加可选 context_checkpoint
+    3. 最后追加 turn_commit
+    4. flush
+    ↓ 成功
+ContextManager.commit(context_commit)
+    ↓
+替换 ChatSession.history
+    ↓
+向 TerminalUI 发出 FinalResponseEvent
+~~~
+
+写入异常时，`SessionManager` 尝试把本次追加截回起始偏移；活动 turn 编号不会推进，
+`ChatSession` 不提交上下文或内存历史，而是返回 `session_storage_error`。这里的 JSONL
+是事实来源，内存状态必须追随磁盘成功，而不是相反。
+
+只执行 `flush()`，没有逐行 `fsync()`。保障范围是普通进程崩溃后最多损坏尾部并可修复，
+不承诺断电、系统崩溃或磁盘故障下的强持久性。失败、取消和达到 Agent 轮数上限的回合
+不会写入会话文件。
+
+### 5. 恢复状态机与文件修复
+
+`SessionManager.load(id)` 是有磁盘修复副作用、但不切换活动会话的预检：
+
+~~~text
+逐行读取并记录字节结束偏移
+    ↓
+JSON 无法解析：警告并跳过
+    ↓
+结构化记录：校验 session ID、递增 turn ID、message_count
+    ↓
+校验消息角色和 tool_use / tool_result ID 集合
+    ↓
+只有合法 turn_commit 才推进 safe_offset
+    ↓
+发现半回合、错配工具链或非法顺序
+    → truncate(safe_offset)
+    → 返回 repaired_tail 警告
+~~~
+
+坏 JSON 行可以跳过，是因为后续记录可能仍组成合法回合；结构错误不能跳过，是因为那会
+把未配对工具调用发送回模型。恢复成功后可以继续追加，再次恢复不会重复报告已截断尾部。
+
+`load_latest()` 根据文件名选择最新会话，`--continue` 在 UI 启动前调用它；
+`/resume <id>` 在空闲状态调用 `load(id)`。恢复失败只返回安全错误，当前活动 ID、历史、
+模式和权限保持不变。
+
+### 6. 无副作用上下文恢复与检查点
+
+会话加载成功不代表它一定能装进当前模型窗口。`ContextManager.prepare_restore()` 接收
+历史和已有摘要，但不修改当前 ContextManager：
+
+~~~text
+估算 history + conversation memory
+    ├── 未超阈值 → 返回普通 RestoreContextResult
+    └── 超阈值 → 最多调用一次 ConversationCompactor
+                    ↓
+                 返回带摘要的候选
+~~~
+
+如果候选需要新检查点，`ChatSession.restore()` 先把
+`memory + retained_history + covered_turn_id` 追加到目标 JSONL，再依次激活
+`SessionManager`、`ContextManager` 和活动历史。压缩失败或检查点写入失败时不切换会话。
+下一次恢复会直接使用最新有效检查点和其后的回合，不再压缩已覆盖的原始历史。
+
+手动 `/compact` 使用同样的候选模式：先 `prepare_manual_compaction()`，检查点落盘后才
+`activate_compaction()`。自动压缩则通过 `ContextCommit.checkpoint_required` 告知
+`ChatSession`，与当前回合一起写入检查点。
+
+会话切换成功后还会：
+
+- 重置任务模式为 `agent`。
+- 清空 `PermissionSession` 的临时授权。
+- 清空上下文失败计数和自动摘要熔断。
+- 调用 `PromptRuntimeContext.reset_mode()`，下一轮重新注入完整模式说明。
+- 保留应用级 MCP 连接、工具 Registry、项目指令和记忆索引启动快照。
+
+最后活跃时间超过 24 小时时，AgentLoop 只为下一次普通请求排队一个 `REMINDER`，包含
+本地格式的上次时间、当前时间和天数。斜杠命令不会消费它，下一次普通请求取走后不会
+再次出现。内部检查点时间不算用户活跃时间。
+
+### 7. 项目记忆目录和四种类型
+
+记忆目录结构：
+
+~~~text
+.ycode/memory/
+├── MEMORY.md
+├── user-*.md
+├── feedback-*.md
+├── project-*.md
+└── reference-*.md
+~~~
+
+四类 `MemoryType`：
+
+| 类型 | 文件前缀 | 内容示例 |
+|---|---|---|
+| `user_preference` | `user-` | 用户稳定的编码或沟通偏好 |
+| `correction_feedback` | `feedback-` | 用户对错误行为的纠正 |
+| `project_knowledge` | `project-` | 项目约定、技术选型和领域知识 |
+| `reference` | `reference-` | 可复用资料和外部参考入口 |
+
+主题文件必须是单层、小写 kebab 风格 Markdown，并使用固定 frontmatter：
+
+~~~markdown
+---
+name: 偏好 any 语法
+description: 用户要求使用 any
+type: user_preference
+---
+使用 any 替代 interface{}。
+~~~
+
+索引只包含指针：
+
+~~~markdown
+- [偏好 any 语法](user-prefers-any.md) — 用户要求使用 any
+~~~
+
+`MemoryStore.load()` 会同时校验索引格式、单层相对路径、真实路径边界、类型与文件前缀、
+frontmatter 精确字段以及 name/description 一致性。它最终从有效 `MemoryEntry` 重新
+生成规范化索引，因此任意坏行、缺失文件或元数据不匹配都不会进入模型上下文。普通请求
+不包含主题正文；需要细节时模型使用 `read_file` 按索引读取。
+
+### 8. 退出时的隔离记忆整理
+
+`ChatSession` 只记录本进程中新成功提交的 `SessionCommit`，恢复进来的旧历史不会重复
+进入整理输入。用户在同一进程中切换多个会话后，每个新回合仍保留自己的 session ID、
+turn ID 和消息 UTC 时间。
+
+正常 `/exit`、`/quit`、EOF 或空闲 Ctrl+C 时，`TerminalUI` 调用幂等的
+`finalize_memory()`：
+
+~~~text
+没有新提交
+    → SKIPPED，不调用模型
+
+有新提交
+    → 重新 MemoryStore.load()，尊重运行期间人工修改
+    → MemoryUpdater.analyze(current, new_commits)
+    → 专用 system prompt
+    → tools=()、thinking_enabled=False
+    → 最多等待 30 秒
+    → 只接受一个 JSON object
+    → MemoryStore.apply(plan)
+~~~
+
+模型可返回 `create`、`update`、`delete` 或空操作。合并不增加第五种动作，而是“更新保留
+条目 + 删除重复条目”。重复判断完全交给模型，程序不做向量、Embedding、关键词或
+相似度算法。
+
+程序仍保持硬边界：创建不能覆盖已有或未索引文件；同路径更新只能修改正文，不能改变
+name、description 或 type；删除只能针对当前有效索引中的条目。若要改元数据或类型，
+模型必须创建替代文件再删除旧文件。
+
+应用变更时先完整校验最终集合并准备所有主题临时文件，再替换主题文件、原子替换
+`MEMORY.md`，最后删除不再被索引引用的旧文件。即使中途失败，旧索引仍只会指向完整
+文件；可能遗留的未索引文件不会进入启动快照。
+
+整理超时、模型流异常、Thinking/工具事件、额外文本、非法 JSON 或写入失败都转换为
+`TIMEOUT` 或 `FAILED` 报告，不影响已经完成的 JSONL 会话提交。强制终止、进程崩溃和
+断电不会触发这条正常退出管线。
+
+### 9. 关键职责边界
+
+~~~text
+ProjectContextLoader：只负责启动快照和指令展开
+SessionManager：只负责磁盘会话，不知道 Provider、权限、工具或 TUI
+ContextManager：只负责 Token、摘要和恢复候选
+MemoryUpdater：只让模型产生结构化操作计划
+MemoryStore：只校验和应用本地记忆
+ChatSession：编排写前提交、恢复切换、运行期新增回合和退出整理
+TerminalUI：决定哪些退出属于正常退出并展示结果
+~~~
+
+这种拆分的核心收益不是类更多，而是失败可以局部隔离：指令错误阻止启动，记忆读取错误
+只警告，会话写入错误回滚当前回合，恢复失败保留原活动会话，退出整理失败仍正常关闭。
+
+### 面试表述
+
+YCode 把 JSONL 作为会话事实来源，用最后写入的 `turn_commit` 建立回合原子边界；恢复时
+通过字节偏移状态机跳过坏行并截断不完整工具链。ContextManager 采用无副作用候选完成
+超限恢复，检查点落盘后才切换活动状态。项目记忆只向普通请求注入经过校验的索引，退出
+时再用无工具、关闭 Thinking 的隔离请求分析本进程新增回合，由 MemoryStore 在路径和
+文件层执行最终安全约束。
 
 ## Anthropic SSE 流式链路
 
@@ -1522,13 +1898,18 @@ ChatSession 的事务边界是整个用户回合，而不是单次 Provider 请�
 
 ~~~text
 COMPLETED
-    → 提交用户消息、所有 ToolCall/ToolResult 和最终回复
+    → 先将用户消息、ToolCall/ToolResult 和最终回复追加到 JSONL
+    → 最后写入 turn_commit 并 flush
+    → 再提交 ContextManager 和 ChatSession.history
+    → 最后向 UI 发送终态事件
 
 LIMIT_REACHED / CANCELLED / ERROR
-    → 当前回合历史不提交
+    → 当前回合不写入 JSONL，也不进入内存历史
 ~~~
 
-“历史回滚”只指内存中的对话历史。已经成功执行的写文件、编辑或命令副作用不会自动撤销。
+JSONL 是会话的事实来源，因此持久化失败时不能先把临时消息留在内存里。
+“回合回滚”只覆盖会话记录和上下文状态；已经成功执行的写文件、编辑或命令
+副作用不会自动撤销。
 
 ### 3. 取消传播
 
@@ -1563,40 +1944,29 @@ Provider / Scheduler / ToolExecutor / CommandRunner
 
 ### 面试表述
 
-YCode 把整个用户回合作为会话事务：只有 COMPLETED 才提交历史，达到上限、用户取消
-和异常都丢弃临时消息。plan-only 同时限制模型可见工具，并由 PermissionEngine 与
-Executor 双重复核。Ctrl+C 可以取消模型流、阻塞审批、调度任务或 PowerShell 进程树，
-清理后恢复输入。
+YCode 把整个用户回合作为会话事务：只有 COMPLETED 才先落盘并再提交内存状态，
+达到上限、用户取消和异常都丢弃临时消息。plan-only 同时限制模型可见工具，
+并由 PermissionEngine 与 Executor 双重复核。Ctrl+C 可以取消模型流、阻塞审批、
+调度任务或 PowerShell 进程树，清理后恢复输入。
 
 ## 当前验证状态
 
-以 2026-08-02 当前工作区的实际重跑结果为准：
+以 2026-08-03 完成记忆系统后的当前工作区实际重跑结果为准：
 
 ~~~text
-MCP 专项单元与集成测试：76 passed
-Ruff format：通过
-Ruff check：通过
-compileall：通过
-
-完整 pytest -x：收集 419 项，2 passed 后在第 1 个失败处停止
-失败：tests/e2e/test_terminal_chat.py::test_windows_terminal_anthropic_thinking
-独立重跑：1 failed
+ruff format --check .：166 files already formatted
+ruff check .：All checks passed
+compileall -q ycode tests：通过
+pytest -q：542 passed, 2 skipped（305.33s）
 ~~~
 
-当前失败是 Windows ConPTY 场景在 15 秒内未等到 `Send a message...` 提示，
-捕获输出只有终端控制序列。它发生在发送模型请求和 MCP 调用之前，与本次
-笔记修改无关；但在它修复或确认为环境问题之前，不能声称当前全量测试通过。
+其中记忆系统 E2E 使用本地假 SSE Provider，连续启动三个真实 YCode 进程，覆盖：
 
-MCP 专项的 76 项通过用例覆盖：
-
-- `.env` 解析、系统环境优先级、Server 配置隔离和秘密脱敏。
-- stdio 真实子进程发现、调用、stderr 排空、超时、取消和连接复用。
-- Streamable HTTP 普通 JSON、请求级 SSE、Header、超时和并发回包。
-- `2026-07-28` 直接协商和 `2025-11-25` 自动回退。
-- JSON-RPC 并发响应按请求匹配。
-- 分页发现、名称映射、Schema 校验、结果转换和错误分类。
-- ToolSearch、下一轮 Schema 暴露、同批次防绕过和任务级清空。
-- 真实 MCP Agent 链路：ToolSearch → 审批 → 远端调用 → 最终回复。
+- 新会话 A 的普通回合和工具回合落盘。
+- `--continue` 恢复 A 并继续追加。
+- 新会话 B 与 `/resume <A>` 在运行期切换。
+- 跨时长提醒只在恢复后的下一次普通请求注入。
+- 退出时记忆更新可聚合本进程在多个会话中新提交的回合。
 
 仍需人工完成：
 

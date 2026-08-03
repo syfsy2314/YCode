@@ -6,6 +6,7 @@ from ycode.context import (
     ContextFailureReport,
     ContextPolicy,
     ConversationMemory,
+    RestoreContextResult,
     SummarySource,
     TokenEstimate,
 )
@@ -64,3 +65,16 @@ def test_context_reports_validate_counts() -> None:
 def test_summary_source_requires_user_retained_message() -> None:
     with pytest.raises(ValueError, match="必须来自用户"):
         SummarySource(None, (), ChatMessage.assistant_text("answer"))
+
+
+def test_restore_context_result_exposes_checkpoint_requirement() -> None:
+    history = (ChatMessage.user_text("hello"),)
+    plain = RestoreContextResult(history, None)
+    compacted = RestoreContextResult(
+        history,
+        ConversationMemory("summary"),
+        ContextCompactionReport(100, 50),
+    )
+
+    assert not plain.checkpoint_required
+    assert compacted.checkpoint_required

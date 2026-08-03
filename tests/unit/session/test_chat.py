@@ -1,4 +1,6 @@
 import asyncio
+import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -18,6 +20,8 @@ from ycode.agent import (
     PermissionGrantsClearedEvent,
     PermissionModeChangedEvent,
     PlainChatRunner,
+    SessionRestoredEvent,
+    TurnMessage,
     UserMessageEvent,
 )
 from ycode.config import SecretRedactor
@@ -27,11 +31,15 @@ from ycode.context import (
     ContextPolicy,
     ConversationCompactor,
 )
-from ycode.core import StopReason, StreamEnd, TextDelta
+from ycode.core import ChatMessage, StopReason, StreamEnd, TextDelta
 from ycode.errors import ProviderError
 from ycode.mcp.models import McpConnectionState, McpServerStatus, McpStatusReport
+from ycode.memory import MemoryStore, MemoryUpdater, MemoryUpdateStatus
+from ycode.prompt import PromptRuntimeContext
 from ycode.security import PermissionMode, PermissionSession
 from ycode.session.chat import ChatSession
+from ycode.session.manager import SessionManager
+from ycode.session.models import SessionStorageError
 
 
 def text_response(*parts: str):
@@ -393,3 +401,172 @@ async def test_compact_can_be_cancelled_without_failure_or_commit(tmp_path: Path
     assert manager.memory is None
     assert manager.failure_count == 0
     await session.close()
+
+
+@pytest.mark.asyncio
+async def test_success_persists_before_history_and_storage_failure_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = FakeProvider([text_response("saved"), text_response("not saved")])
+    manager = SessionManager(tmp_path)
+    session = ChatSession(PlainChatRunner(provider), session_manager=manager)
+
+    events = await collect(session, "first")
+    assert isinstance(events[-1], FinalResponseEvent)
+    assert len((await manager.load(manager.active_session_id)).history) == 2  # type: ignore[arg-type]
+
+    def fail_write(path: Path, lines: tuple[str, ...]) -> None:
+        del path, lines
+        raise SessionStorageError("injected")
+
+    monkeypatch.setattr(manager, "_append_lines", fail_write)
+    events = await collect(session, "second")
+
+    assert events[-1] == AgentErrorEvent(
+        "session_storage_error",
+        "会话保存失败，本轮未提交到当前历史。",
+    )
+    assert [message.text for message in session.history] == ["first", "saved"]
+
+
+@pytest.mark.asyncio
+async def test_resume_switches_session_and_clears_session_state(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    provider = FakeProvider([text_response("one"), text_response("two")])
+    first_session = ChatSession(PlainChatRunner(provider), session_manager=manager)
+    await collect(first_session, "first")
+    first_id = manager.active_session_id
+    assert first_id is not None
+    manager.begin_new()
+    second_session = ChatSession(PlainChatRunner(provider), session_manager=manager)
+    await collect(second_session, "second")
+
+    permission = PermissionSession(PermissionMode.DEFAULT)
+    permission.grant({"tool": "read_file", "path": "a"})
+    runtime = PromptRuntimeContext()
+    runtime.begin_turn("agent")
+    session = ChatSession(
+        PlainChatRunner(FakeProvider([])),
+        permission,
+        session_manager=manager,
+        prompt_runtime=runtime,
+    )
+    events = await collect(session, f"/resume {first_id}")
+
+    assert isinstance(events[-1], SessionRestoredEvent)
+    assert [message.text for message in session.history] == ["first", "one"]
+    assert manager.active_session_id == first_id
+    assert permission.grant_count == 0
+    assert runtime.begin_turn("agent").full_mode_instruction
+
+
+@pytest.mark.asyncio
+async def test_resume_failure_preserves_current_session(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    provider = FakeProvider([text_response("current")])
+    session = ChatSession(PlainChatRunner(provider), session_manager=manager)
+    await collect(session, "hello")
+    current_id = manager.active_session_id
+    current_history = session.history
+
+    events = await collect(session, "/resume 20260803-010203-missing")
+
+    assert events[-1].code == "session_restore_failed"  # type: ignore[union-attr]
+    assert manager.active_session_id == current_id
+    assert session.history == current_history
+
+
+@pytest.mark.asyncio
+async def test_finalize_memory_reloads_and_applies_model_plan(tmp_path: Path) -> None:
+    response = json.dumps(
+        {
+            "operations": [
+                {
+                    "action": "create",
+                    "path": "user-prefers-any.md",
+                    "entry": {
+                        "path": "user-prefers-any.md",
+                        "name": "偏好 any",
+                        "description": "用户要求使用 any",
+                        "type": "user_preference",
+                        "body": "使用 any 替代 interface{}。",
+                    },
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    provider = FakeProvider(
+        [text_response("ok"), [TextDelta(0, response), StreamEnd(StopReason.END_TURN)]]
+    )
+    manager = SessionManager(tmp_path)
+    store = MemoryStore(tmp_path)
+    session = ChatSession(
+        PlainChatRunner(provider),
+        session_manager=manager,
+        memory_store=store,
+        memory_updater=MemoryUpdater(provider),
+    )
+    await collect(session, "remember")
+
+    report = await session.finalize_memory()
+
+    assert report.status is MemoryUpdateStatus.UPDATED
+    assert store.load().entries[0].path == "user-prefers-any.md"
+    assert await session.finalize_memory() is report
+
+
+@pytest.mark.asyncio
+async def test_finalize_memory_skips_without_new_commits(tmp_path: Path) -> None:
+    provider = FakeProvider([])
+    session = ChatSession(
+        PlainChatRunner(provider),
+        session_manager=SessionManager(tmp_path),
+        memory_store=MemoryStore(tmp_path),
+        memory_updater=MemoryUpdater(provider),
+    )
+
+    report = await session.finalize_memory()
+
+    assert report.status is MemoryUpdateStatus.SKIPPED
+    assert provider.requests == []
+
+
+@pytest.mark.asyncio
+async def test_stale_resume_queues_reminder_for_only_next_normal_turn(tmp_path: Path) -> None:
+    old = datetime(2020, 1, 1, tzinfo=UTC)
+    manager = SessionManager(tmp_path, clock=lambda: old)
+    saved = await manager.commit_turn(
+        (
+            TurnMessage(ChatMessage.user_text("old"), old),
+            TurnMessage(ChatMessage.assistant_text("answer"), old),
+        )
+    )
+
+    class ReminderRunner(PlainChatRunner):
+        def __init__(self, provider: FakeProvider) -> None:
+            super().__init__(provider)
+            self.queued = []
+            self.used = []
+
+        def queue_request_supplement(self, supplement) -> None:
+            self.queued.append(supplement)
+
+        def clear_queued_request_supplements(self, kind) -> None:
+            self.queued[:] = [item for item in self.queued if item.kind is not kind]
+
+        def start_turn(self, history, user_message, mode):
+            self.used.append(tuple(self.queued))
+            self.queued.clear()
+            return super().start_turn(history, user_message, mode)
+
+    runner = ReminderRunner(FakeProvider([text_response("first"), text_response("second")]))
+    session = ChatSession(runner, session_manager=manager)
+    await session.restore(saved.session_id)
+    await collect(session, "new turn")
+    await collect(session, "another turn")
+
+    assert len(runner.used[0]) == 1
+    assert "Last active:" in runner.used[0][0].content
+    assert runner.used[1] == ()

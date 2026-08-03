@@ -254,7 +254,7 @@ async def test_context_manager_compacts_before_main_request_and_commits(tmp_path
     assert turn.result.context_commit.history[0] is latest
     main_request = provider.agent_requests[1]
     assert main_request.messages[0] is latest
-    assert main_request.supplements[0].startswith("<memory>")
+    assert main_request.supplements[0].startswith("<conversation_memory>")
     assert main_request.supplements[-1].startswith("<reminder>")
     await context_manager.close()
 

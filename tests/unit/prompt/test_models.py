@@ -69,6 +69,20 @@ def test_system_supplement_renders_fixed_tag_and_scope() -> None:
     assert supplement.scope is SupplementScope.SESSION
 
 
+@pytest.mark.parametrize(
+    ("kind", "tag"),
+    [
+        (SupplementKind.PROJECT_INSTRUCTIONS, "project_instructions"),
+        (SupplementKind.PROJECT_MEMORY, "project_memory"),
+    ],
+)
+def test_project_supplement_types_have_distinct_tags(
+    kind: SupplementKind,
+    tag: str,
+) -> None:
+    assert SystemSupplement(kind, "content").tagged_content.startswith(f"<{tag}>\n")
+
+
 def test_system_supplement_rejects_invalid_values() -> None:
     with pytest.raises(ValueError, match="内容不能为空"):
         SystemSupplement(SupplementKind.MODE, "")

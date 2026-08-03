@@ -5,11 +5,13 @@ import asyncio
 from ycode.context.artifacts import ContextArtifactStore, ToolResultExternalizer
 from ycode.context.models import (
     ContextCommit,
+    ContextCompactionCandidate,
     ContextCompactionReport,
     ContextFailureReport,
     ContextPolicy,
     ConversationMemory,
     PreparedContextRequest,
+    RestoreContextResult,
     SummarySource,
 )
 from ycode.context.summary import ConversationCompactor
@@ -18,7 +20,7 @@ from ycode.core.messages import ChatMessage
 from ycode.core.provider import AgentModelRequest
 from ycode.tools.contracts import ToolExecutionRecord
 
-MEMORY_TEMPLATE = "<memory>\n{summary}\n</memory>"
+MEMORY_TEMPLATE = "<conversation_memory>\n{summary}\n</conversation_memory>"
 BOUNDARY_REMINDER = """<reminder>
 摘要不是代码事实。需要精确的文件、接口、错误或工具结果细节时，必须重新读取工作区
 文件或摘要中引用的存盘结果；禁止依据摘要臆造不存在的代码。
@@ -96,6 +98,14 @@ class ContextManager:
         self,
         history: tuple[ChatMessage, ...],
     ) -> ContextCompactionReport:
+        candidate = await self.prepare_manual_compaction(history)
+        self.activate_compaction(candidate)
+        return candidate.report
+
+    async def prepare_manual_compaction(
+        self,
+        history: tuple[ChatMessage, ...],
+    ) -> ContextCompactionCandidate:
         if not history and self.memory is None:
             raise ContextCompactionNotNeeded
         before = self._estimate_memory_history(history, self.memory)
@@ -108,9 +118,54 @@ class ContextManager:
             raise
         except Exception as error:
             raise ContextCompactionError(self._record_failure(error, False)) from error
-        self.memory = result.summary
+        return ContextCompactionCandidate(
+            result.retained_messages,
+            result.summary,
+            ContextCompactionReport(before, after, manual=True),
+        )
+
+    def activate_compaction(self, candidate: ContextCompactionCandidate) -> None:
+        self.memory = candidate.memory
         self._reset_failures()
-        return ContextCompactionReport(before, after, manual=True)
+
+    async def prepare_restore(
+        self,
+        history: tuple[ChatMessage, ...],
+        memory: ConversationMemory | None,
+    ) -> RestoreContextResult:
+        """预检恢复上下文，整个过程不修改当前会话状态。"""
+
+        before = self._estimate_memory_history(history, memory)
+        if before <= self.policy.auto_compact_threshold:
+            return RestoreContextResult(history, memory)
+        try:
+            result = await self.compactor.compact(SummarySource(memory, history))
+            after = self._estimate_memory_history(result.retained_messages, result.summary)
+            if after > self.policy.auto_compact_threshold:
+                raise ValueError("摘要后上下文仍超过自动压缩阈值")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            report = ContextFailureReport(
+                str(getattr(error, "code", "summary_failed")),
+                "恢复会话时上下文摘要失败。",
+                self.failure_count,
+                self.auto_compaction_fused,
+                False,
+            )
+            raise ContextCompactionError(report) from error
+        return RestoreContextResult(
+            result.retained_messages,
+            result.summary,
+            ContextCompactionReport(before, after),
+        )
+
+    def activate_restore(self, result: RestoreContextResult) -> None:
+        self.memory = result.memory
+        self.reset_runtime_state()
+
+    def reset_runtime_state(self) -> None:
+        self._reset_failures()
 
     def commit(self, context_commit: ContextCommit) -> None:
         self.memory = context_commit.memory
@@ -165,6 +220,7 @@ class ContextTransaction:
         self.history = tuple(history)
         self.latest_user_message = user_message
         self.memory = memory
+        self._compacted = False
 
     def build_result_message(self, records: list[ToolExecutionRecord]) -> ChatMessage:
         return self.manager.externalizer.build_result_message(records)
@@ -223,6 +279,7 @@ class ContextTransaction:
             )
 
         self.memory = result.summary
+        self._compacted = True
         self.manager._reset_failures()
         report = ContextCompactionReport(
             original_estimate.total_tokens,
@@ -236,4 +293,4 @@ class ContextTransaction:
         )
 
     def create_commit(self, history: tuple[ChatMessage, ...]) -> ContextCommit:
-        return ContextCommit(history, self.memory)
+        return ContextCommit(history, self.memory, self._compacted)

@@ -1,12 +1,16 @@
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from tests.support.fake_provider import FakeProvider
+from ycode.agent import TurnMessage
 from ycode.app import run_app
 from ycode.config.models import ProviderConfig
-from ycode.core import StopReason, StreamEnd, TextDelta
+from ycode.core import ChatMessage, StopReason, StreamEnd, TextDelta
+from ycode.errors import ConfigError
 from ycode.mcp.models import McpConnectionState, McpServerStatus, McpStatusReport
+from ycode.session import SessionManager
 from ycode.tools import (
     JsonSchemaToolArguments,
     ToolAccess,
@@ -102,6 +106,90 @@ async def test_app_assembles_anthropic_agent_with_builtin_tools(tmp_path: Path) 
     context_root = tmp_path / ".ycode" / "context"
     assert context_root.is_dir()
     assert list(context_root.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_anthropic_injects_project_instruction_and_memory_index(tmp_path: Path) -> None:
+    path = tmp_path / ".ycode" / "config.yaml"
+    write_config(path, "anthropic")
+    (tmp_path / "YCODE.md").write_text("Use Python 3.12.", encoding="utf-8")
+    memory = tmp_path / ".ycode" / "memory"
+    memory.mkdir()
+    (memory / "MEMORY.md").write_text(
+        "- [技术栈](project-stack.md) — Python 版本\n", encoding="utf-8"
+    )
+    (memory / "project-stack.md").write_text(
+        "---\nname: 技术栈\ndescription: Python 版本\ntype: project_knowledge\n---\nPython 3.12\n",
+        encoding="utf-8",
+    )
+    provider = FakeProvider([[TextDelta(0, "done"), StreamEnd(StopReason.END_TURN)]])
+
+    class FakeUI:
+        def __init__(self, config: object, session: object) -> None:
+            del config
+            self.session = session
+
+        async def run(self) -> None:
+            async for _ in self.session.stream_reply("hello"):
+                pass
+
+    await run_app(
+        start_dir=tmp_path,
+        provider_factory=lambda config: provider,
+        ui_factory=FakeUI,
+    )
+
+    supplements = provider.agent_requests[0].supplements
+    assert any("<project_instructions>" in item and "Python 3.12" in item for item in supplements)
+    assert any("<project_memory>" in item and "project-stack.md" in item for item in supplements)
+    assert all("Python 版本\ntype" not in item for item in supplements)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_continue_restores_latest_session(tmp_path: Path) -> None:
+    path = tmp_path / ".ycode" / "config.yaml"
+    write_config(path, "anthropic")
+    manager = SessionManager(tmp_path, clock=lambda: datetime(2026, 8, 3, tzinfo=UTC))
+    await manager.commit_turn(
+        (
+            TurnMessage(ChatMessage.user_text("old"), datetime(2026, 8, 3, tzinfo=UTC)),
+            TurnMessage(ChatMessage.assistant_text("answer"), datetime(2026, 8, 3, tzinfo=UTC)),
+        )
+    )
+    provider = FakeProvider([])
+    histories = []
+
+    class FakeUI:
+        def __init__(self, config: object, session: object) -> None:
+            del config
+            self.session = session
+
+        async def run(self) -> None:
+            histories.append(self.session.history)
+
+    await run_app(
+        start_dir=tmp_path,
+        provider_factory=lambda config: provider,
+        ui_factory=FakeUI,
+        continue_session=True,
+    )
+
+    assert [message.text for message in histories[0]] == ["old", "answer"]
+
+
+@pytest.mark.asyncio
+async def test_openai_rejects_continue_before_provider_creation(tmp_path: Path) -> None:
+    path = tmp_path / ".ycode" / "config.yaml"
+    write_config(path, "openai")
+    calls = []
+
+    with pytest.raises(ConfigError, match="仅支持 Anthropic"):
+        await run_app(
+            start_dir=tmp_path,
+            provider_factory=lambda config: calls.append(config),  # type: ignore[arg-type,return-value]
+            continue_session=True,
+        )
+    assert calls == []
 
 
 @pytest.mark.asyncio

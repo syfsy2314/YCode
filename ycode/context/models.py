@@ -116,12 +116,15 @@ class ConversationMemory:
 class ContextCommit:
     history: tuple[ChatMessage, ...]
     memory: ConversationMemory | None
+    checkpoint_required: bool = False
 
     def __post_init__(self) -> None:
         history = tuple(self.history)
         if any(not isinstance(message, ChatMessage) for message in history):
             raise TypeError("上下文提交历史只能包含 ChatMessage")
         object.__setattr__(self, "history", history)
+        if not isinstance(self.checkpoint_required, bool):
+            raise TypeError("上下文提交检查点标记必须是 bool")
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,3 +204,37 @@ class PreparedContextRequest:
         if any(not isinstance(message, ChatMessage) for message in messages):
             raise TypeError("预检消息只能包含 ChatMessage")
         object.__setattr__(self, "messages", messages)
+
+
+@dataclass(frozen=True, slots=True)
+class RestoreContextResult:
+    """尚未激活的会话恢复上下文候选。"""
+
+    history: tuple[ChatMessage, ...]
+    memory: ConversationMemory | None
+    compaction_report: ContextCompactionReport | None = None
+
+    def __post_init__(self) -> None:
+        history = tuple(self.history)
+        if any(not isinstance(message, ChatMessage) for message in history):
+            raise TypeError("恢复候选历史只能包含 ChatMessage")
+        object.__setattr__(self, "history", history)
+
+    @property
+    def checkpoint_required(self) -> bool:
+        return self.compaction_report is not None
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCompactionCandidate:
+    """尚未激活的手动压缩结果。"""
+
+    history: tuple[ChatMessage, ...]
+    memory: ConversationMemory
+    report: ContextCompactionReport
+
+    def __post_init__(self) -> None:
+        history = tuple(self.history)
+        if any(not isinstance(message, ChatMessage) for message in history):
+            raise TypeError("压缩候选历史只能包含 ChatMessage")
+        object.__setattr__(self, "history", history)
