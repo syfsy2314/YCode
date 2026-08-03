@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -8,6 +9,9 @@ from ycode.agent import (
     AgentErrorEvent,
     AgentMode,
     AgentTextDelta,
+    ContextCompactedEvent,
+    ContextCompactionFailedEvent,
+    ContextCompactionNotNeededEvent,
     FinalResponseEvent,
     McpStatusEvent,
     ModeChangedEvent,
@@ -15,6 +19,13 @@ from ycode.agent import (
     PermissionModeChangedEvent,
     PlainChatRunner,
     UserMessageEvent,
+)
+from ycode.config import SecretRedactor
+from ycode.context import (
+    ContextArtifactStore,
+    ContextManager,
+    ContextPolicy,
+    ConversationCompactor,
 )
 from ycode.core import StopReason, StreamEnd, TextDelta
 from ycode.errors import ProviderError
@@ -36,6 +47,40 @@ async def collect(session: ChatSession, prompt: str) -> list[object]:
 
 def session_with(provider: FakeProvider) -> ChatSession:
     return ChatSession(PlainChatRunner(provider))
+
+
+def summary_response() -> str:
+    headings = (
+        "主要请求",
+        "关键概念",
+        "文件代码",
+        "错误修复",
+        "解决过程",
+        "用户原话",
+        "待办",
+        "当前工作",
+        "下一步",
+    )
+    body = "\n".join(f"## {heading}\n无" for heading in headings)
+    return f"<analysis_draft>草稿</analysis_draft><summary>{body}</summary>"
+
+
+def context_session(
+    tmp_path: Path,
+    provider: FakeProvider,
+) -> tuple[ChatSession, ContextManager]:
+    policy = ContextPolicy()
+    manager = ContextManager(
+        policy,
+        ContextArtifactStore(
+            tmp_path,
+            SecretRedactor(),
+            policy,
+            session_id="chat-context",
+        ),
+        ConversationCompactor(provider),
+    )
+    return ChatSession(PlainChatRunner(provider), context_manager=manager), manager
 
 
 @pytest.mark.asyncio
@@ -172,6 +217,16 @@ async def test_non_exact_plan_text_is_sent_as_user_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_plain_session_keeps_compact_as_normal_user_message() -> None:
+    provider = FakeProvider([text_response("answer")])
+    session = session_with(provider)
+
+    await collect(session, "/compact")
+
+    assert provider.requests[0][0].text == "/compact"
+
+
+@pytest.mark.asyncio
 async def test_permission_commands_change_runtime_state_without_provider_call() -> None:
     provider = FakeProvider([])
     permission = PermissionSession(PermissionMode.DEFAULT)
@@ -254,3 +309,87 @@ async def test_blank_input_and_idempotent_close() -> None:
 
     assert provider.requests == []
     assert provider.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_compact_command_summarizes_committed_history_without_entering_it(
+    tmp_path: Path,
+) -> None:
+    provider = FakeProvider(
+        [
+            text_response("answer"),
+            [TextDelta(0, summary_response()), StreamEnd(StopReason.END_TURN)],
+        ]
+    )
+    session, manager = context_session(tmp_path, provider)
+    await collect(session, "question")
+
+    events = await collect(session, "/COMPACT")
+
+    assert isinstance(events[0], UserMessageEvent)
+    assert isinstance(events[-1], ContextCompactedEvent)
+    assert events[-1].report.manual
+    assert session.history == ()
+    assert manager.memory is not None
+    assert len(provider.agent_requests) == 1
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_compact_empty_history_does_not_call_provider(tmp_path: Path) -> None:
+    provider = FakeProvider([])
+    session, manager = context_session(tmp_path, provider)
+
+    events = await collect(session, "/compact")
+
+    assert isinstance(events[-1], ContextCompactionNotNeededEvent)
+    assert provider.agent_requests == []
+    assert manager.failure_count == 0
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_compact_failure_keeps_history_and_reports_count(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        [
+            text_response("answer"),
+            [TextDelta(0, "invalid"), StreamEnd(StopReason.END_TURN)],
+        ]
+    )
+    session, manager = context_session(tmp_path, provider)
+    await collect(session, "question")
+    original_history = session.history
+
+    events = await collect(session, "/compact")
+
+    assert isinstance(events[-1], ContextCompactionFailedEvent)
+    assert events[-1].report.failure_count == 1
+    assert session.history == original_history
+    assert manager.memory is None
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_compact_can_be_cancelled_without_failure_or_commit(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        [
+            text_response("answer"),
+            [TextDelta(0, summary_response()), StreamEnd(StopReason.END_TURN)],
+        ]
+    )
+    session, manager = context_session(tmp_path, provider)
+    await collect(session, "question")
+    original_history = session.history
+    provider.delay = 10
+    provider.request_started.clear()
+    task = asyncio.create_task(collect(session, "/compact"))
+    await provider.request_started.wait()
+
+    session.cancel_active_turn()
+    events = await task
+
+    assert isinstance(events[-1], AgentCancelledEvent)
+    assert session.history == original_history
+    assert manager.memory is None
+    assert manager.failure_count == 0
+    await session.close()

@@ -12,9 +12,18 @@ from ycode.agent import (
     AgentTurn,
     AgentTurnResult,
     AgentTurnStream,
+    ContextCompactedEvent,
+    ContextCompactionFailedEvent,
+    ContextCompactionNotNeededEvent,
     FinalResponseEvent,
     ModeChangedEvent,
     ToolApprovalRequested,
+)
+from ycode.context import (
+    ContextCommit,
+    ContextCompactionReport,
+    ContextFailureReport,
+    ConversationMemory,
 )
 from ycode.core.events import TokenUsage
 from ycode.core.messages import ChatMessage, ToolCallBlock
@@ -59,6 +68,38 @@ def test_completed_result_requires_final_message_at_end() -> None:
         )
     with pytest.raises(ValueError, match="错误码"):
         AgentTurnResult(termination=AgentTermination.ERROR, messages=())
+
+
+def test_context_commit_is_only_allowed_for_completed_result() -> None:
+    user = ChatMessage.user_text("question")
+    final = ChatMessage.assistant_text("answer")
+    commit = ContextCommit((user, final), ConversationMemory("summary"))
+    result = AgentTurnResult(
+        AgentTermination.COMPLETED,
+        (user, final),
+        final,
+        context_commit=commit,
+    )
+
+    assert result.context_commit is commit
+    with pytest.raises(ValueError, match="上下文提交"):
+        AgentTurnResult(
+            AgentTermination.CANCELLED,
+            (),
+            context_commit=commit,
+        )
+
+
+def test_context_events_validate_reports() -> None:
+    compacted = ContextCompactedEvent(ContextCompactionReport(100, 50))
+    failed = ContextCompactionFailedEvent(
+        ContextFailureReport("summary_invalid", "摘要无效", 1, False, True)
+    )
+    not_needed = ContextCompactionNotNeededEvent()
+
+    assert compacted.report.after_tokens == 50
+    assert failed.report.failure_count == 1
+    assert not_needed.code == "compact_not_needed"
 
 
 @pytest.mark.asyncio

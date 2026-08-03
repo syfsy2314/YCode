@@ -14,9 +14,17 @@ from ycode.agent import (
     AgentMode,
     AgentTermination,
     AgentTextDelta,
+    ContextCompactedEvent,
     FinalResponseEvent,
     ToolApprovalRequested,
     ToolExecutionCompleted,
+)
+from ycode.config import SecretRedactor
+from ycode.context import (
+    ContextArtifactStore,
+    ContextManager,
+    ContextPolicy,
+    ConversationCompactor,
 )
 from ycode.core import (
     ChatMessage,
@@ -71,6 +79,7 @@ class CountingTool:
         *,
         fail: bool = False,
         defer_loading: bool = False,
+        result_content: str | None = None,
     ) -> None:
         self.definition = ToolDefinition(
             name=name,
@@ -81,6 +90,7 @@ class CountingTool:
         )
         self.calls = 0
         self.fail = fail
+        self.result_content = result_content
 
     async def execute(
         self,
@@ -90,7 +100,13 @@ class CountingTool:
         del arguments, context
         self.calls += 1
         return ToolExecutionResult(
-            content="tool failed" if self.fail else f"result-{self.calls}",
+            content=(
+                self.result_content
+                if self.result_content is not None
+                else "tool failed"
+                if self.fail
+                else f"result-{self.calls}"
+            ),
             is_error=self.fail,
             metadata={"count": self.calls},
         )
@@ -121,6 +137,7 @@ def create_loop(
     max_rounds: int = 10,
     permission_mode: PermissionMode | None = None,
     plan_only_mcp_tools: frozenset[str] = frozenset(),
+    context_manager: ContextManager | None = None,
 ) -> AgentLoop:
     registry = ToolRegistry()
     for tool in tools:
@@ -161,12 +178,40 @@ def create_loop(
         permission_engine=permission_engine,
         permission_session=permission_session,
         plan_only_mcp_tools=plan_only_mcp_tools,
+        context_manager=context_manager,
         max_rounds=max_rounds,
     )
 
 
 async def consume(turn) -> list[object]:
     return [event async for event in turn]
+
+
+def summary_response() -> str:
+    headings = (
+        "主要请求",
+        "关键概念",
+        "文件代码",
+        "错误修复",
+        "解决过程",
+        "用户原话",
+        "待办",
+        "当前工作",
+        "下一步",
+    )
+    body = "\n".join(f"## {heading}\n无" for heading in headings)
+    return f"<analysis_draft>草稿</analysis_draft><summary>{body}</summary>"
+
+
+def create_context_manager(tmp_path: Path, provider: FakeProvider) -> ContextManager:
+    policy = ContextPolicy()
+    store = ContextArtifactStore(
+        tmp_path,
+        SecretRedactor(),
+        policy,
+        session_id="context-test",
+    )
+    return ContextManager(policy, store, ConversationCompactor(provider))
 
 
 def multi_tool_turn(*calls: tuple[str, str]):
@@ -182,6 +227,78 @@ def multi_tool_turn(*calls: tuple[str, str]):
         )
     events.append(StreamEnd(StopReason.TOOL_USE, StopReason.TOOL_USE.value))
     return events
+
+
+@pytest.mark.asyncio
+async def test_context_manager_compacts_before_main_request_and_commits(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        [
+            [TextDelta(0, summary_response()), StreamEnd(StopReason.END_TURN)],
+            final_turn("done"),
+        ]
+    )
+    context_manager = create_context_manager(tmp_path, provider)
+    loop = create_loop(tmp_path, provider, context_manager=context_manager)
+    latest = ChatMessage.user_text("最新用户原文")
+    turn = loop.start_turn(
+        (ChatMessage.user_text("x" * 510_000),),
+        latest,
+        AgentMode.AGENT,
+    )
+
+    events = await consume(turn)
+
+    assert any(isinstance(event, ContextCompactedEvent) for event in events)
+    assert turn.result is not None
+    assert turn.result.context_commit is not None
+    assert turn.result.context_commit.history[0] is latest
+    main_request = provider.agent_requests[1]
+    assert main_request.messages[0] is latest
+    assert main_request.supplements[0].startswith("<memory>")
+    assert main_request.supplements[-1].startswith("<reminder>")
+    await context_manager.close()
+
+
+@pytest.mark.asyncio
+async def test_context_manager_externalizes_tool_result_before_next_round(tmp_path: Path) -> None:
+    provider = FakeProvider([tool_turn("call-1", "large_tool"), final_turn("done")])
+    context_manager = create_context_manager(tmp_path, provider)
+    tool = CountingTool(
+        "large_tool",
+        ToolAccess.READ,
+        result_content="x" * 60_000,
+    )
+    loop = create_loop(tmp_path, provider, tool, context_manager=context_manager)
+
+    await consume(loop.start_turn((), ChatMessage.user_text("run"), AgentMode.AGENT))
+
+    result_block = provider.agent_requests[1].messages[-1].blocks(ToolResultBlock)[0]
+    reference = json.loads(result_block.content)
+    assert reference["externalized"] is True
+    assert reference["tool_name"] == "large_tool"
+    await context_manager.close()
+
+
+@pytest.mark.asyncio
+async def test_context_manager_observes_main_request_usage(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        [
+            [
+                TextDelta(0, "done"),
+                StreamEnd(
+                    StopReason.END_TURN,
+                    usage=TokenUsage(input_tokens=1_000_000),
+                ),
+            ]
+        ]
+    )
+    context_manager = create_context_manager(tmp_path, provider)
+    loop = create_loop(tmp_path, provider, context_manager=context_manager)
+
+    await consume(loop.start_turn((), ChatMessage.user_text("hello"), AgentMode.AGENT))
+
+    assert context_manager.estimator.calibration_ratio > 1
+    await context_manager.close()
 
 
 def tool_turn_with_arguments(call_id: str, name: str, arguments: dict[str, object]):

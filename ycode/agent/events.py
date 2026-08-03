@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 from ycode.agent.contracts import AgentMode
+from ycode.context.models import ContextCompactionReport, ContextFailureReport
 from ycode.core.messages import ChatMessage, ToolCallBlock
 from ycode.mcp.models import McpStatusReport
 from ycode.security.models import PermissionDecision, PermissionMode
@@ -192,6 +193,34 @@ class McpStatusEvent:
             raise TypeError("MCP 状态事件必须携带 McpStatusReport")
 
 
+@dataclass(frozen=True, slots=True)
+class ContextCompactedEvent:
+    report: ContextCompactionReport
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.report, ContextCompactionReport):
+            raise TypeError("上下文压缩事件必须携带压缩报告")
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCompactionFailedEvent:
+    report: ContextFailureReport
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.report, ContextFailureReport):
+            raise TypeError("上下文失败事件必须携带失败报告")
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCompactionNotNeededEvent:
+    code: str = "compact_not_needed"
+    message: str = "当前没有可压缩的对话历史。"
+
+    def __post_init__(self) -> None:
+        if not self.code or not self.message:
+            raise ValueError("无需压缩事件字段不能为空")
+
+
 type AgentEvent = (
     UserMessageEvent
     | AgentThinkingDelta
@@ -208,4 +237,7 @@ type AgentEvent = (
     | AgentCancelledEvent
     | AgentErrorEvent
     | McpStatusEvent
+    | ContextCompactedEvent
+    | ContextCompactionFailedEvent
+    | ContextCompactionNotNeededEvent
 )

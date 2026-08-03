@@ -30,6 +30,10 @@ $env:OPENAI_API_KEY = "your-key"
 
 配置顶层使用 `active` 选择当前 Provider。Anthropic 的官方 `base_url` 不包含 `/v1`；OpenAI 的官方 `base_url` 包含 `/v1`。
 
+顶层 `context_window_tokens` 配置 Anthropic 模型的上下文窗口，默认 `200000`。默认会在
+完整请求估算超过 167000 Token 时自动压缩，并为摘要输出和估算误差预留空间。该配置
+目前不改变 OpenAI 路径。
+
 启动时，YCode 只完整校验 `active` 指向的配置，也只解析该配置中的 `${ENV_VAR}`。未激活配置只要求提供唯一的 `name`，其他字段可以暂时不完整；切换 `active` 并重新启动后，新活动配置才会接受完整校验。未激活配置不会创建 SDK 客户端。
 
 YCode 默认从当前工作目录开始逐级向上寻找最近的 `.ycode/config.yaml`。也可以显式指定：
@@ -45,6 +49,19 @@ Anthropic 配置可在顶层使用 `mcp_servers` 接入本地 `stdio` 或远程 
 发现的工具以 `mcp_<server>_<tool>` 名称注册，并默认延迟加载：模型先通过 `tool_search` 搜索需要的名称，下一轮才会收到完整 Schema。输入 `/mcp` 可查看本地连接状态；工具目录只在启动时发现，修改 Server 后需重启。
 
 plan-only 默认不显示 MCP 工具。可在 `.ycode/security.yaml` 配置 `plan_only.allow_mcp_tools` 精确白名单；即使在白名单内，每一次 MCP 调用仍需要人工确认，不能授予会话永久权限。首版不支持 OAuth、Resources、Prompts，也不向 OpenAI 路径接入 MCP。
+
+### 上下文管理
+
+Anthropic 会话会在请求前控制工具结果大小：单个结果超过 50 KiB，或同一工具结果消息
+合计超过 200 KiB 时，脱敏后的完整内容会临时保存到
+`.ycode/context/<session-id>/tool-results/`，对话只保留预览、哈希和 manifest 路径。
+模型需要精确细节时可以使用现有文件读取工具重新读取。该目录已被 Git 忽略，并在正常
+关闭会话时删除。
+
+完整请求逼近窗口上限时，YCode 会调用当前 Anthropic 模型生成结构化摘要，同时原样
+保留活动回合的最新用户消息。输入 `/compact` 可以在未达到自动阈值时手动压缩全部已
+提交历史；命令本身不进入对话历史。连续三次摘要失败后自动摘要会熔断，仍可使用
+`/compact` 重试并在成功后恢复。
 
 ## 启动
 

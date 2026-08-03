@@ -19,6 +19,8 @@ class AgentModelRequest:
     system_prompt: tuple[str, ...] = ()
     supplements: tuple[str, ...] = ()
     tools: tuple[ToolDefinition[Any], ...] = ()
+    max_output_tokens: int | None = None
+    thinking_enabled: bool | None = None
 
     def __post_init__(self) -> None:
         messages = tuple(self.messages)
@@ -31,6 +33,14 @@ class AgentModelRequest:
             raise ValueError("System Prompt 内容块不能为空")
         if any(not isinstance(content, str) or not content.strip() for content in supplements):
             raise ValueError("系统补充内容不能为空")
+        if self.max_output_tokens is not None and (
+            not isinstance(self.max_output_tokens, int)
+            or isinstance(self.max_output_tokens, bool)
+            or self.max_output_tokens < 1
+        ):
+            raise ValueError("请求输出上限必须是正整数")
+        if self.thinking_enabled is not None and not isinstance(self.thinking_enabled, bool):
+            raise TypeError("Thinking 覆盖必须是布尔值")
         object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "system_prompt", system_prompt)
         object.__setattr__(self, "supplements", supplements)

@@ -67,6 +67,20 @@ def test_active_provider_is_unavailable_before_full_validation() -> None:
         _ = config.active_provider
 
 
+def test_app_config_context_window_defaults_and_validates_strictly() -> None:
+    base = {"active": "local", "providers": [{"name": "local"}]}
+
+    assert AppConfig.model_validate(base).context_window_tokens == 200_000
+    assert (
+        AppConfig.model_validate({**base, "context_window_tokens": 100_000}).context_window_tokens
+        == 100_000
+    )
+
+    for value in (True, "200000", 200_000.0, 33_000):
+        with pytest.raises(ValidationError, match="context_window_tokens"):
+            AppConfig.model_validate({**base, "context_window_tokens": value})
+
+
 @pytest.mark.parametrize(
     "data, expected",
     [

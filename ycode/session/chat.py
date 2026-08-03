@@ -15,12 +15,20 @@ from ycode.agent.events import (
     AgentErrorEvent,
     AgentEvent,
     AgentLimitReachedEvent,
+    ContextCompactedEvent,
+    ContextCompactionFailedEvent,
+    ContextCompactionNotNeededEvent,
     FinalResponseEvent,
     McpStatusEvent,
     ModeChangedEvent,
     PermissionGrantsClearedEvent,
     PermissionModeChangedEvent,
     UserMessageEvent,
+)
+from ycode.context import (
+    ContextCompactionError,
+    ContextCompactionNotNeeded,
+    ContextManager,
 )
 from ycode.core.messages import ChatMessage
 from ycode.mcp.models import McpStatusProvider
@@ -37,13 +45,16 @@ class ChatSession:
         runner: ConversationRunner,
         permission_session: PermissionSession | None = None,
         mcp_status_provider: McpStatusProvider | None = None,
+        context_manager: ContextManager | None = None,
     ) -> None:
         self._runner = runner
         self._history: list[ChatMessage] = []
         self._mode = AgentMode.AGENT
         self._permission_session = permission_session
         self._mcp_status_provider = mcp_status_provider
+        self._context_manager = context_manager
         self._active_turn: AgentTurn | None = None
+        self._active_compaction: asyncio.Task[object] | None = None
         self._turn_finished = asyncio.Event()
         self._turn_finished.set()
         self._closed = False
@@ -71,7 +82,7 @@ class ChatSession:
             raise ValueError("消息不能为空")
         if self._closed:
             raise RuntimeError("会话已关闭")
-        if self._active_turn is not None:
+        if self._active_turn is not None or self._active_compaction is not None:
             raise RuntimeError("已有 Agent 回合正在运行")
 
         user_message = ChatMessage.user_text(user_text)
@@ -95,6 +106,33 @@ class ChatSession:
                 yield AgentErrorEvent("mcp_unavailable", "当前没有 MCP 状态信息。")
             else:
                 yield McpStatusEvent(self._mcp_status_provider.snapshot())
+            return
+        if command == "/compact" and self._context_manager is not None:
+            yield UserMessageEvent(user_message)
+            task = asyncio.create_task(
+                self._context_manager.compact_committed_history(tuple(self._history))
+            )
+            self._active_compaction = task
+            self._turn_finished.clear()
+            try:
+                try:
+                    report = await task
+                except ContextCompactionNotNeeded:
+                    yield ContextCompactionNotNeededEvent()
+                except ContextCompactionError as error:
+                    yield ContextCompactionFailedEvent(error.report)
+                except asyncio.CancelledError:
+                    yield AgentCancelledEvent("当前上下文压缩已取消。")
+                else:
+                    self._history.clear()
+                    yield ContextCompactedEvent(report)
+            finally:
+                if not task.done():
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+                self._active_compaction = None
+                self._turn_finished.set()
             return
         if self._permission_session is not None and command.startswith("/permission"):
             yield UserMessageEvent(user_message)
@@ -156,7 +194,11 @@ class ChatSession:
             if result is None:
                 raise RuntimeError("AgentTurn 结束时缺少结果")
             if result.termination is AgentTermination.COMPLETED:
-                self._history.extend(result.messages)
+                if result.context_commit is not None and self._context_manager is not None:
+                    self._context_manager.commit(result.context_commit)
+                    self._history[:] = result.context_commit.history
+                else:
+                    self._history.extend(result.messages)
             if terminal_event is None:
                 raise RuntimeError("AgentTurn 结束时缺少终态事件")
             yield terminal_event
@@ -172,6 +214,8 @@ class ChatSession:
     def cancel_active_turn(self) -> None:
         if self._active_turn is not None:
             self._active_turn.cancel()
+        if self._active_compaction is not None:
+            self._active_compaction.cancel()
 
     def submit_approval(self, choice: ApprovalChoice) -> None:
         if self._active_turn is None:
@@ -182,7 +226,11 @@ class ChatSession:
         if self._closed:
             return
         self._closed = True
-        if self._active_turn is not None:
-            self._active_turn.cancel()
+        if self._active_turn is not None or self._active_compaction is not None:
+            self.cancel_active_turn()
             await self._turn_finished.wait()
-        await self._runner.close()
+        try:
+            await self._runner.close()
+        finally:
+            if self._context_manager is not None:
+                await self._context_manager.close()

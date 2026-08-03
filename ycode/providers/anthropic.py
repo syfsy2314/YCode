@@ -238,16 +238,21 @@ class AnthropicProvider:
     ) -> dict[str, Any]:
         request: dict[str, Any] = {
             "model": self._config.model,
-            "max_tokens": MAX_TOKENS,
+            "max_tokens": model_request.max_output_tokens or MAX_TOKENS,
             "messages": self._messages(
                 model_request.messages,
                 model_request.supplements if native_supplements else (),
             ),
             "stream": True,
         }
+        thinking_enabled = (
+            self._config.thinking
+            if model_request.thinking_enabled is None
+            else model_request.thinking_enabled
+        )
         request["thinking"] = (
             {"type": "adaptive", "display": "summarized"}
-            if self._config.thinking
+            if thinking_enabled
             else {"type": "disabled"}
         )
         system = self._system(

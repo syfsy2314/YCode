@@ -12,6 +12,9 @@ from ycode.agent import (
     AgentLimitReachedEvent,
     AgentTextDelta,
     AgentThinkingDelta,
+    ContextCompactedEvent,
+    ContextCompactionFailedEvent,
+    ContextCompactionNotNeededEvent,
     FinalResponseEvent,
     McpStatusEvent,
     ModeChangedEvent,
@@ -137,6 +140,18 @@ class TerminalUI:
                         self._console.print(f"permission grants cleared: {event.cleared_count}")
                     elif isinstance(event, McpStatusEvent):
                         self._console.print(render_mcp_status(event.report))
+                    elif isinstance(event, ContextCompactedEvent):
+                        self._console.print(
+                            f"上下文已压缩：{event.report.before_tokens:,} → "
+                            f"{event.report.after_tokens:,} tokens"
+                        )
+                    elif isinstance(event, ContextCompactionFailedEvent):
+                        message = f"上下文摘要失败（连续 {event.report.failure_count} 次）。"
+                        if event.report.fuse_open:
+                            message += "自动摘要已熔断；可使用 /compact 重试。"
+                        self._console.print(message)
+                    elif isinstance(event, ContextCompactionNotNeededEvent):
+                        self._console.print(event.message)
                     elif isinstance(event, FinalResponseEvent):
                         await ensure_started()
                         await active_renderer.complete(event.message)

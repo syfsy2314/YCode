@@ -1,0 +1,71 @@
+"""上下文管理公共接口。"""
+
+from ycode.context.artifacts import (
+    ContextArtifactStore,
+    ContextStorageError,
+    ToolResultExternalizer,
+)
+from ycode.context.manager import (
+    BOUNDARY_REMINDER,
+    ContextCompactionError,
+    ContextCompactionNotNeeded,
+    ContextLimitError,
+    ContextManager,
+    ContextTransaction,
+)
+from ycode.context.models import (
+    ArtifactChunk,
+    ContextCommit,
+    ContextCompactionReport,
+    ContextFailureReport,
+    ContextPolicy,
+    ContextSessionManifest,
+    ConversationMemory,
+    PreparedContextRequest,
+    SummaryResult,
+    SummarySource,
+    TokenEstimate,
+    ToolResultArtifact,
+    ToolResultManifest,
+)
+from ycode.context.summary import (
+    ConversationCompactor,
+    SummaryTranscript,
+    SummaryValidationError,
+    build_transcript,
+    load_summary_prompt,
+    parse_summary_response,
+)
+from ycode.context.tokens import TokenEstimator
+
+__all__ = [
+    "ArtifactChunk",
+    "ContextArtifactStore",
+    "ContextCommit",
+    "ContextCompactionReport",
+    "ContextCompactionError",
+    "ContextCompactionNotNeeded",
+    "ContextFailureReport",
+    "ContextPolicy",
+    "ContextLimitError",
+    "ContextManager",
+    "ContextSessionManifest",
+    "ContextStorageError",
+    "ContextTransaction",
+    "ConversationMemory",
+    "ConversationCompactor",
+    "PreparedContextRequest",
+    "SummaryResult",
+    "SummarySource",
+    "SummaryTranscript",
+    "SummaryValidationError",
+    "TokenEstimate",
+    "TokenEstimator",
+    "ToolResultArtifact",
+    "ToolResultExternalizer",
+    "ToolResultManifest",
+    "build_transcript",
+    "BOUNDARY_REMINDER",
+    "load_summary_prompt",
+    "parse_summary_response",
+]

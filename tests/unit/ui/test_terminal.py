@@ -5,9 +5,19 @@ import pytest
 from rich.console import Console
 
 from tests.support.fake_provider import FakeProvider
-from ycode.agent import AgentMode, PlainChatRunner, ToolExecutionCompleted
+from ycode.agent import (
+    AgentMode,
+    ContextCompactedEvent,
+    ContextCompactionFailedEvent,
+    ContextCompactionNotNeededEvent,
+    PlainChatRunner,
+    ToolExecutionCompleted,
+    UserMessageEvent,
+)
 from ycode.config.models import ProviderConfig
+from ycode.context import ContextCompactionReport, ContextFailureReport
 from ycode.core import (
+    ChatMessage,
     StopReason,
     StreamEnd,
     TextDelta,
@@ -255,3 +265,38 @@ async def test_terminal_renders_mcp_startup_summary_and_status_command() -> None
     assert "MCP Servers" in output
     assert "entry_2" in output
     assert "invalid_config" in output
+
+
+@pytest.mark.asyncio
+async def test_terminal_renders_context_status_events() -> None:
+    class EventSession:
+        mode = AgentMode.AGENT
+        permission_mode = None
+        mcp_status = None
+
+        async def stream_reply(self, text: str):
+            yield UserMessageEvent(ChatMessage.user_text(text))
+            yield ContextCompactedEvent(ContextCompactionReport(170_000, 12_000))
+            yield ContextCompactionFailedEvent(
+                ContextFailureReport("summary_invalid", "摘要无效", 3, True, False)
+            )
+            yield ContextCompactionNotNeededEvent()
+
+        def cancel_active_turn(self) -> None:
+            return
+
+    target = StringIO()
+    ui = TerminalUI(
+        config(),
+        EventSession(),  # type: ignore[arg-type]
+        console=Console(file=target, width=80, color_system=None),
+        input_factory=lambda _: FakeInput(["/compact", "/exit"]),
+    )
+
+    await ui.run()
+
+    output = target.getvalue()
+    assert "170,000 → 12,000 tokens" in output
+    assert "连续 3 次" in output
+    assert "自动摘要已熔断" in output
+    assert "没有可压缩" in output

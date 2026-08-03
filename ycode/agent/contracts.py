@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
+from ycode.context.models import ContextCommit
 from ycode.core.events import TokenUsage
 from ycode.core.messages import ChatMessage
 from ycode.security.models import ApprovalChoice
@@ -31,6 +32,7 @@ class AgentTurnResult:
     error_code: str = ""
     error_message: str = ""
     usage: TokenUsage = field(default_factory=TokenUsage)
+    context_commit: ContextCommit | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.termination, AgentTermination):
@@ -49,6 +51,9 @@ class AgentTurnResult:
                 raise ValueError("最终回复必须是本轮消息的最后一条")
         elif self.final_message is not None:
             raise ValueError("非正常完成不能携带最终回复")
+
+        if self.termination is not AgentTermination.COMPLETED and self.context_commit is not None:
+            raise ValueError("非正常完成不能携带上下文提交")
 
         if self.termination is AgentTermination.ERROR:
             if not self.error_code or not self.error_message:

@@ -8,6 +8,12 @@ from ycode.agent import AgentLoop, PlainChatRunner
 from ycode.config.discovery import discover_config
 from ycode.config.loader import load_config
 from ycode.config.models import ProviderConfig, ProviderProtocol
+from ycode.context import (
+    ContextArtifactStore,
+    ContextManager,
+    ContextPolicy,
+    ConversationCompactor,
+)
 from ycode.core.provider import AgentChatProvider, ChatProvider
 from ycode.mcp.manager import McpManager
 from ycode.prompt import EnvironmentCollector, PromptRuntimeContext, build_builtin_prompt
@@ -47,9 +53,16 @@ async def run_app(
     workspace = _resolve_workspace(start_dir)
     permission_session: PermissionSession | None = None
     manager: McpManager | None = None
+    context_manager: ContextManager | None = None
     session: ChatSession | None = None
     try:
         if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
+            policy = ContextPolicy(config.app.context_window_tokens)
+            context_manager = ContextManager(
+                policy,
+                ContextArtifactStore(workspace, config.redactor, policy),
+                ConversationCompactor(cast(AgentChatProvider, provider)),
+            )
             resolver = WorkspacePathResolver(workspace)
             registry = create_builtin_registry(
                 resolver,
@@ -83,10 +96,11 @@ async def run_app(
                 permission_session=permission_session,
                 plan_only_mcp_tools=frozenset(security_result.config.plan_only.allow_mcp_tools),
                 resource_manager=manager,
+                context_manager=context_manager,
             )
         else:
             runner = PlainChatRunner(provider)
-        session = ChatSession(runner, permission_session, manager)
+        session = ChatSession(runner, permission_session, manager, context_manager)
         ui = ui_factory(config.active_provider, session)
         await ui.run()
     finally:
@@ -97,4 +111,8 @@ async def run_app(
                 if manager is not None:
                     await manager.close()
             finally:
-                await provider.close()
+                try:
+                    await provider.close()
+                finally:
+                    if context_manager is not None:
+                        await context_manager.close()

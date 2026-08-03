@@ -19,12 +19,15 @@ from ycode.agent.events import (
     AgentLimitReachedEvent,
     AgentTextDelta,
     AgentThinkingDelta,
+    ContextCompactedEvent,
+    ContextCompactionFailedEvent,
     FinalResponseEvent,
     ToolApprovalRequested,
     ToolExecutionCancelled,
     ToolExecutionCompleted,
     ToolExecutionStarted,
 )
+from ycode.context import ContextLimitError, ContextManager, ContextStorageError
 from ycode.core.events import StopReason, TextDelta, ThinkingDelta, TokenUsage
 from ycode.core.messages import (
     ChatMessage,
@@ -76,6 +79,7 @@ class AgentLoop:
         permission_session: PermissionSession | None = None,
         plan_only_mcp_tools: frozenset[str] = frozenset(),
         resource_manager: "_AsyncCloseable | None" = None,
+        context_manager: ContextManager | None = None,
         max_rounds: int = 10,
     ) -> None:
         if not isinstance(max_rounds, int) or isinstance(max_rounds, bool) or max_rounds < 1:
@@ -93,6 +97,7 @@ class AgentLoop:
         self._permission_session = permission_session
         self._plan_only_mcp_tools = plan_only_mcp_tools
         self._resource_manager = resource_manager
+        self._context_manager = context_manager
         self._close_task: asyncio.Task[None] | None = None
         self._max_rounds = max_rounds
 
@@ -130,6 +135,11 @@ class AgentLoop:
     ) -> AsyncIterator[AgentEvent]:
         working_messages = [*history, user_message]
         turn_messages = [user_message]
+        context_transaction = (
+            self._context_manager.begin_turn(history, user_message)
+            if self._context_manager is not None
+            else None
+        )
         allowed_access = (
             frozenset({ToolAccess.READ})
             if mode is AgentMode.PLAN_ONLY
@@ -183,15 +193,47 @@ class AgentLoop:
                         definition for definition in definitions if definition.name != "tool_search"
                     )
                 advertised_names = frozenset(definition.name for definition in definitions)
-                assembler = ResponseAssembler()
-                stream = self._provider.stream_agent(
-                    AgentModelRequest(
-                        messages=tuple(working_messages),
-                        system_prompt=system_prompt,
-                        supplements=supplements,
-                        tools=definitions,
-                    )
+                model_request = AgentModelRequest(
+                    messages=tuple(working_messages),
+                    system_prompt=system_prompt,
+                    supplements=supplements,
+                    tools=definitions,
                 )
+                prepared = None
+                if context_transaction is not None:
+                    try:
+                        prepared = await turn.run_child(
+                            context_transaction.prepare_request(model_request)
+                        )
+                    except ContextLimitError as error:
+                        if error.failure_report is not None:
+                            yield ContextCompactionFailedEvent(error.failure_report)
+                        yield self._finish_error(
+                            turn,
+                            turn_messages,
+                            error.code,
+                            str(error),
+                            usage,
+                        )
+                        return
+                    except ContextStorageError:
+                        yield self._finish_error(
+                            turn,
+                            turn_messages,
+                            "context_storage_error",
+                            "无法安全保存超限工具结果。",
+                            usage,
+                        )
+                        return
+                    working_messages = list(prepared.messages)
+                    model_request = prepared.request
+                    if prepared.compaction_report is not None:
+                        yield ContextCompactedEvent(prepared.compaction_report)
+                    if prepared.failure_report is not None:
+                        yield ContextCompactionFailedEvent(prepared.failure_report)
+
+                assembler = ResponseAssembler()
+                stream = self._provider.stream_agent(model_request)
                 while True:
                     try:
                         event = await turn.run_child(anext(stream))
@@ -212,6 +254,11 @@ class AgentLoop:
                         )
 
                 assistant_message = assembler.finish()
+                if self._context_manager is not None and prepared is not None:
+                    self._context_manager.observe_main_usage(
+                        prepared.estimate.local_tokens,
+                        assembler.usage.total_input_tokens,
+                    )
                 usage += assembler.usage
                 stop_reason = assembler.stop_reason
                 tool_calls = assistant_message.blocks(ToolCallBlock)
@@ -225,6 +272,11 @@ class AgentLoop:
                             messages=tuple(turn_messages),
                             final_message=assistant_message,
                             usage=usage,
+                            context_commit=(
+                                context_transaction.create_commit(tuple(working_messages))
+                                if context_transaction is not None
+                                else None
+                            ),
                         )
                     )
                     yield FinalResponseEvent(assistant_message)
@@ -331,16 +383,20 @@ class AgentLoop:
                     return
 
                 records.sort(key=lambda record: record.position)
-                result_message = ChatMessage(
-                    role="user",
-                    content=tuple(
-                        ToolResultBlock(
-                            record.call.id,
-                            _result_content(record),
-                            record.result.is_error,
-                        )
-                        for record in records
-                    ),
+                result_message = (
+                    context_transaction.build_result_message(records)
+                    if context_transaction is not None
+                    else ChatMessage(
+                        role="user",
+                        content=tuple(
+                            ToolResultBlock(
+                                record.call.id,
+                                _result_content(record),
+                                record.result.is_error,
+                            )
+                            for record in records
+                        ),
+                    )
                 )
                 working_messages.append(result_message)
                 turn_messages.append(result_message)
@@ -384,6 +440,14 @@ class AgentLoop:
                 turn_messages,
                 "invalid_response",
                 "模型响应结构无效，请重试。",
+                usage,
+            )
+        except ContextStorageError:
+            yield self._finish_error(
+                turn,
+                turn_messages,
+                "context_storage_error",
+                "无法安全保存超限工具结果。",
                 usage,
             )
         except Exception:

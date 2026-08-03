@@ -181,6 +181,29 @@ async def test_agent_request_adds_system_and_provider_neutral_tools() -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_request_applies_output_and_thinking_overrides() -> None:
+    client = client_with(event("message_start"), *completed())
+    provider = AnthropicProvider(config(thinking=True), client=client)
+
+    events = [
+        event
+        async for event in provider.stream_agent(
+            AgentModelRequest(
+                messages=(ChatMessage.user_text("summarize"),),
+                max_output_tokens=20_000,
+                thinking_enabled=False,
+            )
+        )
+    ]
+
+    assert events[-1] == StreamEnd(StopReason.END_TURN, "end_turn")
+    request = client.messages.create.await_args.kwargs
+    assert request["max_tokens"] == 20_000
+    assert request["thinking"] == {"type": "disabled"}
+    assert "tools" not in request
+
+
+@pytest.mark.asyncio
 async def test_stream_merges_cache_usage_without_breaking_missing_fields() -> None:
     client = client_with(
         event(

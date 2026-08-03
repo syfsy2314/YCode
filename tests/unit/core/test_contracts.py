@@ -119,6 +119,24 @@ def test_agent_model_request_freezes_separate_channels() -> None:
     assert request.supplements[0].startswith("<environment_context>")
 
 
+def test_agent_model_request_validates_request_overrides() -> None:
+    user = ChatMessage.user_text("hello")
+    request = AgentModelRequest(
+        messages=(user,),
+        max_output_tokens=20_000,
+        thinking_enabled=False,
+    )
+
+    assert request.max_output_tokens == 20_000
+    assert request.thinking_enabled is False
+
+    for value in (True, 0, -1):
+        with pytest.raises(ValueError, match="输出上限"):
+            AgentModelRequest(messages=(user,), max_output_tokens=value)
+    with pytest.raises(TypeError, match="Thinking"):
+        AgentModelRequest(messages=(user,), thinking_enabled=1)  # type: ignore[arg-type]
+
+
 def test_semantic_events_have_precise_payloads() -> None:
     thinking = ThinkingBlock("reason", "signature")
     redacted = RedactedThinkingBlock("encrypted")

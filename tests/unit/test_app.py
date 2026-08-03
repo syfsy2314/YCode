@@ -59,6 +59,7 @@ async def test_app_assembles_components_and_always_closes(tmp_path: Path) -> Non
     assert factory_configs == [seen["config"]]
     assert factory_configs[0].name == "local"
     assert provider.closed is True
+    assert not (tmp_path / ".ycode" / "context").exists()
 
 
 @pytest.mark.asyncio
@@ -98,6 +99,9 @@ async def test_app_assembles_anthropic_agent_with_builtin_tools(tmp_path: Path) 
     assert all("Workspace:" not in block for block in request.system_prompt)
     assert all("permission mode:" not in block for block in request.system_prompt)
     assert provider.closed is True
+    context_root = tmp_path / ".ycode" / "context"
+    assert context_root.is_dir()
+    assert list(context_root.iterdir()) == []
 
 
 @pytest.mark.asyncio

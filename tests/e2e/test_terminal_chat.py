@@ -148,6 +148,22 @@ def anthropic_text_response(text: str) -> StreamResponse:
     )
 
 
+def context_summary_text() -> str:
+    headings = (
+        "主要请求",
+        "关键概念",
+        "文件代码",
+        "错误修复",
+        "解决过程",
+        "用户原话",
+        "待办",
+        "当前工作",
+        "下一步",
+    )
+    body = "\n".join(f"## {heading}\n无" for heading in headings)
+    return f"<analysis_draft>草稿</analysis_draft><summary>{body}</summary>"
+
+
 class PtyReader:
     def __init__(self, process: PtyProcess) -> None:
         self.process = process
@@ -998,6 +1014,44 @@ def test_windows_terminal_narrow_header_stacks_details(
         assert "Traceback" not in reader.snapshot()
     finally:
         stop_process(process)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
+def test_windows_terminal_context_compact_and_continue(
+    tmp_path: Path,
+    sse_server: SSETestServer,
+) -> None:
+    project = tmp_path / "context-flow"
+    write_anthropic_config(project / ".ycode" / "config.yaml", sse_server, thinking=False)
+    sse_server.enqueue(anthropic_text_response("first answer"))
+    sse_server.enqueue(anthropic_text_response(context_summary_text()))
+    sse_server.enqueue(anthropic_text_response("after compact"))
+    process, reader = spawn_ycode(project)
+    try:
+        reader.wait_for("Send a message...", timeout=15)
+        process.write("first question\r")
+        reader.wait_for("first answer", timeout=15)
+        reader.wait_for("Send a message...", timeout=15, count=2)
+        process.write("/compact\r")
+        reader.wait_for("上下文已压缩", timeout=15)
+        reader.wait_for("Send a message...", timeout=15, count=3)
+        process.write("continue now\r")
+        reader.wait_for("after compact", timeout=15)
+        reader.wait_for("Send a message...", timeout=15, count=4)
+        process.write("/exit\r")
+        wait_for_exit(process)
+        assert "Traceback" not in reader.snapshot()
+    finally:
+        stop_process(process)
+
+    summary_request = sse_server.requests[1].json
+    assert summary_request["max_tokens"] == 20_000
+    assert summary_request["thinking"] == {"type": "disabled"}
+    assert "tools" not in summary_request
+    assert "<memory>" in json.dumps(sse_server.requests[2].json, ensure_ascii=False)
+    context_root = project / ".ycode" / "context"
+    assert context_root.is_dir()
+    assert list(context_root.iterdir()) == []
 
 
 @pytest.mark.parametrize(
