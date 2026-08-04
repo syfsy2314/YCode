@@ -13,7 +13,12 @@ from ycode.core import (
     ThinkingDelta,
 )
 from ycode.memory import MemorySnapshot, MemoryType, MemoryUpdater
-from ycode.memory.updater import MemoryUpdateError, build_memory_transcript, parse_memory_update
+from ycode.memory.updater import (
+    MemoryUpdateError,
+    build_memory_transcript,
+    load_memory_update_prompt,
+    parse_memory_update,
+)
 from ycode.session import SessionCommit
 
 NOW = datetime(2026, 8, 3, 1, 2, 3, tzinfo=UTC)
@@ -36,6 +41,17 @@ def test_memory_transcript_contains_session_time_boundaries() -> None:
     assert turn["session_id"] == "20260803-010203-memory"
     assert turn["turn_id"] == "000001"
     assert turn["messages"][0]["timestamp"].endswith("Z")
+
+
+def test_memory_update_prompt_declares_filename_contract() -> None:
+    prompt = load_memory_update_prompt()
+
+    assert "user_preference: `user-<slug>.md`" in prompt
+    assert "correction_feedback: `feedback-<slug>.md`" in prompt
+    assert "project_knowledge: `project-<slug>.md`" in prompt
+    assert "reference: `reference-<slug>.md`" in prompt
+    assert "`path` and `entry.path` must be identical" in prompt
+    assert "`user_language`" in prompt
 
 
 def test_parse_memory_update_accepts_noop_and_valid_create() -> None:

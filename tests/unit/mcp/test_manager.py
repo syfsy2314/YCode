@@ -115,3 +115,97 @@ async def test_enabled_servers_start_concurrently() -> None:
 
     assert loop.time() - started < 0.055
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_background_start_returns_before_connection_and_runs_callback() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    callbacks = 0
+
+    class BlockingConnection:
+        def __init__(self, config, redactor) -> None:
+            del redactor
+            self.config = config
+            self.state = McpConnectionState.STARTING
+
+        @property
+        def status(self) -> McpServerStatus:
+            return McpServerStatus(self.config.name, "stdio", self.state, 0)
+
+        async def start(self) -> McpDiscoveryResult:
+            started.set()
+            await release.wait()
+            self.state = McpConnectionState.READY
+            return McpDiscoveryResult(self.config.name, "2026-07-28", ())
+
+        async def close(self) -> None:
+            self.state = McpConnectionState.CLOSED
+
+    manager = McpManager(
+        McpConfigSet((server("slow"),)),
+        ToolRegistry(),
+        SecretRedactor(),
+        BlockingConnection,
+    )
+
+    def completed() -> None:
+        nonlocal callbacks
+        callbacks += 1
+
+    manager.add_startup_callback(completed)
+    manager.start_background()
+    await started.wait()
+
+    assert manager.snapshot().starting_count == 1
+    assert callbacks == 0
+
+    release.set()
+    await manager.start()
+
+    assert callbacks == 1
+    assert manager.snapshot().ready_count == 1
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_background_start() -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    closed = asyncio.Event()
+
+    class BlockingConnection:
+        def __init__(self, config, redactor) -> None:
+            del redactor
+            self.config = config
+            self.state = McpConnectionState.STARTING
+
+        @property
+        def status(self) -> McpServerStatus:
+            return McpServerStatus(self.config.name, "stdio", self.state, 0)
+
+        async def start(self) -> McpDiscoveryResult:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+            return McpDiscoveryResult(self.config.name, "2026-07-28", ())
+
+        async def close(self) -> None:
+            self.state = McpConnectionState.CLOSED
+            closed.set()
+
+    manager = McpManager(
+        McpConfigSet((server("slow"),)),
+        ToolRegistry(),
+        SecretRedactor(),
+        BlockingConnection,
+    )
+    manager.start_background()
+    await started.wait()
+
+    await manager.close()
+
+    assert cancelled.is_set()
+    assert closed.is_set()

@@ -14,6 +14,7 @@ from ycode.agent import (
     ToolExecutionCompleted,
     UserMessageEvent,
 )
+from ycode.commands import CommandDefinition, CommandKind, build_command_runtime
 from ycode.config.models import ProviderConfig
 from ycode.context import ContextCompactionReport, ContextFailureReport
 from ycode.core import (
@@ -33,6 +34,7 @@ from ycode.mcp.models import (
     McpServerStatus,
     McpStatusReport,
 )
+from ycode.security import PermissionMode, PermissionSession
 from ycode.session.chat import ChatSession
 from ycode.tools import ToolExecutionRecord, ToolExecutionResult
 from ycode.ui.terminal import TerminalUI, _tool_result_summary, _tool_start_summary
@@ -46,6 +48,12 @@ class FakeInput:
     async def read(self, mode: AgentMode) -> str:
         self.modes.append(mode)
         return self.values.pop(0)
+
+
+class CommandInput(FakeInput):
+    async def read(self, mode: AgentMode, permission_mode=None) -> str:
+        del permission_mode
+        return await super().read(mode)
 
 
 class InterruptingInput(FakeInput):
@@ -106,6 +114,74 @@ def config() -> ProviderConfig:
 
 def text_response(value: str):
     return [TextDelta(0, value), StreamEnd(StopReason.END_TURN)]
+
+
+@pytest.mark.asyncio
+async def test_command_runtime_routes_local_commands_without_provider() -> None:
+    provider = FakeProvider([])
+    runner = PlainChatRunner(provider)
+    runner.supported_modes = frozenset({AgentMode.AGENT, AgentMode.PLAN_ONLY})
+    permission = PermissionSession(PermissionMode.DEFAULT)
+    session = ChatSession(
+        runner,
+        permission,
+        command_runtime=build_command_runtime(),
+    )
+    target = StringIO()
+    ui = TerminalUI(
+        config(),
+        session,
+        console=Console(file=target, width=80, color_system=None),
+        input_factory=lambda _: CommandInput(
+            ["/help", "/unknown", "/plan", "/permission strict", "/exit"]
+        ),
+    )
+
+    await ui.run()
+
+    output = target.getvalue()
+    assert "可用命令" in output
+    assert "未知命令" in output
+    assert session.mode is AgentMode.PLAN_ONLY
+    assert permission.mode is PermissionMode.STRICT
+    assert provider.requests == []
+    assert session.history == ()
+
+
+@pytest.mark.asyncio
+async def test_hidden_ai_command_displays_raw_and_commits_expanded_prompt() -> None:
+    async def review(invocation, controller) -> None:
+        await controller.send_user_message(invocation.raw_text, "Review current changes.")
+
+    definition = CommandDefinition(
+        "review-test",
+        (),
+        "test",
+        "/review-test",
+        CommandKind.AI,
+        "",
+        review,
+        True,
+    )
+    provider = FakeProvider([text_response("done")])
+    session = ChatSession(
+        PlainChatRunner(provider),
+        command_runtime=build_command_runtime((definition,)),
+    )
+    target = StringIO()
+    ui = TerminalUI(
+        config(),
+        session,
+        console=Console(file=target, width=80, color_system=None),
+        input_factory=lambda _: CommandInput(["/review-test", "/exit"]),
+        renderer_factory=lambda _: FakeRenderer(),
+    )
+
+    await ui.run()
+
+    assert "/review-test" in target.getvalue()
+    assert provider.requests[0][0].text == "Review current changes."
+    assert session.history[0].text == "Review current changes."
 
 
 @pytest.mark.asyncio
@@ -265,6 +341,27 @@ async def test_terminal_renders_mcp_startup_summary_and_status_command() -> None
     assert "MCP Servers" in output
     assert "entry_2" in output
     assert "invalid_config" in output
+
+
+@pytest.mark.asyncio
+async def test_terminal_mcp_summary_shows_background_connections() -> None:
+    report = McpStatusReport((McpServerStatus("slow", "stdio", McpConnectionState.STARTING, 0),))
+
+    class StatusProvider:
+        def snapshot(self) -> McpStatusReport:
+            return report
+
+    target = StringIO()
+    ui = TerminalUI(
+        config(),
+        ChatSession(PlainChatRunner(FakeProvider([])), mcp_status_provider=StatusProvider()),
+        console=Console(file=target, width=80, color_system=None),
+        input_factory=lambda _: FakeInput(["/exit"]),
+    )
+
+    await ui.run()
+
+    assert "MCP: 后台连接 1 / 可用 0 / 失败 0 / 未启用 0" in target.getvalue()
 
 
 @pytest.mark.asyncio

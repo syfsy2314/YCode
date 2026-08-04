@@ -71,10 +71,12 @@ async def test_app_assembles_anthropic_agent_with_builtin_tools(tmp_path: Path) 
     path = tmp_path / ".ycode" / "config.yaml"
     write_config(path, "anthropic")
     provider = FakeProvider([[TextDelta(0, "done"), StreamEnd(StopReason.END_TURN)]])
+    sessions = []
 
     class FakeUI:
         def __init__(self, config: object, session: object) -> None:
             self._session = session
+            sessions.append(session)
 
         async def run(self) -> None:
             async for _ in self._session.stream_reply("hello"):
@@ -103,6 +105,16 @@ async def test_app_assembles_anthropic_agent_with_builtin_tools(tmp_path: Path) 
     assert all("Workspace:" not in block for block in request.system_prompt)
     assert all("permission mode:" not in block for block in request.system_prompt)
     assert provider.closed is True
+    assert [item.name for item in sessions[0].command_runtime.registry.definitions] == [
+        "help",
+        "exit",
+        "plan",
+        "agent",
+        "mcp",
+        "compact",
+        "permission",
+        "resume",
+    ]
     context_root = tmp_path / ".ycode" / "context"
     assert context_root.is_dir()
     assert list(context_root.iterdir()) == []
@@ -277,9 +289,15 @@ async def test_anthropic_mcp_assembly_is_deferred_and_closes_manager_first(
             del config, redactor
             self.registry = registry
             self.warnings = ()
+            self.callbacks = []
 
-        async def start(self) -> None:
+        def add_startup_callback(self, callback) -> None:
+            self.callbacks.append(callback)
+
+        def start_background(self) -> None:
             self.registry.register(DeferredTool())
+            for callback in self.callbacks:
+                callback()
 
         def set_security_warnings(self, warnings) -> None:
             self.warnings = warnings
@@ -323,6 +341,65 @@ async def test_anthropic_mcp_assembly_is_deferred_and_closes_manager_first(
 
 
 @pytest.mark.asyncio
+async def test_anthropic_runs_ui_before_background_mcp_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / ".ycode" / "config.yaml"
+    write_config(path, "anthropic")
+    path.write_text(
+        path.read_text(encoding="utf-8") + "mcp_servers:\n"
+        "  - name: slow\n"
+        "    transport: stdio\n"
+        "    command: unused\n",
+        encoding="utf-8",
+    )
+    events = []
+
+    class BackgroundManager:
+        def __init__(self, config, registry, redactor) -> None:
+            del config, registry, redactor
+            self.warnings = ()
+
+        def set_security_warnings(self, warnings) -> None:
+            self.warnings = warnings
+
+        def add_startup_callback(self, callback) -> None:
+            del callback
+
+        def start_background(self) -> None:
+            events.append("mcp_background")
+
+        def snapshot(self) -> McpStatusReport:
+            return McpStatusReport(
+                (McpServerStatus("slow", "stdio", McpConnectionState.STARTING, 0),),
+                self.warnings,
+            )
+
+        async def close(self) -> None:
+            events.append("mcp_closed")
+
+    monkeypatch.setattr("ycode.app.McpManager", BackgroundManager)
+
+    class FakeUI:
+        def __init__(self, config, session) -> None:
+            del config
+            self.session = session
+
+        async def run(self) -> None:
+            events.append("ui_running")
+            assert self.session.mcp_status.starting_count == 1
+
+    await run_app(
+        start_dir=tmp_path,
+        provider_factory=lambda config: FakeProvider([]),
+        ui_factory=FakeUI,
+    )
+
+    assert events == ["mcp_background", "ui_running", "mcp_closed"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("enabled", [True, False])
 async def test_mcp_unavailable_or_disabled_keeps_anthropic_agent_running(
     tmp_path: Path, enabled: bool
@@ -358,7 +435,7 @@ async def test_mcp_unavailable_or_disabled_keeps_anthropic_agent_running(
 
     assert reports[0] is not None
     if enabled:
-        assert reports[0].failed_count == 1
+        assert reports[0].starting_count == 1
     else:
         assert reports[0].disabled_count == 1
     names = [item.name for item in provider.agent_requests[0].tools]

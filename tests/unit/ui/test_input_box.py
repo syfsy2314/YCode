@@ -4,7 +4,13 @@ from io import StringIO
 import pytest
 from prompt_toolkit.formatted_text import fragment_list_to_text, to_formatted_text
 from prompt_toolkit.input import DummyInput, create_pipe_input
-from prompt_toolkit.layout import BufferControl, FormattedTextControl, HSplit, Window
+from prompt_toolkit.layout import (
+    BufferControl,
+    FloatContainer,
+    FormattedTextControl,
+    HSplit,
+    Window,
+)
 from prompt_toolkit.layout.processors import AfterInput, BeforeInput, ConditionalProcessor
 from prompt_toolkit.output import DummyOutput
 from rich.console import Console
@@ -47,9 +53,10 @@ def test_four_line_layout_and_indicator(unicode_supported: bool, expected: str) 
     application = box._create_application(19)
     root = application.layout.container
 
-    assert isinstance(root, HSplit)
-    assert len(root.children) == 4
-    top, input_window, bottom, hint = root.children
+    assert isinstance(root, FloatContainer)
+    assert isinstance(root.content, HSplit)
+    assert len(root.content.children) == 4
+    top, input_window, bottom, hint = root.content.children
 
     assert isinstance(top, Window)
     assert isinstance(input_window, Window)
@@ -90,7 +97,9 @@ def test_layout_reserves_last_terminal_column() -> None:
     )
     application = box._create_application(19)
     root = application.layout.container
-    top, _, bottom, _ = root.children
+    assert isinstance(root, FloatContainer)
+    assert isinstance(root.content, HSplit)
+    top, _, bottom, _ = root.content.children
 
     assert isinstance(top, Window)
     assert isinstance(bottom, Window)
@@ -108,6 +117,9 @@ def test_hint_places_mode_on_right_and_prioritizes_it_when_narrow() -> None:
         60,
         AgentMode.AGENT,
         PermissionMode.STRICT,
+    )
+    assert format_hint(40, AgentMode.AGENT, help_hint="/help for commands").startswith(
+        "/help for commands"
     )
 
 

@@ -973,11 +973,17 @@ def test_windows_terminal_mcp_deferred_flow(tmp_path: Path, sse_server: SSETestS
     sse_server.enqueue(anthropic_text_response("MCP flow completed"))
     process, reader = spawn_ycode(project)
     try:
-        reader.wait_for("可用 1 / 失败 0 / 未启用 0", timeout=25)
+        reader.wait_for("后台连接 1", timeout=25)
         reader.wait_for("Send a message...", timeout=20)
+        deadline = time.monotonic() + 15
+        while not state_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert state_file.exists()
+        time.sleep(0.5)
         process.write("/mcp\r")
         reader.wait_for("MCP Servers", timeout=15)
         reader.wait_for("fixture", timeout=15)
+        reader.wait_for("ready", timeout=15)
         process.write("use MCP echo\r")
         reader.wait_for("tool_search", timeout=20)
         reader.wait_for("工具审批：mcp_fixture_echo", timeout=20)
@@ -998,6 +1004,70 @@ def test_windows_terminal_mcp_deferred_flow(tmp_path: Path, sse_server: SSETestS
     assert [tool["name"] for tool in sse_server.requests[0].json["tools"]][-1] == ("tool_search")
     assert "mcp_fixture_echo" not in {tool["name"] for tool in sse_server.requests[0].json["tools"]}
     assert "mcp_fixture_echo" in {tool["name"] for tool in sse_server.requests[1].json["tools"]}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
+def test_windows_terminal_mcp_background_startup(
+    tmp_path: Path,
+    sse_server: SSETestServer,
+) -> None:
+    project = tmp_path / "mcp-background"
+    project.mkdir()
+    state_file = project / "mcp-state.jsonl"
+    python = Path.cwd() / ".venv" / "Scripts" / "python.exe"
+    mcp_server = Path.cwd() / "tests" / "support" / "mcp_stdio_server.py"
+    delayed_server = (
+        "import time,runpy;time.sleep(5);"
+        f"runpy.run_path(r'{mcp_server.as_posix()}',run_name='__main__')"
+    )
+    config_path = project / ".ycode" / "config.yaml"
+    write_anthropic_config(config_path, sse_server, thinking=False)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "mcp_servers:\n"
+        "  - name: slow_fixture\n"
+        "    transport: stdio\n"
+        f"    command: '{python}'\n"
+        "    args:\n"
+        "      - '-c'\n"
+        f'      - "{delayed_server}"\n'
+        "    startup_timeout_seconds: 10\n"
+        "    env:\n"
+        "      YCODE_MCP_STATE_FILE: ${MCP_STATE_FILE}\n",
+        encoding="utf-8",
+    )
+    (project / ".env").write_text(f"MCP_STATE_FILE={state_file}\n", encoding="utf-8")
+
+    process, reader = spawn_ycode(project)
+    try:
+        reader.wait_for("后台连接 1", timeout=20)
+        reader.wait_for("Send a message...", timeout=20)
+        process.write("/mcp\r")
+        reader.wait_for("starting", timeout=15)
+        reader.wait_for("Send a message...", timeout=15, count=2)
+
+        deadline = time.monotonic() + 15
+        while not state_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert state_file.exists()
+        time.sleep(0.5)
+        assert "ready" not in reader.snapshot()
+
+        process.write("/mcp\r")
+        reader.wait_for("ready", timeout=15)
+        reader.wait_for("slow_fixture", timeout=15)
+        reader.wait_for("8", timeout=15)
+        reader.wait_for("Send a message...", timeout=15, count=3)
+        process.write("/exit\r")
+        wait_for_exit(process, timeout=15)
+        output = reader.snapshot()
+        assert "Traceback" not in output
+    finally:
+        stop_process(process)
+
+    assert sse_server.requests == []
+    state = [json.loads(line) for line in state_file.read_text(encoding="utf-8").splitlines()]
+    assert state[0]["event"] == "started"
+    assert state[-1]["event"] == "stopped"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
@@ -1055,6 +1125,44 @@ def test_windows_terminal_context_compact_and_continue(
     context_root = project / ".ycode" / "context"
     assert context_root.is_dir()
     assert list(context_root.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
+def test_windows_terminal_builtin_command_framework(
+    tmp_path: Path,
+    sse_server: SSETestServer,
+) -> None:
+    project = tmp_path / "builtin-commands"
+    write_anthropic_config(project / ".ycode" / "config.yaml", sse_server, thinking=False)
+    process, reader = spawn_ycode(project)
+    try:
+        reader.wait_for("/help for commands", timeout=15)
+
+        process.write("/he\t\r")
+        reader.wait_for("可用命令", timeout=15)
+        reader.wait_for("/help for commands", timeout=15, count=2)
+
+        process.write("/p\t")
+        output = reader.wait_for("/permission", timeout=15)
+        assert "/plan" in output
+        process.write("\x15")
+        process.write("/unknown\r")
+        reader.wait_for("未知命令", timeout=15)
+        reader.wait_for("/help for commands", timeout=15, count=3)
+
+        process.write("/plan\r")
+        reader.wait_for("mode: plan-only", timeout=15)
+        process.write("/permission strict\r")
+        reader.wait_for("permission: strict", timeout=15)
+        process.write("/mcp\r")
+        reader.wait_for("当前没有 MCP 状态信息", timeout=15)
+        process.write("/quit\r")
+        wait_for_exit(process)
+        assert "Traceback" not in reader.snapshot()
+    finally:
+        stop_process(process)
+
+    assert sse_server.requests == []
 
 
 @pytest.mark.parametrize(

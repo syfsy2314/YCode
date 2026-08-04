@@ -6,20 +6,24 @@ import sys
 from prompt_toolkit import Application
 from prompt_toolkit.application.current import get_app, get_app_session
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.completion import Completer
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.input.base import Input
-from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
 from prompt_toolkit.key_binding.defaults import load_key_bindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import (
     BufferControl,
     Dimension,
+    Float,
+    FloatContainer,
     FormattedTextControl,
     HSplit,
     Layout,
     Window,
 )
+from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.processors import (
     AfterInput,
     BeforeInput,
@@ -46,12 +50,13 @@ def format_hint(
     width: int,
     mode: AgentMode,
     permission_mode: PermissionMode | None = None,
+    help_hint: str = HELP_HINT,
 ) -> str:
     full_mode = f"mode: {mode.value}"
     if permission_mode is not None:
         full_mode += f"  permission: {permission_mode.value}"
-    if width >= len(HELP_HINT) + len(full_mode) + 1:
-        return f"{HELP_HINT}{' ' * (width - len(HELP_HINT) - len(full_mode))}{full_mode}"
+    if width >= len(help_hint) + len(full_mode) + 1:
+        return f"{help_hint}{' ' * (width - len(help_hint) - len(full_mode))}{full_mode}"
     if width >= len(full_mode):
         return full_mode.rjust(width)
     if width >= len(mode.value):
@@ -78,6 +83,8 @@ class InputBox:
         border_style: InputBorderStyle = DEFAULT_INPUT_BORDER_STYLE,
         input: Input | None = None,
         output: Output | None = None,
+        completer: Completer | None = None,
+        help_hint: str = HELP_HINT,
     ) -> None:
         self._console = console
         self._unicode_supported = (
@@ -86,6 +93,8 @@ class InputBox:
         self._border_style = border_style
         self._input = input
         self._output = output
+        self._completer = completer
+        self._help_hint = help_hint
 
     def _create_application(
         self,
@@ -99,7 +108,12 @@ class InputBox:
             get_app().exit(result=buffer.text, style="class:accepted")
             return True
 
-        buffer = Buffer(multiline=False, accept_handler=accept)
+        buffer = Buffer(
+            multiline=False,
+            accept_handler=accept,
+            completer=self._completer,
+            complete_while_typing=False,
+        )
 
         @Condition
         def display_placeholder() -> bool:
@@ -141,7 +155,7 @@ class InputBox:
                     [
                         (
                             "class:input-hint",
-                            format_hint(width, mode, permission_mode),
+                            format_hint(width, mode, permission_mode, self._help_hint),
                         )
                     ]
                 )
@@ -151,11 +165,26 @@ class InputBox:
             dont_extend_width=True,
             dont_extend_height=True,
         )
-        root = HSplit([make_border(), input_window, make_border(), hint_window])
+        content = HSplit([make_border(), input_window, make_border(), hint_window])
+        root = FloatContainer(
+            content=content,
+            floats=[
+                Float(
+                    xcursor=True,
+                    ycursor=True,
+                    content=CompletionsMenu(max_height=8, scroll_offset=1),
+                )
+            ],
+        )
+        bindings = KeyBindings()
+
+        @bindings.add("c-c")
+        def exit_application(event) -> None:
+            event.app.exit(exception=KeyboardInterrupt())
 
         return Application(
             layout=Layout(root, focused_element=input_window),
-            key_bindings=load_key_bindings(),
+            key_bindings=merge_key_bindings([load_key_bindings(), bindings]),
             style=create_prompt_style(self._border_style),
             full_screen=False,
             erase_when_done=True,

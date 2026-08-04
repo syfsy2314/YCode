@@ -17,7 +17,7 @@ def test_model_defaults_and_valid_stdio_config() -> None:
 
     assert config.enabled is True
     assert config.args == ()
-    assert config.startup_timeout_seconds == 10.0
+    assert config.startup_timeout_seconds == 5.0
     assert config.tool_timeout_seconds == 60.0
 
 
@@ -33,6 +33,19 @@ def test_model_accepts_streamable_http_config() -> None:
 
     assert isinstance(config, HttpMcpServerConfig)
     assert config.headers["Authorization"].get_secret_value() == "Bearer token"
+
+
+def test_explicit_startup_timeout_overrides_default() -> None:
+    config = StdioMcpServerConfig.model_validate(
+        {
+            "name": "local_tools",
+            "transport": "stdio",
+            "command": "python",
+            "startup_timeout_seconds": 10,
+        }
+    )
+
+    assert config.startup_timeout_seconds == 10.0
 
 
 @pytest.mark.parametrize(

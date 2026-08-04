@@ -31,7 +31,7 @@ class _McpServerConfig(BaseModel):
 
     name: str = Field(min_length=1)
     enabled: bool = True
-    startup_timeout_seconds: float = Field(default=10.0, gt=0)
+    startup_timeout_seconds: float = Field(default=5.0, gt=0)
     tool_timeout_seconds: float = Field(default=60.0, gt=0)
 
     @field_validator("name")

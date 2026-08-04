@@ -9,6 +9,8 @@ from ycode.mcp.models import McpStatusReport
 def render_mcp_summary(report: McpStatusReport) -> Text:
     summary = Text()
     summary.append("MCP: ", style="bold")
+    if report.starting_count:
+        summary.append(f"后台连接 {report.starting_count} / ")
     summary.append(f"可用 {report.ready_count}")
     summary.append(f" / 失败 {report.failed_count}")
     summary.append(f" / 未启用 {report.disabled_count}")

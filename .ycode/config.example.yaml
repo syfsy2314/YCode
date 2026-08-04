@@ -21,7 +21,7 @@ mcp_servers:
     transport: stdio
     command: python
     args: ["-m", "your_mcp_server"]
-    startup_timeout_seconds: 10
+    startup_timeout_seconds: 10  # 默认 5 秒；此处显式覆盖
     tool_timeout_seconds: 60
     env:
       API_TOKEN: ${MCP_API_TOKEN}
@@ -29,7 +29,7 @@ mcp_servers:
   - name: remote_tools
     transport: streamable_http
     url: https://mcp.example.com/mcp
-    startup_timeout_seconds: 10
+    startup_timeout_seconds: 10  # 默认 5 秒；此处显式覆盖
     tool_timeout_seconds: 60
     headers:
       Authorization: Bearer ${MCP_API_TOKEN}

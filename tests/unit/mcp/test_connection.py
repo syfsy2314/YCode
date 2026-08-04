@@ -234,6 +234,47 @@ async def test_startup_timeout_covers_client_entry(
 
 
 @pytest.mark.asyncio
+async def test_close_cancels_connection_still_entering_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+
+    class BlockingClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        async def __aenter__(self) -> "BlockingClient":
+            entered.set()
+            await asyncio.Event().wait()
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+    monkeypatch.setattr("ycode.mcp.connection.Client", BlockingClient)
+    from ycode.mcp.connection import McpConnection
+
+    connection = McpConnection(
+        StdioMcpServerConfig.model_validate(
+            {
+                "name": "local",
+                "transport": "stdio",
+                "command": "python",
+                "startup_timeout_seconds": 10,
+            }
+        ),
+        SecretRedactor(),
+    )
+    start_task = asyncio.create_task(connection.start())
+    await entered.wait()
+
+    await asyncio.wait_for(connection.close(), timeout=0.2)
+    await start_task
+
+    assert connection.state is McpConnectionState.CLOSED
+
+
+@pytest.mark.asyncio
 async def test_discovery_collects_pages_and_keeps_invalid_schema_as_issue() -> None:
     from mcp.types import ListToolsResult, Tool
 

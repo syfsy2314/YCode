@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from ycode.agent import AgentLoop, PlainChatRunner
+from ycode.commands import CommandDefinitionError, build_command_runtime
 from ycode.config.discovery import discover_config
 from ycode.config.loader import load_config
 from ycode.config.models import ProviderConfig, ProviderProtocol
@@ -62,8 +63,14 @@ async def run_app(
     manager: McpManager | None = None
     context_manager: ContextManager | None = None
     session: ChatSession | None = None
+    command_runtime = None
+    has_enabled_mcp = False
     try:
         if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
+            try:
+                command_runtime = build_command_runtime()
+            except CommandDefinitionError as error:
+                raise ConfigError("内置命令配置无效") from error
             memory_store = MemoryStore(workspace)
             project_context = ProjectContextLoader(workspace, memory_store).load()
             prompt_runtime = PromptRuntimeContext()
@@ -84,12 +91,19 @@ async def run_app(
             )
             if config.mcp.servers or config.mcp.issues:
                 manager = McpManager(config.mcp, registry, config.redactor)
-                await manager.start()
-                if any(server.enabled for server in config.mcp.servers):
+                has_enabled_mcp = any(server.enabled for server in config.mcp.servers)
+                if has_enabled_mcp:
                     registry.register(ToolSearchTool(registry))
             security_result = load_security_config(workspace, registry)
             if manager is not None:
                 manager.set_security_warnings(security_result.warnings)
+                if has_enabled_mcp:
+
+                    def refresh_security_warnings() -> None:
+                        refreshed = load_security_config(workspace, registry)
+                        manager.set_security_warnings(refreshed.warnings)
+
+                    manager.add_startup_callback(refresh_security_warnings)
             permission_session = PermissionSession(security_result.config.mode)
             permission_engine = PermissionEngine(
                 registry,
@@ -124,6 +138,7 @@ async def run_app(
                 memory_store=memory_store,
                 memory_updater=MemoryUpdater(cast(AgentChatProvider, provider)),
                 startup_warnings=tuple(warning.message for warning in project_context.warnings),
+                command_runtime=command_runtime,
             )
             if continue_session:
                 try:
@@ -132,6 +147,8 @@ async def run_app(
                     raise ConfigError("最近会话恢复失败") from error
         else:
             session = ChatSession(runner, permission_session, manager, context_manager)
+        if manager is not None and has_enabled_mcp:
+            manager.start_background()
         ui = ui_factory(config.active_provider, session)
         await ui.run()
     finally:

@@ -40,6 +40,8 @@ class McpManager:
         self._tool_counts: dict[str, int] = {}
         self._registration_errors: dict[str, McpErrorSummary] = {}
         self._security_warnings: tuple[SecurityConfigWarning, ...] = ()
+        self._start_task: asyncio.Task[None] | None = None
+        self._startup_callbacks: list[Callable[[], None]] = []
         for index, server in zip(config.entry_indices, config.servers, strict=True):
             self._status_order.append((index, server.name))
             if not server.enabled:
@@ -60,7 +62,40 @@ class McpManager:
         self._status_order.sort(key=lambda item: (item[0], item[1]))
         self._close_task: asyncio.Task[None] | None = None
 
+    def add_startup_callback(self, callback: Callable[[], None]) -> None:
+        if self._start_task is not None and self._start_task.done():
+            if not self._start_task.cancelled() and self._start_task.exception() is None:
+                try:
+                    callback()
+                except Exception:
+                    pass
+            return
+        self._startup_callbacks.append(callback)
+
+    def start_background(self) -> None:
+        if self._start_task is None:
+            self._start_task = asyncio.create_task(self._start())
+
     async def start(self) -> None:
+        self.start_background()
+        assert self._start_task is not None
+        await asyncio.shield(self._start_task)
+
+    async def _start(self) -> None:
+        try:
+            await self._start_connections()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return
+        for callback in self._startup_callbacks:
+            try:
+                callback()
+            except Exception:
+                continue
+        self._startup_callbacks.clear()
+
+    async def _start_connections(self) -> None:
         async with asyncio.TaskGroup() as group:
             tasks = {
                 name: group.create_task(connection.start())
@@ -114,4 +149,7 @@ class McpManager:
         await self._close_task
 
     async def _close(self) -> None:
+        if self._start_task is not None and not self._start_task.done():
+            self._start_task.cancel()
+            await asyncio.gather(self._start_task, return_exceptions=True)
         await asyncio.gather(*(connection.close() for connection in self._connections.values()))

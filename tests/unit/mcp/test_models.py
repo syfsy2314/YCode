@@ -12,6 +12,8 @@ def test_status_report_counts_states_in_config_order() -> None:
     report = McpStatusReport(
         (
             McpServerStatus("ready", "stdio", McpConnectionState.READY, 2),
+            McpServerStatus("starting", "stdio", McpConnectionState.STARTING, 0),
+            McpServerStatus("reconnecting", "stdio", McpConnectionState.RECONNECTING, 0),
             McpServerStatus("disabled", "stdio", McpConnectionState.DISABLED, 0),
             McpServerStatus(
                 "failed",
@@ -23,8 +25,15 @@ def test_status_report_counts_states_in_config_order() -> None:
         )
     )
 
-    assert [status.name for status in report.servers] == ["ready", "disabled", "failed"]
+    assert [status.name for status in report.servers] == [
+        "ready",
+        "starting",
+        "reconnecting",
+        "disabled",
+        "failed",
+    ]
     assert report.ready_count == 1
+    assert report.starting_count == 2
     assert report.disabled_count == 1
     assert report.failed_count == 1
 

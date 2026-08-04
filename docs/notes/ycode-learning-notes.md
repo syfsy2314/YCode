@@ -81,8 +81,10 @@ def main(argv=None) -> int:
 
 ### 4. run_app()
 
-`run_app()` 是组合根：它读取配置、创建 Provider，并根据协议选择对话运行器。Anthropic
-路径还会装配内建工具、MCP、权限系统和 AgentLoop；OpenAI 仍保持纯聊天。
+`run_app()` 是组合根：它读取配置、只创建 `active` 指向的 Provider，并根据协议选择
+对话运行器。Provider 工厂在协议分支内局部导入实现，因此活动配置为 Anthropic 时不会
+导入 OpenAI Provider 或 OpenAI SDK。Anthropic 路径还会装配命令框架、内建工具、MCP、
+权限系统和 AgentLoop；OpenAI 仍保持纯聊天。
 
 简化后的核心逻辑：
 
@@ -95,6 +97,7 @@ provider = create_provider(config.active_provider)
 workspace = config.project_root
 
 if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
+    command_runtime = build_command_runtime()
     memory_store = MemoryStore(workspace)
     project_context = ProjectContextLoader(workspace, memory_store).load()
     prompt_runtime = PromptRuntimeContext()
@@ -108,8 +111,8 @@ if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
 
     if config.mcp.servers or config.mcp.issues:
         manager = McpManager(config.mcp, registry, config.redactor)
-        await manager.start()
-        if any(server.enabled for server in config.mcp.servers):
+        has_enabled_mcp = any(server.enabled for server in config.mcp.servers)
+        if has_enabled_mcp:
             registry.register(ToolSearchTool(registry))
 
     security_result = load_security_config(workspace, registry)
@@ -147,18 +150,30 @@ if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
         prompt_runtime=prompt_runtime,
         memory_store=memory_store,
         memory_updater=MemoryUpdater(provider),
+        command_runtime=command_runtime,
     )
     if continue_session:
         await session.restore()
 else:
     session = ChatSession(runner)
+
+if manager is not None and has_enabled_mcp:
+    manager.start_background()
+
+ui = TerminalUI(config.active_provider, session)
+await ui.run()
 ~~~
 
 Anthropic 的对象关系：
 
 ~~~text
 TerminalUI
+    ├── InputBox
+    │       └── CommandCompleter
     └── ChatSession
+            ├── CommandRuntime
+            │       ├── CommandRegistry
+            │       └── CommandDispatcher
             └── AgentLoop
                     ├── AnthropicProvider
                     ├── ToolRegistry
@@ -196,20 +211,24 @@ TerminalUI
 
 - Anthropic 进入 AgentLoop，能够使用内建工具和 MCP 工具并进行多轮 ReAct
   循环。
+- Anthropic 装配集中式命令运行时；OpenAI 不装配命令注册、分发或补全。
 - Anthropic 使用 `config.project_root` 统一工具、项目指令、会话、上下文和记忆的路径
   边界，并支持 `--continue`。
 - OpenAI 只通过 PlainChatRunner 发起一次模型请求，没有工具定义、Agent system prompt 或 plan-only 能力。
 - OpenAI 不装配持久化会话和项目记忆，使用 `--continue` 会在创建 Provider 前失败。
+- `enabled: true` 的 MCP 在 UI 装配完成后后台连接；`enabled: false` 不创建连接任务。
 
 退出时，`finally` 调用 `session.close()`。Session 再关闭 Runner，AgentLoop 先通过
-`resource_manager` 关闭 MCP 连接、HTTP Client 和 stdio 子进程，最后关闭 Provider。
+`resource_manager` 关闭 MCP：未完成的后台启动先取消，READY 连接再正常退出，最后关闭
+HTTP Client、stdio 子进程和 Provider。
 
 ### 面试表述
 
 YCode 通过 `pyproject.toml` 注册 CLI 入口。`cli.main()` 负责参数解析和启动 asyncio
-事件循环，`run_app()` 是组合根：它加载 Provider 与 MCP 配置，在 Anthropic
-路径先完成 MCP 连接和工具注册，再装配权限系统与 AgentLoop；OpenAI 保持
-PlainChatRunner。资源关闭沿 Session、Runner 传递，MCP 和 Provider 都会被释放。
+事件循环，`run_app()` 是组合根：它按 `active` 延迟导入单个 Provider，在 Anthropic
+路径装配命令、工具、权限与 AgentLoop，然后让启用的 MCP 后台连接并立即进入 UI；
+OpenAI 保持 PlainChatRunner。资源关闭沿 Session、Runner 传递，MCP 后台任务和 Provider
+都会被释放。
 
 ## 核心数据与组件关系
 
@@ -539,7 +558,18 @@ UI 的展示原则：
 
 Anthropic 的 InputBox 右下角同时显示任务模式和权限模式。审批输入只有“拒绝、本次
 允许、本会话允许”三个选择；进入审批前会暂停普通 Ctrl+C 监听，避免两个输入应用竞争
-同一终端设备。OpenAI 没有装配权限会话，保持原有输入和命令行为。
+同一终端设备。启用命令运行时时，输入框左侧提示为 `/help for commands`，并使用
+`CommandCompleter` 从注册中心读取公开名称和别名完成 Tab 补全。
+
+普通输入框是自行构造的 prompt_toolkit `Application`。`load_key_bindings()` 中基础
+`Ctrl+C` 绑定只会忽略按键，所以 YCode 还必须显式合并一个 `c-c` 绑定并让应用以
+`KeyboardInterrupt` 结束。TerminalUI 捕获后进入正常退出管线。三种场景的语义不同：
+
+- 空闲输入框 `Ctrl+C`：直接退出 YCode，并执行记忆整理和资源关闭。
+- Agent 回合、工具执行或手动压缩期间 `Ctrl+C`：取消当前活动操作，回到输入框。
+- 工具审批期间 `Ctrl+C`：取消审批 Future 和整个当前 Agent 回合。
+
+OpenAI 没有装配权限会话和命令运行时，保持兼容输入路径。
 
 ### 8. 职责边界
 
@@ -564,6 +594,9 @@ Anthropic 的 InputBox 右下角同时显示任务模式和权限模式。审批
 | ContextManager | Token 预检、会话摘要、恢复候选和检查点状态 |
 | MemoryStore | 校验、规范化并安全应用 `.ycode/memory/` 内容 |
 | MemoryUpdater | 退出时发起隔离请求并解析结构化记忆操作 |
+| CommandRegistry | 保存不可变命令元数据，统一处理名称、别名、冲突、帮助和补全来源 |
+| CommandDispatcher | 在普通对话前解析和安全分发斜杠命令 |
+| UIController | 隔离命令处理器与 Rich、prompt_toolkit 等具体 UI 框架 |
 | TerminalUI | 消费 AgentEvent 并控制输入、取消与展示 |
 | Renderer | 多轮内容、工具摘要、计时和最终 Markdown |
 
@@ -577,6 +610,7 @@ AgentLoop 负责多轮行动
 Tool 系统负责执行本地能力
 SessionManager 负责磁盘会话事实
 ChatSession 负责跨组件事务和活动状态
+CommandRuntime 负责斜杠命令的目录、解析和分发
 TerminalUI 负责交互与展示
 ~~~
 
@@ -992,6 +1026,70 @@ name、description 或 type；删除只能针对当前有效索引中的条目�
 `TIMEOUT` 或 `FAILED` 报告，不影响已经完成的 JSONL 会话提交。强制终止、进程崩溃和
 断电不会触发这条正常退出管线。
 
+### ⚠️ 真实故障复盘：路径契约只写在代码里
+
+> [!IMPORTANT]
+> 如果结构化输出需要满足本地领域模型，不能只在解析器中实现校验；同一份
+> 契约必须明确告诉模型。否则模型会返回语义正确、但无法被程序接受的数据。
+
+故障现象是：用户明确要求“平时用中文与我交流，记住了”，`/exit` 后却显示
+“项目记忆整理失败”，且 `.ycode/memory/` 没有生成主题文件。
+
+最初只用构造的最小对话调用 DeepSeek，模型返回：
+
+~~~json
+{"operations":[]}
+~~~
+
+这只能证明空操作路径正常，没有走到真正出错的 `create` 分支。改用用户明确授权的
+实际相关回合后，捕获到原始响应：
+
+~~~json
+{
+  "operations": [
+    {
+      "action": "create",
+      "path": "user_language",
+      "entry": {
+        "path": "user_language",
+        "name": "交流语言偏好",
+        "description": "用户要求使用中文交流",
+        "type": "user_preference",
+        "body": "用户明确要求平时使用中文交流。所有后续回复均应使用中文。"
+      }
+    }
+  ]
+}
+~~~
+
+问题由此确定：`MemoryEntry` 要求路径是单层、小写 kebab-case Markdown 文件，并按
+记忆类型使用 `user-`、`feedback-`、`project-` 或 `reference-` 前缀。
+`user_language` 不带类型前缀和 `.md` 后缀，因此 `parse_memory_update()` 最终抛出
+`记忆操作字段无效`。`ChatSession._finalize_memory()` 当时把所有普通异常统一转换成
+“项目记忆整理失败”，所以终端没有暴露路径校验这个真正原因。
+
+根因不是校验过严，而是更新 Prompt 只给了 `"path":"..."` 占位符，没有把代码中的
+路径契约告诉模型。修复后的 Prompt 明确规定：
+
+- 文件名必须是单层 ASCII 小写 kebab-case Markdown。
+- 四类记忆必须使用各自的固定前缀。
+- `create` 和 `update` 的 `path` 必须与 `entry.path` 完全一致。
+- 明确把 `user_language` 和目录路径列为反例。
+
+使用同一回合重新请求后，DeepSeek 返回：
+
+~~~json
+{"operations":[{"action":"create","path":"user-chinese-language.md","entry":{"path":"user-chinese-language.md","name":"中文交流","description":"用户偏好使用中文交流","type":"user_preference","body":"用户明确要求使用中文交流。所有后续回复应使用中文。"}}]}
+~~~
+
+该响应以 `end_turn` 正常结束，并成功解析为一条 `create` 操作。修复后记忆相关
+回归测试为 `27 passed`，格式、静态、编译和 `git diff --check` 也均通过。
+
+> [!WARNING]
+> “真实 API 可以返回合法 JSON”不等于“会返回合法领域对象”。调试结构化模型
+> 输出时，必须触发实际失败的操作分支，保留原始响应，再逐层区分“流异常、
+> JSON 语法、结构契约、领域校验和文件应用”。
+
 ### 9. 关键职责边界
 
 ~~~text
@@ -1398,6 +1496,126 @@ YCode 在 AgentLoop 与 Scheduler 之间设置统一 PermissionEngine：先做�
 才执行；拒绝作为结构化 ToolResult 回填。这样既保留 ReAct 自我修正，也保证工具在
 获准前没有副作用。
 
+## 内置命令框架
+
+内置命令不再散落在 `ChatSession` 和 `TerminalUI` 的条件分支里。Anthropic 启动时显式
+调用 `build_command_runtime()`，得到共享同一份元数据的 `CommandRegistry` 和
+`CommandDispatcher`。没有全局单例、装饰器自动注册或 YAML 动态命令。
+
+### 1. 定义、注册和解析
+
+每条 `CommandDefinition` 是不可变对象，包含：
+
+~~~text
+name / aliases / description / usage / argument_hint
+kind / hidden / async handler
+~~~
+
+`CommandRegistry` 用一个大小写无关索引同时保存规范名称和别名。注册前先完成名称格式、
+定义完整性、内部重复和已有索引冲突检查，全部通过后才一次性写入，因此失败不会留下
+半注册状态。隐藏命令可以直接解析，但不会出现在帮助和补全中。
+
+`CommandParser` 的规则保持简单：去除输入两端空白，以 `/` 开头才是命令；第一个空白前
+转为小写命令名，后面的完整文本作为参数并保留原始大小写。`/` 是保留前缀，目前不支持
+`//` 转义，也不解析引号、管道或重定向。
+
+### 2. 分流与 UIController
+
+用户回车后的主链路是：
+
+~~~text
+TerminalUI.run()
+    ↓
+CommandDispatcher.try_dispatch(text, controller)
+    ├── 非斜杠输入 → False → send_user_message() → Agent
+    ├── 未知命令 → 显示原输入和 /help 引导
+    └── 已注册命令 → handler(invocation, UIController)
+~~~
+
+命令处理器只依赖 `UIController` Protocol。具体终端如何显示系统消息、切换模式、查询
+MCP、压缩上下文、恢复会话或请求退出，都由 `TerminalUI` 适配到现有 `ChatSession`
+能力。这样命令核心不导入 Rich 或 prompt_toolkit，也不会复制会话状态。
+
+错误边界分三层：参数错误显示该命令用法；预期业务错误只显示安全摘要；未知异常统一
+显示“命令执行失败”。`CancelledError` 不吞掉，继续交给现有取消管线。
+
+### 3. 三类命令的实际含义
+
+`CommandKind` 保留三类元数据：
+
+- `LOCAL`：只读取或显示本地信息，例如 `/help`、`/mcp`。
+- `STATE`：改变或维护会话状态，例如 `/plan`、`/compact`、`/resume`。
+- `AI`：把预设提示词送进普通 Agent 对话。
+
+分类主要用于表达和路由，不自动决定权限、是否访问模型或是否刷新状态。特别是
+`/compact` 虽然内部调用模型生成摘要，仍属于状态命令；`/mcp` 只查询当前状态，不会
+调用模型。第一期没有注册生产 `AI` 命令，只通过测试验证这种扩展能力。
+
+AI 命令支持分离两份文本：
+
+~~~text
+display_text = 用户输入的原始 /command
+model_text   = handler 展开的预设提示词
+~~~
+
+UI 展示 `display_text`，Agent 请求和成功提交的会话历史使用 `model_text`，不会把原始
+命令再保存为第二条消息。
+
+### 4. 当前命令、帮助与补全
+
+当前生产命令全部由同一注册工厂定义：
+
+| 命令 | 类型 | 作用 |
+|---|---|---|
+| `/help [command]` | LOCAL | 从注册元数据生成列表或详细帮助 |
+| `/exit`、`/quit` | LOCAL | 进入统一正常退出与记忆整理 |
+| `/plan` | STATE | 切换到 plan-only |
+| `/agent` | STATE | 切回 agent |
+| `/mcp` | LOCAL | 显示当前 MCP 状态快照 |
+| `/compact` | STATE | 执行可取消的隔离上下文压缩 |
+| `/permission [...]` | STATE | 查询、切换权限模式或清除临时授权 |
+| `/resume <session-id>` | STATE | 原子恢复指定会话 |
+
+`/help`、解析、实际分发和 `CommandCompleter` 都读取同一个 Registry，避免多份手写命令
+清单漂移。补全只在光标位于第一个命令词末尾时工作；单匹配直接替换，多匹配用
+`CompletionsMenu` 展示，参数和隐藏命令不补全。
+
+### 面试表述
+
+YCode 用不可变命令定义和集中注册中心统一名称、别名、帮助与补全；Dispatcher 在普通
+对话前完成斜杠命令分流，Handler 只依赖 UIController，因此业务命令不耦合终端框架。
+命令分类是描述性元数据，不把“是否调用模型”误做成强制策略；显示文本和模型文本分离，
+也为未来的 AI 预设命令保留了清晰事务边界。
+
+## 启动性能与按需加载
+
+启动优化包含两种不同的“延迟”，不要混淆：
+
+1. Provider 延迟导入：`create_provider()` 根据已解析的 `active` 协议，在分支内部局部
+   导入对应实现。只激活 Anthropic 时，不导入 OpenAI Provider 和 OpenAI SDK。
+2. MCP 后台启动：应用不再等待 Server 握手和 `tools/list` 完成，先进入 UI；连接成功后
+   注册的工具只对后续新 Agent 回合生效。
+
+MCP 配置的 `enabled` 决定是否参与加载。禁用项不会解析秘密、创建 `McpConnection`、
+启动子进程或建立 HTTP 连接，只在 `/mcp` 中保留 `disabled` 状态。应用仍只支持一个
+`active` Provider；同时激活多个 Provider、自动故障切换和路由不在当前范围。
+
+`McpManager.start_background()` 幂等创建并持有 `_start_task`，立即返回；兼容入口
+`start()` 等待同一个任务。各启用 Server 仍在 TaskGroup 内并发连接，单个失败被隔离。
+UI 首屏只显示“后台连接 N”，完成时不插入异步提示，用户通过 `/mcp` 主动查看
+`starting → ready/unavailable`。
+
+`startup_timeout_seconds` 省略时默认 5 秒，YAML 显式值优先。当前示例和项目配置显式
+写出的 10 秒仍保持 10 秒，并用注释标明默认值。退出时 Manager 先取消未完成的启动
+任务；处于 STARTING/RECONNECTING 的 Connection 再取消 owner task，因此不等待剩余
+完整启动超时。
+
+### 面试表述
+
+YCode 通过协议分支局部导入消除未激活 SDK 的冷启动成本，并把 MCP 连接改成由 Manager
+持有的后台生命周期任务。UI 不等待远端服务，状态用快照按需查询；退出时反向取消后台
+任务和连接 owner，既改善首屏响应，也保留明确的资源所有权。
+
 ## MCP 客户端、连接与延迟工具加载
 
 MCP 实现位于 `ycode.mcp`，目标不是另外建立一套 Agent 工具系统，而是把
@@ -1411,7 +1629,7 @@ MCP 实现位于 `ycode.mcp`，目标不是另外建立一套 Agent 工具系统
 - 本地子进程 `stdio` 传输。
 - 远端 `streamable_http` 传输，包括普通 JSON 和请求级 SSE 响应。
 - MCP `2026-07-28` 与 `2025-11-25` 自动协商。
-- 多 Server 并发启动、独立失败和状态汇总。
+- 多 Server 并发后台启动、独立失败和状态汇总。
 - 启动时工具发现、连接与目录复用。
 - 任务级延迟 Schema 暴露。
 - 远端调用前的本地参数校验和权限审批。
@@ -1424,7 +1642,11 @@ MCP 实现位于 `ycode.mcp`，目标不是另外建立一套 Agent 工具系统
     ↓
 load_config() / load_mcp_servers()
     ↓
-McpManager 并发启动每个 McpConnection
+McpManager 只为 enabled Server 创建 McpConnection
+    ↓
+start_background() 后 UI 立即可输入
+    ↓
+后台 TaskGroup 并发连接
     ↓
 stdio_client 或 streamable_http_client
     ↓
@@ -1463,7 +1685,7 @@ mcp_servers:
     args: ["-m", "your_mcp_server"]
     env:
       API_TOKEN: ${MCP_API_TOKEN}
-    startup_timeout_seconds: 10
+    startup_timeout_seconds: 10  # 默认 5 秒；此处显式覆盖
     tool_timeout_seconds: 60
 ~~~
 
@@ -1477,7 +1699,7 @@ mcp_servers:
     url: https://mcp.example.com/mcp
     headers:
       Authorization: Bearer ${MCP_API_TOKEN}
-    startup_timeout_seconds: 10
+    startup_timeout_seconds: 10  # 默认 5 秒；此处显式覆盖
     tool_timeout_seconds: 60
 ~~~
 
@@ -1501,7 +1723,7 @@ HTTP `headers` 值。只有显式写在 Server `env` 里的变量才会传给子
 
 `enabled` 默认为 `true`。显式设为 `false` 时，该条目不解析秘密、不连接、
 不发现也不注册工具，但会在 `/mcp` 中显示为 `disabled`。修改开关后必须重启
-YCode，当前不支持热加载。
+YCode，当前不支持热加载。`startup_timeout_seconds` 省略时为 5 秒，显式配置值优先。
 
 配置错误采用两层处理：
 
@@ -1563,9 +1785,10 @@ YCode 不自行手写 JSON-RPC 读取循环。官方 SDK 负责生成 JSON-RPC 2
 
 ### 4. 启动发现、名称映射与 Registry
 
-`McpManager` 为每个启用的 Server 建立独立 `McpConnection`，使用
-`asyncio.TaskGroup` 并发启动，因此多个 Server 的超时不会简单累加。单个 Server
-握手或发现失败时标记为 `unavailable`，不影响内建工具和其他 Server。
+`McpManager` 为每个启用的 Server 建立独立 `McpConnection`。`run_app()` 调用
+`start_background()` 后不等待，UI 首屏先出现；Manager 自己持有的启动任务再使用
+`asyncio.TaskGroup` 并发连接，因此多个 Server 的超时不会简单累加。单个 Server
+握手或发现失败时标记为 `unavailable`，不影响输入、内建工具和其他 Server。
 
 连接成功后，`McpConnection._discover()` 循环调用分页 `tools/list`：
 
@@ -1607,8 +1830,9 @@ Registry 拒绝覆盖。
 
 ### 5. 四步延迟 Schema 暴露
 
-延迟加载解决的是“工具太多导致 Schema 占用大量 Token”，不是延迟连接 Server。
-Server 在 YCode 启动时已经连接和发现，延迟的只是完整 Schema 进入模型请求。
+这里有两层不同的延迟：Server 连接和目录发现现在在应用启动后后台进行；连接完成后，
+完整 Schema 仍继续按任务延迟暴露。前者解决 UI 被远端 MCP 阻塞，后者解决工具太多导致
+Schema 占用大量 Token。
 
 四步机制：
 
@@ -1724,8 +1948,9 @@ MCP 存在两层进程级复用：
 
 用户取消或工具超时时，当前 SDK 调用 task 会被取消并等待清理，迟到结果
 不会进入 Agent 历史。关闭时先取消 inflight 调用，再退出 SDK 上下文，最后关闭
-HTTP Client 或 stdio 子进程。Connection、Manager、AgentLoop 和 ChatSession 的关闭
-都是幂等的。
+HTTP Client 或 stdio 子进程。如果 Manager 的后台启动仍未完成，先取消 Manager
+`_start_task`；Connection 还在 STARTING 或 RECONNECTING 时再取消 owner task，不等待
+剩余启动超时。Connection、Manager、AgentLoop 和 ChatSession 的关闭都是幂等的。
 
 ### 8. 状态与故障隔离
 
@@ -1739,20 +1964,21 @@ reconnecting / unavailable / closing / closed
 `McpManager.snapshot()` 只组装脱敏的 `McpStatusReport`：Server 名、传输、状态、
 有效工具数和稳定错误摘要。它不包含 URL、command、args、env 或 Header。
 
-`/mcp` 是 ChatSession 的本地命令：
+`/mcp` 由集中式命令框架注册为 LOCAL 命令：
 
 ~~~text
 用户输入 /mcp
     ↓
-ChatSession 调用 McpStatusProvider.snapshot()
+CommandDispatcher → mcp_handler
     ↓
-产生 McpStatusEvent
+UIController.show_mcp_status()
     ↓
-TerminalUI 渲染状态表
+TerminalUI 读取 ChatSession.mcp_status 快照并渲染状态表
 ~~~
 
-它不调用模型，不进入对话历史，也不触发重新发现。无论单个还是全部 MCP
-Server 失败，Anthropic Agent 仍可以使用六个内建工具启动。
+它不调用模型，不进入对话历史，也不触发重新发现。连接期间可观察 `starting`，完成后
+观察 `ready` 或 `unavailable`。无论单个还是全部 MCP Server 失败，Anthropic Agent
+仍可以使用六个内建工具启动。
 
 ### 9. 当前明确不支持的范围
 
@@ -1769,12 +1995,13 @@ Server 失败，Anthropic Agent 仍可以使用六个内建工具启动。
 ### 面试表述
 
 YCode 使用官方 MCP SDK 处理 stdio、Streamable HTTP、JSON-RPC ID 匹配和新旧
-协议协商。McpManager 并发启动多个独立连接，启动时分页发现工具，并通过
+协议协商。McpManager 在后台并发启动多个独立连接，分页发现工具，并通过
 MCPToolWrapper 将远端 JSON Schema 工具适配为统一 Tool。Registry 始终保留完整目录，
 AgentLoop 使用任务级 ToolExposureSession 和本地 ToolSearch 按需暴露 Schema，减少
 Token 占用且防止同批次绕过。所有 MCP 工具固定为 UNKNOWN，在远端调用前复用
 本地参数校验和权限审批。连接和目录进程级复用，可见集任务级清空；断线时
-当前调用不重试，只允许后续新调用重建连接，避免未知副作用被重复执行。
+当前调用不重试，只允许后续新调用重建连接，避免未知副作用被重复执行。禁用项完全
+跳过连接流程，启动中退出则取消后台任务，不等待完整超时。
 
 ## ReAct Agent Loop
 
@@ -1863,7 +2090,8 @@ YCode 的 AgentLoop 实现最小 ReAct：每轮创建新的 ResponseAssembler，
 
 ### 1. agent 与 plan-only
 
-ChatSession 识别两个精确命令：
+集中式命令框架注册两个模式命令，Handler 再通过 `UIController` 调用 ChatSession 的
+状态能力：
 
 ~~~text
 /plan   → plan-only
@@ -1890,7 +2118,8 @@ plan-only 对普通工具有三层保护：
 PermissionEngine 仍对每次调用强制 ASK，不允许会话授权。这不是将 MCP 降级为
 READ，而是一条显式白名单加逐次审批的例外通道。
 
-最终计划输出后不会自动退出 plan-only。OpenAI 使用 PlainChatRunner，不支持 plan-only；输入 `/plan` 会得到 unsupported_mode 错误且不会请求 Provider。
+最终计划输出后不会自动退出 plan-only。OpenAI 使用 PlainChatRunner 且不装配命令
+运行时，继续走原有兼容路径；它不支持 plan-only。
 
 ### 2. 整轮事务
 
@@ -1942,25 +2171,43 @@ Provider / Scheduler / ToolExecutor / CommandRunner
 
 外层 asyncio 任务被取消时，清理完成后仍继续传播 CancelledError，不把它伪装成普通 Agent 取消。
 
+空闲输入阶段不走上面的取消链，而是由普通 InputBox 的显式 `c-c` 绑定抛出
+`KeyboardInterrupt`。TerminalUI 捕获后调用幂等的 `request_exit()`：先执行本次进程的
+记忆整理，再由 `run_app()` 的 `finally` 关闭 Session、MCP 后台任务和 Provider。
+prompt_toolkit 的基础绑定会忽略 `Ctrl+C`，因此这个显式绑定是安全退出行为的一部分，
+不能只依赖 `load_key_bindings()`。
+
 ### 面试表述
 
 YCode 把整个用户回合作为会话事务：只有 COMPLETED 才先落盘并再提交内存状态，
 达到上限、用户取消和异常都丢弃临时消息。plan-only 同时限制模型可见工具，
-并由 PermissionEngine 与 Executor 双重复核。Ctrl+C 可以取消模型流、阻塞审批、
-调度任务或 PowerShell 进程树，清理后恢复输入。
+并由 PermissionEngine 与 Executor 双重复核。活动操作中的 Ctrl+C 取消模型流、阻塞
+审批、调度任务或 PowerShell 进程树并恢复输入；空闲输入中的 Ctrl+C 则进入统一安全
+退出管线。
 
 ## 当前验证状态
 
-以 2026-08-03 完成记忆系统后的当前工作区实际重跑结果为准：
+以 2026-08-04 完成内置命令框架和启动性能优化后的最近一次工作区验证为准：
 
 ~~~text
-ruff format --check .：166 files already formatted
+ruff format --check .：通过
 ruff check .：All checks passed
 compileall -q ycode tests：通过
-pytest -q：542 passed, 2 skipped（305.33s）
+pytest -q：570 passed, 2 skipped
+Windows ConPTY：完整场景通过；一次既有冷启动用例超时，单独重跑通过
 ~~~
 
-其中记忆系统 E2E 使用本地假 SSE Provider，连续启动三个真实 YCode 进程，覆盖：
+新增实现与验证覆盖：
+
+- Anthropic 活动时不导入 OpenAI Provider 和 SDK。
+- 内置命令注册、冲突检测、解析、帮助、隐藏命令、AI 双文本分流和 Tab 补全。
+- `/help`、模式、权限、MCP、压缩、恢复和退出统一经过命令框架。
+- 慢 MCP 后台连接时 UI 先进入输入状态，`/mcp` 可观察 starting 和 ready。
+- 省略 MCP 启动超时时使用 5 秒，显式 10 秒仍优先。
+- 后台启动中的 MCP 可在退出时取消并完成资源清理。
+- 用户在真实空闲输入框中手动确认 `Ctrl+C` 可以直接退出。
+
+记忆系统 E2E 使用本地假 SSE Provider，连续启动三个真实 YCode 进程，覆盖：
 
 - 新会话 A 的普通回合和工具回合落盘。
 - `--continue` 恢复 A 并继续追加。

@@ -100,7 +100,22 @@ ycode
 
 输入消息后，回答以纯文本增量实时显示；本轮正常结束后再整体渲染 Markdown。Claude 启用 `thinking: true` 时，Thinking 在独立区域以纯文本流式显示。
 
-等待输入时，`Send a message...` 位于两条普通横线之间，下方显示静态提示 `? for help`。该提示目前只预留未来的帮助或 Skill 入口；输入 `?` 会作为普通消息发送。
+等待输入时，`Send a message...` 位于两条普通横线之间。Anthropic 会话下方显示
+`/help for commands`，输入命令名或别名前缀后按 Tab 可补全；多个匹配会显示候选列表。
+补全只作用于命令词，不补全参数。OpenAI 会话保持原有 `? for help` 提示和输入行为。
+
+Anthropic 当前提供以下内置命令：
+
+- `/help [command]`：列出命令或查看某条命令的详细用法。
+- `/exit`（别名 `/quit`）：正常退出。
+- `/plan`、`/agent`：切换计划或执行模式。
+- `/mcp`：显示 MCP 连接状态。
+- `/compact`：手动压缩已提交的对话上下文。
+- `/permission [strict|default|allow|clear]`：查看、切换权限模式或清除临时授权。
+- `/resume <session-id>`：恢复指定会话。
+
+所有命令名大小写不敏感；未知的 `/` 命令不会发送给模型，而会引导使用 `/help`。
+当前不支持自定义命令或命令参数补全。
 
 提交后，用户消息会以带蓝色 `❯` 的无边框背景板显示在终端滚动区，多行内容保持在同一背景板内。
 

@@ -322,6 +322,7 @@ class McpConnection:
 
     async def _close(self) -> None:
         if self._state is not McpConnectionState.CLOSED:
+            previous_state = self._state
             self._state = McpConnectionState.CLOSING
             self._close_requested.set()
             for task in tuple(self._inflight):
@@ -329,6 +330,11 @@ class McpConnection:
             if self._inflight:
                 await asyncio.gather(*self._inflight, return_exceptions=True)
             if self._owner_task is not None:
+                if previous_state in {
+                    McpConnectionState.STARTING,
+                    McpConnectionState.RECONNECTING,
+                }:
+                    self._owner_task.cancel()
                 await self._owner_task
             await self._transport_factory.close()
             self._state = McpConnectionState.CLOSED

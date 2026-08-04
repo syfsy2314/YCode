@@ -26,6 +26,10 @@ def create_prompt_style(
             "input-hint": "ansibrightblack bg:default noreverse",
             "prompt": "ansibrightblue bold",
             "placeholder": "ansibrightblack",
+            "completion-menu.completion": "ansibrightblack bg:default",
+            "completion-menu.completion.current": "ansiwhite bg:ansibrightblack",
+            "completion-menu.meta.completion": "ansibrightblack bg:default",
+            "completion-menu.meta.completion.current": "ansiwhite bg:ansibrightblack",
         }
     )
 

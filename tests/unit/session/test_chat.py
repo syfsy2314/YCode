@@ -111,6 +111,43 @@ async def test_success_commits_complete_turn_before_final_event() -> None:
 
 
 @pytest.mark.asyncio
+async def test_display_text_differs_from_model_and_committed_text() -> None:
+    provider = FakeProvider([text_response("reviewed")])
+    session = session_with(provider)
+
+    events = [
+        event
+        async for event in session.stream_reply(
+            "Review the current changes.",
+            display_text="/review",
+        )
+    ]
+
+    assert events[0].message.text == "/review"  # type: ignore[union-attr]
+    assert provider.requests[0][0].text == "Review the current changes."
+    assert session.history[0].text == "Review the current changes."
+    assert all(message.text != "/review" for message in session.history)
+
+
+@pytest.mark.asyncio
+async def test_dual_text_failure_commits_neither_display_nor_model_text() -> None:
+    provider = FakeProvider([[ProviderError("network", "safe error", True)]])
+    session = session_with(provider)
+
+    events = [
+        event
+        async for event in session.stream_reply(
+            "Review the current changes.",
+            display_text="/review",
+        )
+    ]
+
+    assert events[0].message.text == "/review"  # type: ignore[union-attr]
+    assert isinstance(events[-1], AgentErrorEvent)
+    assert session.history == ()
+
+
+@pytest.mark.asyncio
 async def test_multi_turn_request_contains_only_committed_history() -> None:
     provider = FakeProvider([text_response("first"), text_response("second")])
     session = session_with(provider)

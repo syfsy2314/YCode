@@ -82,6 +82,14 @@ class McpStatusReport:
         return sum(server.state is McpConnectionState.READY for server in self.servers)
 
     @property
+    def starting_count(self) -> int:
+        active_states = {
+            McpConnectionState.STARTING,
+            McpConnectionState.RECONNECTING,
+        }
+        return sum(server.state in active_states for server in self.servers)
+
+    @property
     def failed_count(self) -> int:
         failed_states = {
             McpConnectionState.DISCONNECTED,

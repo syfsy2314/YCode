@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from ycode.agent.contracts import (
     AgentMode,
@@ -47,6 +48,9 @@ from ycode.security import ApprovalChoice, PermissionMode, PermissionSession
 from ycode.session.manager import SessionManager
 from ycode.session.models import SessionCommit, SessionStorageError
 
+if TYPE_CHECKING:
+    from ycode.commands import CommandRuntime
+
 type _TerminalEvent = (
     FinalResponseEvent | AgentLimitReachedEvent | AgentCancelledEvent | AgentErrorEvent
 )
@@ -64,6 +68,7 @@ class ChatSession:
         memory_store: MemoryStore | None = None,
         memory_updater: MemoryUpdater | None = None,
         startup_warnings: tuple[str, ...] = (),
+        command_runtime: CommandRuntime | None = None,
     ) -> None:
         self._runner = runner
         self._history: list[ChatMessage] = []
@@ -76,6 +81,7 @@ class ChatSession:
         self._memory_store = memory_store
         self._memory_updater = memory_updater
         self._startup_warnings = tuple(startup_warnings)
+        self._command_runtime = command_runtime
         self._active_turn: AgentTurn | None = None
         self._active_compaction: asyncio.Task[object] | None = None
         self._turn_finished = asyncio.Event()
@@ -114,6 +120,39 @@ class ChatSession:
     @property
     def startup_restore_event(self) -> SessionRestoredEvent | None:
         return self._startup_restore_event
+
+    @property
+    def command_runtime(self) -> CommandRuntime | None:
+        return self._command_runtime
+
+    def change_mode(self, target: AgentMode) -> ModeChangedEvent:
+        if target not in self._runner.supported_modes:
+            raise ValueError("当前对话运行器不支持 plan-only 模式。")
+        previous = self._mode
+        self._mode = target
+        return ModeChangedEvent(previous, target)
+
+    def permission_status(self) -> PermissionModeChangedEvent:
+        if self._permission_session is None:
+            raise ValueError("当前对话未启用权限管理。")
+        return PermissionModeChangedEvent(
+            self._permission_session.mode,
+            self._permission_session.mode,
+        )
+
+    def change_permission_mode(self, target: PermissionMode) -> PermissionModeChangedEvent:
+        if self._permission_session is None:
+            raise ValueError("当前对话未启用权限管理。")
+        previous = self._permission_session.mode
+        self._permission_session.set_mode(target)
+        return PermissionModeChangedEvent(previous, target)
+
+    def clear_permission_grants(self) -> PermissionGrantsClearedEvent:
+        if self._permission_session is None:
+            raise ValueError("当前对话未启用权限管理。")
+        count = self._permission_session.grant_count
+        self._permission_session.clear()
+        return PermissionGrantsClearedEvent(count)
 
     async def restore(self, session_id: str | None = None) -> SessionRestoredEvent:
         if self._session_manager is None:
@@ -171,19 +210,67 @@ class ChatSession:
         self._startup_restore_event = event
         return event
 
-    async def stream_reply(self, user_text: str) -> AsyncIterator[AgentEvent]:
-        if not user_text.strip():
+    async def compact_context(self) -> AsyncIterator[AgentEvent]:
+        if self._context_manager is None:
+            yield ContextCompactionNotNeededEvent()
+            return
+        task = asyncio.create_task(
+            self._context_manager.prepare_manual_compaction(tuple(self._history))
+        )
+        self._active_compaction = task
+        self._turn_finished.clear()
+        try:
+            try:
+                candidate = await task
+            except ContextCompactionNotNeeded:
+                yield ContextCompactionNotNeededEvent()
+            except ContextCompactionError as error:
+                yield ContextCompactionFailedEvent(error.report)
+            except asyncio.CancelledError:
+                yield AgentCancelledEvent("当前上下文压缩已取消。")
+            else:
+                try:
+                    if self._session_manager is not None:
+                        await self._session_manager.append_checkpoint(
+                            candidate.memory,
+                            candidate.history,
+                        )
+                except (SessionStorageError, ValueError):
+                    yield AgentErrorEvent(
+                        "session_storage_error",
+                        "上下文检查点保存失败，当前历史未改变。",
+                    )
+                else:
+                    self._context_manager.activate_compaction(candidate)
+                    self._history[:] = candidate.history
+                    yield ContextCompactedEvent(candidate.report)
+        finally:
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+            self._active_compaction = None
+            self._turn_finished.set()
+
+    async def stream_reply(
+        self,
+        model_text: str,
+        *,
+        display_text: str | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        if not model_text.strip():
             raise ValueError("消息不能为空")
         if self._closed:
             raise RuntimeError("会话已关闭")
         if self._active_turn is not None or self._active_compaction is not None:
             raise RuntimeError("已有 Agent 回合正在运行")
 
-        user_message = ChatMessage.user_text(user_text)
-        stripped = user_text.strip()
+        user_message = ChatMessage.user_text(model_text)
+        display_message = ChatMessage.user_text(display_text or model_text)
+        stripped = model_text.strip()
         command = stripped.lower()
         if command == "/resume" or command.startswith("/resume "):
-            yield UserMessageEvent(user_message)
+            yield UserMessageEvent(display_message)
             session_id = stripped[len("/resume") :].strip()
             if not session_id:
                 yield AgentErrorEvent("invalid_resume_command", "用法：/resume <session-id>")
@@ -194,73 +281,35 @@ class ChatSession:
                 yield AgentErrorEvent("session_restore_failed", "会话恢复失败，当前会话未改变。")
             return
         if command in {"/plan", "/agent"}:
-            yield UserMessageEvent(user_message)
+            yield UserMessageEvent(display_message)
             target = AgentMode.PLAN_ONLY if command == "/plan" else AgentMode.AGENT
-            if target not in self._runner.supported_modes:
+            try:
+                event = self.change_mode(target)
+            except ValueError:
                 yield AgentErrorEvent(
                     "unsupported_mode",
                     "当前对话运行器不支持 plan-only 模式。",
                 )
                 return
-            previous = self._mode
-            self._mode = target
-            yield ModeChangedEvent(previous, target)
+            yield event
             return
         if command == "/mcp":
-            yield UserMessageEvent(user_message)
+            yield UserMessageEvent(display_message)
             if self._mcp_status_provider is None:
                 yield AgentErrorEvent("mcp_unavailable", "当前没有 MCP 状态信息。")
             else:
                 yield McpStatusEvent(self._mcp_status_provider.snapshot())
             return
         if command == "/compact" and self._context_manager is not None:
-            yield UserMessageEvent(user_message)
-            task = asyncio.create_task(
-                self._context_manager.prepare_manual_compaction(tuple(self._history))
-            )
-            self._active_compaction = task
-            self._turn_finished.clear()
-            try:
-                try:
-                    candidate = await task
-                except ContextCompactionNotNeeded:
-                    yield ContextCompactionNotNeededEvent()
-                except ContextCompactionError as error:
-                    yield ContextCompactionFailedEvent(error.report)
-                except asyncio.CancelledError:
-                    yield AgentCancelledEvent("当前上下文压缩已取消。")
-                else:
-                    try:
-                        if self._session_manager is not None:
-                            await self._session_manager.append_checkpoint(
-                                candidate.memory,
-                                candidate.history,
-                            )
-                    except (SessionStorageError, ValueError):
-                        yield AgentErrorEvent(
-                            "session_storage_error",
-                            "上下文检查点保存失败，当前历史未改变。",
-                        )
-                    else:
-                        self._context_manager.activate_compaction(candidate)
-                        self._history[:] = candidate.history
-                        yield ContextCompactedEvent(candidate.report)
-            finally:
-                if not task.done():
-                    task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await task
-                self._active_compaction = None
-                self._turn_finished.set()
+            yield UserMessageEvent(display_message)
+            async for event in self.compact_context():
+                yield event
             return
         if self._permission_session is not None and command.startswith("/permission"):
-            yield UserMessageEvent(user_message)
+            yield UserMessageEvent(display_message)
             parts = command.split()
             if len(parts) == 1:
-                yield PermissionModeChangedEvent(
-                    self._permission_session.mode,
-                    self._permission_session.mode,
-                )
+                yield self.permission_status()
                 return
             if len(parts) != 2:
                 yield AgentErrorEvent(
@@ -270,9 +319,7 @@ class ChatSession:
                 return
             argument = parts[1]
             if argument == "clear":
-                count = self._permission_session.grant_count
-                self._permission_session.clear()
-                yield PermissionGrantsClearedEvent(count)
+                yield self.clear_permission_grants()
                 return
             try:
                 target_permission = PermissionMode(argument)
@@ -282,9 +329,7 @@ class ChatSession:
                     "用法：/permission [strict|default|allow|clear]",
                 )
                 return
-            previous_permission = self._permission_session.mode
-            self._permission_session.set_mode(target_permission)
-            yield PermissionModeChangedEvent(previous_permission, target_permission)
+            yield self.change_permission_mode(target_permission)
             return
 
         turn = self._runner.start_turn(
@@ -296,7 +341,7 @@ class ChatSession:
         self._turn_finished.clear()
         terminal_event: _TerminalEvent | None = None
         try:
-            yield UserMessageEvent(user_message)
+            yield UserMessageEvent(display_message)
             async for event in turn:
                 if isinstance(
                     event,
