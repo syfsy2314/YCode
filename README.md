@@ -2,6 +2,58 @@
 
 YCode 是一个使用 Python 3.12+ 开发的 Windows 终端 AI 助手。当前版本提供 Anthropic Claude 与 OpenAI Chat Completions 的流式多轮对话。
 
+## 项目概览
+
+YCode 的产品形态类似 Claude Code：用户在终端中与模型对话，模型可以读取和
+编辑项目文件、搜索代码、执行 PowerShell 命令，也可以通过 MCP 扩展外部工具。
+当前 Anthropic 路径提供完整 Agent 循环、工具、权限、上下文管理、会话恢复和项目记忆；
+OpenAI 路径仍保持纯流式对话。
+
+核心调用链：
+
+```text
+CLI
+ → App 组件装配
+ → TerminalUI
+ → ChatSession
+ → AgentLoop
+ → Provider / ToolScheduler / ToolExecutor
+ → SessionManager / ContextManager / MemoryStore
+```
+
+主要模块：
+
+| 目录 | 职责 |
+|---|---|
+| `ycode/agent/` | Agent 多轮循环、回合结果与统一事件 |
+| `ycode/session/` | 对话事务、JSONL 会话存档、恢复与修复 |
+| `ycode/context/` | Token 估算、上下文压缩、摘要和检查点 |
+| `ycode/prompt/` | 内置提示词、运行时补充、环境与项目上下文 |
+| `ycode/tools/` | 内建工具、参数校验、暴露策略、调度与执行 |
+| `ycode/security/` | 权限模式、工具决策与 PowerShell 安全检查 |
+| `ycode/mcp/` | MCP Server 连接、工具发现、名称映射和调用 |
+| `ycode/memory/` | 项目记忆索引、主题文件校验与退出整理 |
+| `ycode/providers/` | Anthropic 和 OpenAI 协议适配 |
+| `ycode/ui/` | 终端输入、流式渲染、审批和命令交互 |
+| `ycode/commands/` | 斜杠命令定义、解析、注册和调度 |
+| `ycode/config/` | 项目根发现、YAML/环境变量加载与配置校验 |
+
+关键设计边界：
+
+- JSONL 是会话的事实来源；正常回合先落盘，再提交内存历史并通知 UI。
+- `SessionManager` 独占管理 `.ycode/sessions/`；`ChatSession` 负责跨组件的会话事务编排。
+- 项目指令、项目记忆和会话压缩摘要是语义独立的上下文来源。
+- `.ycode/memory/MEMORY.md` 只向模型提供索引，主题正文由模型按需读取。
+- 工具调度允许读操作并发，写操作作为屏障串行；权限引擎和执行器会分别复核访问边界。
+- 功能开发遵循 Spec 流程，现有功能文档位于 `docs/features/`。
+
+建议阅读顺序：
+
+1. 本 README：了解项目定位、安装、配置和主要能力。
+2. [`docs/Development-Workflow.md`](docs/Development-Workflow.md)：了解 Spec 驱动开发流程。
+3. [`docs/features/`](docs/features/)：查看各功能的需求、设计、任务和验收记录。
+4. [`docs/notes/ycode-learning-notes.md`](docs/notes/ycode-learning-notes.md)：深入理解完整调用链和典型故障。
+
 ## 安装
 
 在 PowerShell 中进入项目目录：

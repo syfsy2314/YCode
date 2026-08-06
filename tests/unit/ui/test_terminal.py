@@ -11,7 +11,10 @@ from ycode.agent import (
     ContextCompactionFailedEvent,
     ContextCompactionNotNeededEvent,
     PlainChatRunner,
+    ToolApprovalRequested,
+    ToolExecutionCancelled,
     ToolExecutionCompleted,
+    ToolExecutionStarted,
     UserMessageEvent,
 )
 from ycode.commands import CommandDefinition, CommandKind, build_command_runtime
@@ -34,7 +37,13 @@ from ycode.mcp.models import (
     McpServerStatus,
     McpStatusReport,
 )
-from ycode.security import PermissionMode, PermissionSession
+from ycode.security import (
+    PermissionAction,
+    PermissionDecision,
+    PermissionMode,
+    PermissionSession,
+    PermissionSubject,
+)
 from ycode.session.chat import ChatSession
 from ycode.tools import ToolExecutionRecord, ToolExecutionResult
 from ycode.ui.terminal import TerminalUI, _tool_result_summary, _tool_start_summary
@@ -73,7 +82,7 @@ class FakeRenderer:
         self.started = 0
         self.thinking: list[tuple[int, str]] = []
         self.text: list[tuple[int, str]] = []
-        self.tools: list[str] = []
+        self.tools: list[tuple[int, str, str]] = []
         self.completed: list[str] = []
         self.failures: list[str] = []
         self.cancelled = 0
@@ -87,8 +96,8 @@ class FakeRenderer:
     def append_text(self, text: str, round_number: int) -> None:
         self.text.append((round_number, text))
 
-    def add_tool_status(self, status: str) -> None:
-        self.tools.append(status)
+    def set_tool_status(self, round_number: int, call_id: str, status: str) -> None:
+        self.tools.append((round_number, call_id, status))
 
     async def complete(self, message) -> None:
         self.completed.append(message.text)
@@ -305,6 +314,41 @@ def test_tool_summaries_hide_write_content_and_show_result_metadata() -> None:
     assert _tool_start_summary(call) == "◇ write_file  a.txt"
     assert "MUST-NOT-APPEAR" not in _tool_start_summary(call)
     assert _tool_result_summary(ToolExecutionCompleted(1, record)) == "✓ write_file  完成"
+
+
+@pytest.mark.asyncio
+async def test_tool_events_update_renderer_with_stable_call_id() -> None:
+    ui = TerminalUI(
+        config(),
+        ChatSession(PlainChatRunner(FakeProvider([]))),
+        console=Console(file=StringIO(), width=80, color_system=None),
+    )
+    renderer = FakeRenderer()
+    approvals: asyncio.Queue[ToolApprovalRequested] = asyncio.Queue()
+    call = ToolCallBlock("call-1", "write_file", {"path": "a.txt", "content": "x"})
+    subject = PermissionSubject(
+        call,
+        {"path": "a.txt", "content": "x"},
+        {"tool": "write_file", "path": "a.txt"},
+        "写入 a.txt",
+    )
+    decision = PermissionDecision(PermissionAction.ASK, subject, "test", "需要确认")
+    record = ToolExecutionRecord(
+        position=0,
+        call=call,
+        result=ToolExecutionResult(content="完成", metadata={"path": "a.txt"}),
+        elapsed_seconds=0.1,
+    )
+
+    await ui._render_event(ToolExecutionStarted(1, 0, call), renderer, approvals)
+    await ui._render_event(ToolApprovalRequested(1, 0, decision), renderer, approvals)
+    await ui._render_event(ToolExecutionCompleted(1, record), renderer, approvals)
+    await ui._render_event(ToolExecutionCancelled(1, 0, call), renderer, approvals)
+
+    assert [round_number for round_number, _, _ in renderer.tools] == [1] * 4
+    assert [call_id for _, call_id, _ in renderer.tools] == ["call-1"] * 4
+    assert [status[0] for _, _, status in renderer.tools] == ["◇", "?", "✓", "–"]
+    assert (await approvals.get()).decision is decision
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,6 @@
 # YCode 工具系统与 Agent Loop 技术设计
 
-> 状态：已批准
+> 状态：已批准（含 Agent 回合单标题展示修订）
 
 ## 1. 设计范围
 
@@ -771,6 +771,10 @@ TerminalUI 改为只消费 AgentEvent，不再导入或判断 `StreamEnd`：
 Renderer 按 `round_number` 隔离各轮内容。出现工具执行事件后，该轮文本确定为过程文本；
 出现 FinalResponseEvent 后，最后一轮才确定为最终回复。过程文本不得拼入最终 Markdown。
 
+`round_number` 只用于内部归属文本和工具状态，不再用于创建多个 UI 回复块。
+同一次 Agent 回合的所有 `_RoundContent` 按轮次连续渲染，只在第一个内容块中显示
+一次 `● YCode` 标题。`_title()` 不再追加 `round N`，Thinking 标题也不显示轮次编号。
+
 ### 12.2 工具摘要
 
 - 文件工具只显示安全路径，不显示写入或替换内容。
@@ -781,6 +785,35 @@ Renderer 按 `round_number` 隔离各轮内容。出现工具执行事件后，�
 - 不直接打印完整 ToolExecutionResult、环境变量、异常对象或 traceback。
 
 展示规则只影响 UI，不改变 Agent 状态或工具结果。
+
+#### 12.2.1 同一调用的状态覆盖
+
+Renderer 不再用全局列表累计工具状态，而是在每个 `_RoundContent` 内按
+`ToolCallBlock.id` 保存有序状态表。首次收到某个调用的开始事件时，在事件指定
+的 `round_number` 内创建状态位置；后续审批等待、完成或取消事件使用相同轮次和调用 ID
+覆盖该位置的文本。Python 字典的插入顺序用于保持同一轮内工具首次出现顺序。
+
+```python
+class LiveResponseRenderer:
+    # _RoundContent.tool_statuses: dict[str, str]
+
+    def set_tool_status(
+        self, round_number: int, call_id: str, status: str
+    ) -> None: ...
+```
+
+TerminalUI 对工具事件统一传递事件的 `round_number` 和调用 ID：
+
+- `ToolExecutionStarted.call.id`：设置开始摘要。
+- `ToolApprovalRequested.decision.subject.call.id`：覆盖为等待审批摘要。
+- `ToolExecutionCompleted.record.call.id`：覆盖为成功或失败最终摘要。
+- `ToolExecutionCancelled.call.id`：覆盖为取消最终摘要。
+
+渲染时，整个 Agent 回合先显示一次 YCode 标题；每轮再依次显示该轮 Thinking、模型文本和
+工具状态，下一轮的模型文本直接接在这些工具结果之后，不再插入 YCode 标题或轮次标记。
+终态事件即使没有对应的开始状态也可以在指定轮次创建最终状态。多个不同调用
+各自保留一条状态；同一调用无论经历多少临时状态，Renderer 最终只渲染最后一个值。
+审批输入、AgentEvent、工具执行顺序和模型回填内容均不改变。
 
 ### 12.3 模式提示
 
@@ -849,7 +882,7 @@ pathspec
 - plan-only 请求过滤和执行边界拦截。
 - Anthropic 请求 system/tools、流式工具参数和工具结果历史。
 - OpenAI 请求、SSE、Session/UI 和 PTY 纯聊天回归。
-- UI 多轮内容、工具摘要、模式窄宽布局和所有终态恢复。
+- UI 多轮内容、单 YCode 标题、工具摘要、同一工具调用的状态覆盖、工具状态的轮次归属和模式窄宽布局。
 - 真实 Windows PTY 中的读、搜、写、编辑、命令、失败、取消、上限和退出。
 
 最终仍执行仓库规定的 Ruff 格式检查、Ruff 静态检查、完整 Pytest、compileall 和

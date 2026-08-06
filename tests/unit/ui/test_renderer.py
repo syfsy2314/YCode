@@ -96,7 +96,7 @@ async def test_multiple_rounds_keep_process_text_out_of_final_markdown() -> None
     )
     await renderer.start()
     renderer.append_text("**process**", round_number=1)
-    renderer.add_tool_status("✓ read_file  读取 1 行")
+    renderer.set_tool_status(1, "call-1", "✓ read_file  读取 1 行")
     renderer.append_text("# Final", round_number=2)
 
     await renderer.complete(ChatMessage.assistant_text("# Final"))
@@ -106,3 +106,39 @@ async def test_multiple_rounds_keep_process_text_out_of_final_markdown() -> None
     assert "Final" in output
     assert "# Final" not in output
     assert "read_file" in output
+    assert output.count("● YCode") == 1
+    assert "round 2" not in output
+
+
+def test_tool_status_replaces_same_call_and_renders_inside_its_round() -> None:
+    target = StringIO()
+    renderer = LiveResponseRenderer(
+        console=Console(file=target, width=80, color_system=None),
+        refresh_interval=10,
+    )
+
+    renderer.append_text("first round", round_number=1)
+    renderer.set_tool_status(1, "call-1", "◇ read_file  a.txt")
+    renderer.set_tool_status(1, "call-2", "◇ grep  pattern")
+    renderer.set_tool_status(1, "call-1", "? read_file  等待用户确认")
+    renderer.set_tool_status(1, "call-1", "✓ read_file  读取 1 行")
+    renderer.set_tool_status(1, "call-2", "✗ grep  搜索失败")
+    renderer.append_text("second round", round_number=2)
+    renderer.set_tool_status(2, "call-3", "– run_command  已取消")
+
+    output = snapshot(renderer)
+    assert "◇ read_file" not in output
+    assert "等待用户确认" not in output
+    assert output.count("read_file") == 1
+    assert output.count("grep") == 1
+    assert output.count("run_command") == 1
+    assert (
+        output.index("first round")
+        < output.index("read_file")
+        < output.index("grep")
+        < output.index("second round")
+        < output.index("run_command")
+    )
+    assert output.count("● YCode") == 1
+    assert "round 1" not in output
+    assert "round 2" not in output

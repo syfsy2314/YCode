@@ -1,6 +1,6 @@
 # YCode 工具系统与 Agent Loop Tasks
 
-> 状态：已批准
+> 状态：已批准（含 Agent 回合单标题展示修订）
 
 ## 实施约束
 
@@ -12,6 +12,7 @@
 - 不连接真实模型服务，不读取或改写用户级 `.ycode/config.yaml`。
 - 涉及文件副作用的测试一律使用 Pytest 临时目录。
 - 不创建 Git commit。
+- 本次增量修订只做功能性实现和核心验证，不增加压力、性能、长时稳定性或复杂故障注入等生产级验证。
 
 ## 文件变化概览
 
@@ -415,6 +416,82 @@
 .venv\Scripts\ycode.exe --help
 ```
 
+### TS16：使工具状态按调用收敛为单行最终结果
+
+**文件：**
+`ycode/ui/renderer.py`、`ycode/ui/terminal.py`、
+`tests/unit/ui/test_renderer.py`、`tests/unit/ui/test_terminal.py`、
+`tests/e2e/test_terminal_chat.py`
+
+**依赖：** TS12
+
+**步骤：**
+
+1. Renderer 用按 `call_id` 维护的有序状态集合取代只追加的状态列表。
+2. 提供 `set_tool_status(call_id, status)`；同一调用的开始、审批等待和终态在同一位置覆盖更新。
+3. TerminalUI 从开始、审批、完成和取消事件中取得稳定的工具调用 ID，并将该 ID 与状态摘要一起交给 Renderer。
+4. 保持不同工具调用的首次出现顺序；没有先行开始事件的终态也可直接建立最终状态行。
+5. 保持 AgentEvent、审批流程、调度顺序和回灌模型的工具结果不变。
+6. 单元测试覆盖同 ID 覆盖、成功/失败/拒绝/取消终态、多 ID 稳定顺序和 TerminalUI 的 ID 传递。
+7. 复用一个现有真实 Windows PTY 工具场景做最小端到端回归，确认最终回复可见且交互正常结束。
+
+**验证：**
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/unit/ui/test_renderer.py tests/unit/ui/test_terminal.py -q
+.venv\Scripts\python.exe -m pytest tests/e2e/test_terminal_chat.py -k "agent_executes_six_tools" -q
+```
+
+### TS17：将工具状态放入对应模型轮次
+
+**文件：**
+`ycode/ui/renderer.py`、`ycode/ui/terminal.py`、
+`tests/unit/ui/test_renderer.py`、`tests/unit/ui/test_terminal.py`、
+`tests/e2e/test_terminal_chat.py`
+
+**依赖：** TS16
+
+**步骤：**
+
+1. 将工具状态表从 Renderer 全局字段移入 `_RoundContent`，每轮独立保存状态。
+2. 将 `set_tool_status` 调整为接收 `round_number`、`call_id` 和状态摘要。
+3. Renderer 按“本轮 Thinking/文本 → 本轮工具状态 → 下一轮”的顺序渲染。
+4. TerminalUI 将工具开始、审批、完成和取消事件的 `round_number` 传给 Renderer。
+5. 保持同一轮内按 `call_id` 覆盖和首次出现顺序，不改变 AgentEvent 或工具执行流程。
+6. 单元测试覆盖工具状态位于所属轮次文本之后、下一轮文本之前，以及 TerminalUI 正确传递轮次。
+7. 复用现有六工具 Windows PTY 场景进行最小交互回归。
+
+**验证：**
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/unit/ui/test_renderer.py tests/unit/ui/test_terminal.py -q
+.venv\Scripts\python.exe -m pytest tests/e2e/test_terminal_chat.py -k "agent_executes_six_tools" -q
+```
+
+### TS18：将 Agent 内部轮次连续渲染为单个 YCode 回合
+
+**文件：**
+`ycode/ui/renderer.py`、`tests/unit/ui/test_renderer.py`、
+`tests/e2e/test_terminal_chat.py`
+
+**依赖：** TS17
+
+**步骤：**
+
+1. Renderer 在一次活动 Agent 回合中只生成一个 `● YCode` 标题。
+2. 移除 YCode 标题和 Thinking 标题中的 `round N` 展示，但保留内部轮次数据。
+3. 各轮仍按“Thinking/模型文本 → 本轮工具结果”顺序渲染，后一轮模型文本直接继续显示。
+4. 保持最终轮 Markdown、工具原位覆盖、计时和终态恢复不变。
+5. 调整 Renderer 单元测试，验证多轮只有一个 YCode 标题、无 `round N`，且工具结果后紧跟后续回复。
+6. 复用现有六工具 Windows PTY 场景进行最小交互回归；最终展示效果由用户手动验收。
+
+**验证：**
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/unit/ui/test_renderer.py -q
+.venv\Scripts\python.exe -m pytest tests/e2e/test_terminal_chat.py -k "agent_executes_six_tools" -q
+```
+
 ## 执行顺序
 
 ```text
@@ -422,7 +499,7 @@ TS1 → TS2
        ├──→ TS3 ─┐
        ├──→ TS4 ─┼──→ TS6 → TS7 ─┐
        └──→ TS5 ─┘                │
-                         TS6 → TS8 ├──→ TS10 → TS11 → TS12 → TS13 → TS14 → TS15
+                         TS6 → TS8 ├──→ TS10 → TS11 → TS12 → TS13 → TS14 → TS15 → TS16 → TS17 → TS18
                          TS6 → TS9 ┘
 ```
 
@@ -447,5 +524,8 @@ TS1 → TS2
 | 应用装配与本机模拟服务 | TS13 |
 | Anthropic/OpenAI 集成与真实 PTY | TS14 |
 | 完整质量门禁与范围检查 | TS15 |
+| 工具过程状态按调用收敛为单行最终结果 | TS16 |
+| 工具状态在对应模型轮次内就地展示 | TS17 |
+| 同一 Agent 回合的内部轮次共用一个 YCode 标题 | TS18 |
 
 已批准 Spec 与 Plan 中的每项能力均有对应实现任务和验证方式，任务依赖无循环。

@@ -18,6 +18,7 @@ from ycode.ui.timer import ResponseTimer
 class _RoundContent:
     thinking_parts: list[str] = field(default_factory=list)
     text_parts: list[str] = field(default_factory=list)
+    tool_statuses: dict[str, str] = field(default_factory=dict)
 
     @property
     def thinking(self) -> str:
@@ -40,7 +41,6 @@ class LiveResponseRenderer:
         self._timer = timer or ResponseTimer()
         self._refresh_interval = refresh_interval
         self._rounds: dict[int, _RoundContent] = {}
-        self._tool_statuses: list[str] = []
         self._error: str | None = None
         self._final_message: ChatMessage | None = None
         self._live: Live | None = None
@@ -58,41 +58,38 @@ class LiveResponseRenderer:
     def elapsed(self) -> float:
         return self._timer.elapsed
 
-    def _title(self, round_number: int) -> Text:
+    def _title(self) -> Text:
         title = Text("● YCode", style=f"bold {BLUE}")
-        if len(self._rounds) > 1:
-            title.append(f"  round {round_number}", style=MUTED)
         title.append(f"  {self.elapsed:.1f}s", style=MUTED)
         return title
 
     def renderable(self) -> RenderableType:
         items: list[RenderableType] = []
         final_round = max(self._rounds, default=1)
+        if self._rounds:
+            items.append(self._title())
         for round_number, content in self._rounds.items():
             if content.thinking:
                 items.extend(
                     [
-                        Text(f"◇ Thinking · round {round_number}", style=f"bold {BLUE}"),
+                        Text("◇ Thinking", style=f"bold {BLUE}"),
                         Text(content.thinking),
                         Text(""),
                     ]
                 )
-            items.append(self._title(round_number))
             if self._final_message is not None and round_number == final_round:
                 items.append(Markdown(self._final_message.text))
             else:
                 items.append(Text(content.text))
+            for status in content.tool_statuses.values():
+                items.append(Text(status))
             items.append(Text(""))
-
-        for status in self._tool_statuses:
-            items.append(Text(status))
         if self._error:
             items.extend([Text(""), Text(self._error, style=ERROR)])
         return Group(*items)
 
     async def start(self) -> None:
         self._rounds.clear()
-        self._tool_statuses.clear()
         self._error = None
         self._final_message = None
         self._timer.start()
@@ -125,8 +122,8 @@ class LiveResponseRenderer:
         self._round(round_number).text_parts.append(text)
         self._update()
 
-    def add_tool_status(self, status: str) -> None:
-        self._tool_statuses.append(status)
+    def set_tool_status(self, round_number: int, call_id: str, status: str) -> None:
+        self._round(round_number).tool_statuses[call_id] = status
         self._update()
 
     def _update(self) -> None:

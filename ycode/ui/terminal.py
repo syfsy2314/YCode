@@ -294,16 +294,23 @@ class TerminalUI:
             renderer.append_text(event.text, event.round_number)
         elif isinstance(event, ToolExecutionStarted):
             await start()
-            renderer.add_tool_status(_tool_start_summary(event.call))
+            renderer.set_tool_status(
+                event.round_number, event.call.id, _tool_start_summary(event.call)
+            )
         elif isinstance(event, ToolExecutionCompleted):
             await start()
-            renderer.add_tool_status(_tool_result_summary(event))
+            renderer.set_tool_status(
+                event.round_number, event.record.call.id, _tool_result_summary(event)
+            )
         elif isinstance(event, ToolExecutionCancelled):
             await start()
-            renderer.add_tool_status(f"– {event.call.name}  已取消")
+            renderer.set_tool_status(
+                event.round_number, event.call.id, f"– {event.call.name}  已取消"
+            )
         elif isinstance(event, ToolApprovalRequested):
             await start()
-            renderer.add_tool_status(f"? {event.decision.subject.call.name}  等待用户确认")
+            call = event.decision.subject.call
+            renderer.set_tool_status(event.round_number, call.id, f"? {call.name}  等待用户确认")
             assert approvals is not None
             await approvals.put(event)
         elif isinstance(event, ModeChangedEvent):
