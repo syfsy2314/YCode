@@ -1,5 +1,5 @@
 """AgentEvent 会话、模式与整轮历史事务。"""
-
+from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import suppress

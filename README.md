@@ -56,14 +56,38 @@ CLI
 
 ## 安装
 
-在 PowerShell 中进入项目目录：
+需要 Python 3.12 或更高版本。在 PowerShell 中进入项目根目录，然后执行：
 
 ```powershell
 py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\Activate.ps1
+ycode --help
 ```
 
-`requirements.txt` 会从 `pyproject.toml` 安装 YCode、运行依赖和开发依赖。已有 `.venv` 时无需重新创建。
+当前 `requirements.txt` 的内容是 `-e .[dev]`，会根据 `pyproject.toml` 以可编辑模式安装
+YCode 本体、`ycode` 命令入口、运行依赖和开发依赖。已有 `.venv` 时无需重新创建，更新
+代码后通常也无需重新安装；仅当 `pyproject.toml` 或依赖发生变化时，再执行安装命令。
+
+如果只使用 YCode、不需要测试和代码检查工具，可以改用：
+
+```powershell
+.venv\Scripts\python.exe -m pip install -e .
+```
+
+如果 PowerShell 不允许执行激活脚本，或不想激活虚拟环境，可以直接运行：
+
+```powershell
+.venv\Scripts\ycode.exe --help
+.venv\Scripts\ycode.exe
+```
+
+如果激活后仍提示找不到 `ycode`，请确认命令实际安装在当前虚拟环境：
+
+```powershell
+.venv\Scripts\python.exe -m pip show ycode
+Get-ChildItem .venv\Scripts\ycode.exe
+```
 
 ## 配置
 
