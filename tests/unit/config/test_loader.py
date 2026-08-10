@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from ycode.config.loader import load_config
+from ycode.config.loader import load_config, load_named_anthropic_provider
 from ycode.errors import ConfigError
 
 
@@ -193,3 +193,41 @@ def test_openai_keeps_os_environment_behavior_and_ignores_mcp(tmp_path: Path) ->
 
     with pytest.raises(ConfigError, match="OPENAI_TEST_KEY"):
         load_config(path)
+
+
+def test_loads_named_anthropic_provider_lazily(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "active: local\nproviders:\n"
+        "  - name: local\n    protocol: anthropic\n    model: main\n"
+        "    base_url: http://localhost:9000\n    api_key: main-key\n"
+        "  - name: reviewer\n    protocol: anthropic\n    model: review\n"
+        "    base_url: http://localhost:9001\n    api_key: ${REVIEW_KEY}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text("REVIEW_KEY=review-secret\n", encoding="utf-8")
+    loaded = load_config(path)
+
+    reviewer = load_named_anthropic_provider(loaded, "reviewer")
+
+    assert reviewer.model == "review"
+    assert reviewer.api_key.get_secret_value() == "review-secret"
+    assert loaded.redactor.redact_text("review-secret") == "[REDACTED]"
+
+
+def test_named_skill_provider_rejects_missing_and_openai_entries(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "active: local\nproviders:\n"
+        "  - name: local\n    protocol: anthropic\n    model: main\n"
+        "    base_url: http://localhost:9000\n    api_key: main-key\n"
+        "  - name: other\n    protocol: openai\n    model: gpt\n"
+        "    base_url: http://localhost:9001\n    api_key: other-key\n",
+        encoding="utf-8",
+    )
+    loaded = load_config(path)
+
+    with pytest.raises(ConfigError, match="不存在"):
+        load_named_anthropic_provider(loaded, "missing")
+    with pytest.raises(ConfigError, match="不是 Anthropic"):
+        load_named_anthropic_provider(loaded, "other")

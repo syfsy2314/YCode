@@ -3,7 +3,9 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, ConfigDict
 
+from ycode.agent import AgentMode
 from ycode.core.messages import ToolCallBlock
+from ycode.prompt import PromptRuntimeContext
 from ycode.security import (
     CommandSafetyResult,
     PermissionAction,
@@ -13,6 +15,7 @@ from ycode.security import (
     SecurityConfig,
     SecurityRule,
 )
+from ycode.skills import SkillCatalog, SkillLoader, SkillRuntime, SkillValidationEnvironment
 from ycode.tools import (
     PydanticToolArguments,
     ToolAccess,
@@ -21,6 +24,7 @@ from ycode.tools import (
     ToolExecutionResult,
     create_builtin_registry,
 )
+from ycode.tools.builtin import InstallSkillTool, LoadSkillTool
 from ycode.tools.command import CommandResult
 from ycode.tools.paths import WorkspacePathResolver
 from ycode.tools.text_files import TextFileService
@@ -89,6 +93,8 @@ def make_engine(
     *,
     config: SecurityConfig | None = None,
     checker: FakeChecker | None = None,
+    skill_runtime: SkillRuntime | None = None,
+    install_tool: InstallSkillTool | None = None,
 ) -> PermissionEngine:
     resolver = WorkspacePathResolver(workspace)
     registry = create_builtin_registry(
@@ -98,12 +104,38 @@ def make_engine(
     )
     registry.register(UnknownTool())
     registry.register(McpUnknownTool())
+    if skill_runtime is not None:
+        registry.register(LoadSkillTool(skill_runtime))
+    if install_tool is not None:
+        registry.register(install_tool)
     return PermissionEngine(
         registry,
         resolver,
         config or SecurityConfig(),
         checker or FakeChecker(),  # type: ignore[arg-type]
+        skill_runtime,
     )
+
+
+def make_skill_runtime(tmp_path: Path, allowed_tools: str = "read_file") -> SkillRuntime:
+    skill_dir = tmp_path / ".ycode" / "skills" / "review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: review\ndescription: Review files\n"
+        f"allowed-tools: {allowed_tools}\n---\nReview carefully.\n",
+        encoding="utf-8",
+    )
+    catalog = SkillCatalog(
+        tmp_path,
+        SkillLoader(),
+        SkillValidationEnvironment(
+            frozenset({"read_file", "write_file", "load_skill"}),
+            frozenset(),
+            frozenset(),
+        ),
+    )
+    catalog.commit(catalog.scan_candidate())
+    return SkillRuntime(catalog, PromptRuntimeContext())
 
 
 @pytest.mark.asyncio
@@ -344,6 +376,90 @@ async def test_plan_only_mcp_project_deny_still_wins(tmp_path: Path) -> None:
 
     assert decision.action is PermissionAction.DENY
     assert decision.rule_id == "deny-mcp"
+
+
+@pytest.mark.asyncio
+async def test_skill_preapproval_turns_ask_into_allow_but_not_deny(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+    scope = make_skill_runtime(tmp_path).begin_task(AgentMode.AGENT)
+    scope.preapproved_tools.add("read_file")
+    ask = await make_engine(tmp_path).evaluate(
+        ToolCallBlock(id="read", name="read_file", arguments={"path": "a.txt"}),
+        PermissionSession(PermissionMode.STRICT),
+        allowed_access=ALL_ACCESS,
+        skill_scope=scope,
+    )
+    deny_engine = make_engine(
+        tmp_path,
+        config=SecurityConfig(
+            rules=(SecurityRule(id="deny-read", action="deny", tool="read_file"),)
+        ),
+    )
+    deny = await deny_engine.evaluate(
+        ToolCallBlock(id="read", name="read_file", arguments={"path": "a.txt"}),
+        PermissionSession(),
+        allowed_access=ALL_ACCESS,
+        skill_scope=scope,
+    )
+
+    assert ask.action is PermissionAction.ALLOW
+    assert ask.reason_code == "skill_preapproval"
+    assert deny.action is PermissionAction.DENY
+
+
+@pytest.mark.asyncio
+async def test_automatic_skill_activation_lists_preapproved_tools(tmp_path: Path) -> None:
+    runtime = make_skill_runtime(tmp_path, "read_file write_file")
+    scope = runtime.begin_task(AgentMode.AGENT)
+    decision = await make_engine(tmp_path, skill_runtime=runtime).evaluate(
+        ToolCallBlock(id="skill", name="load_skill", arguments={"name": "review"}),
+        PermissionSession(PermissionMode.ALLOW),
+        allowed_access=ALL_ACCESS,
+        skill_scope=scope,
+    )
+
+    assert decision.action is PermissionAction.ASK
+    assert decision.reason_code == "skill_activation_approval"
+    assert decision.allow_session is False
+    assert "review" in decision.subject.approval_summary
+    assert "read_file, write_file" in decision.subject.approval_summary
+
+
+@pytest.mark.asyncio
+async def test_install_skill_always_asks_and_plan_only_denies(tmp_path: Path) -> None:
+    class Installer:
+        async def install(self, url):
+            raise AssertionError
+
+    tool = InstallSkillTool(Installer())  # type: ignore[arg-type]
+    engine = make_engine(tmp_path, install_tool=tool)
+    scope = make_skill_runtime(tmp_path).begin_task(AgentMode.AGENT)
+    scope.preapproved_tools.add("install_skill")
+    call = ToolCallBlock(
+        id="install",
+        name="install_skill",
+        arguments={"source_url": "https://example.com/review.zip"},
+    )
+
+    decision = await engine.evaluate(
+        call,
+        PermissionSession(PermissionMode.ALLOW),
+        allowed_access=ALL_ACCESS,
+        skill_scope=scope,
+    )
+    plan_only = await engine.evaluate(
+        call,
+        PermissionSession(PermissionMode.ALLOW),
+        allowed_access=frozenset({ToolAccess.READ}),
+        plan_only=True,
+        skill_scope=scope,
+    )
+
+    assert decision.action is PermissionAction.ASK
+    assert decision.reason_code == "skill_install_approval"
+    assert decision.allow_session is False
+    assert "https://example.com/review.zip" in decision.subject.approval_summary
+    assert plan_only.action is PermissionAction.DENY
 
 
 @pytest.mark.asyncio

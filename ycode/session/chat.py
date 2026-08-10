@@ -1,5 +1,7 @@
 """AgentEvent 会话、模式与整轮历史事务。"""
+
 from __future__ import annotations
+
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -11,6 +13,7 @@ from ycode.agent.contracts import (
     AgentTermination,
     AgentTurn,
     ConversationRunner,
+    TurnMessage,
 )
 from ycode.agent.events import (
     AgentCancelledEvent,
@@ -47,6 +50,9 @@ from ycode.prompt.models import SupplementKind, SystemSupplement
 from ycode.security import ApprovalChoice, PermissionMode, PermissionSession
 from ycode.session.manager import SessionManager
 from ycode.session.models import SessionCommit, SessionStorageError
+from ycode.skills.commands import build_skill_command_definitions
+from ycode.skills.models import SkillInvocationSource, SkillTaskScope
+from ycode.skills.runtime import SkillRuntime, SkillRuntimeError
 
 if TYPE_CHECKING:
     from ycode.commands import CommandRuntime
@@ -54,6 +60,15 @@ if TYPE_CHECKING:
 type _TerminalEvent = (
     FinalResponseEvent | AgentLimitReachedEvent | AgentCancelledEvent | AgentErrorEvent
 )
+
+
+def _expanded_skill_task(name: str, arguments: str | None) -> str:
+    detail = (
+        f"Invocation arguments:\n{arguments}"
+        if arguments is not None and arguments.strip()
+        else "No arguments were provided."
+    )
+    return f'Use the "{name}" skill for this task.\n\n{detail}'
 
 
 class ChatSession:
@@ -69,6 +84,7 @@ class ChatSession:
         memory_updater: MemoryUpdater | None = None,
         startup_warnings: tuple[str, ...] = (),
         command_runtime: CommandRuntime | None = None,
+        skill_runtime: SkillRuntime | None = None,
     ) -> None:
         self._runner = runner
         self._history: list[ChatMessage] = []
@@ -82,6 +98,7 @@ class ChatSession:
         self._memory_updater = memory_updater
         self._startup_warnings = tuple(startup_warnings)
         self._command_runtime = command_runtime
+        self._skill_runtime = skill_runtime
         self._active_turn: AgentTurn | None = None
         self._active_compaction: asyncio.Task[object] | None = None
         self._turn_finished = asyncio.Event()
@@ -179,6 +196,9 @@ class ChatSession:
         if self._context_manager is not None:
             self._context_manager.activate_restore(candidate)
         self._history[:] = candidate.history
+        skill_warnings: tuple[str, ...] = ()
+        if self._skill_runtime is not None:
+            skill_warnings = await self._skill_runtime.restore(snapshot.active_skill_names)
         self._mode = AgentMode.AGENT
         if self._permission_session is not None:
             self._permission_session.clear()
@@ -205,7 +225,7 @@ class ChatSession:
         event = SessionRestoredEvent(
             snapshot.session_id,
             len(candidate.history),
-            tuple(warning.message for warning in snapshot.warnings),
+            (*tuple(warning.message for warning in snapshot.warnings), *skill_warnings),
         )
         self._startup_restore_event = event
         return event
@@ -257,6 +277,7 @@ class ChatSession:
         model_text: str,
         *,
         display_text: str | None = None,
+        skill_scope: SkillTaskScope | None = None,
     ) -> AsyncIterator[AgentEvent]:
         if not model_text.strip():
             raise ValueError("消息不能为空")
@@ -332,10 +353,11 @@ class ChatSession:
             yield self.change_permission_mode(target_permission)
             return
 
-        turn = self._runner.start_turn(
-            tuple(self._history),
-            user_message,
-            self._mode,
+        scoped_start = getattr(self._runner, "start_turn_with_skill_scope", None)
+        turn = (
+            scoped_start(tuple(self._history), user_message, self._mode, skill_scope)
+            if skill_scope is not None and callable(scoped_start)
+            else self._runner.start_turn(tuple(self._history), user_message, self._mode)
         )
         self._active_turn = turn
         self._turn_finished.clear()
@@ -373,14 +395,23 @@ class ChatSession:
                         commit = await self._session_manager.commit_turn(
                             result.turn_messages,
                             checkpoint=checkpoint,
+                            active_skill_names=(
+                                result.active_skill_names
+                                if self._skill_runtime is not None
+                                else None
+                            ),
                         )
                     except (SessionStorageError, ValueError):
+                        if self._skill_runtime is not None and result.skill_scope is not None:
+                            self._skill_runtime.discard_task(result.skill_scope)
                         yield AgentErrorEvent(
                             "session_storage_error",
                             "会话保存失败，本轮未提交到当前历史。",
                         )
                         return
                     self._new_commits.append(commit)
+                if self._skill_runtime is not None and result.skill_scope is not None:
+                    self._skill_runtime.commit_task(result.skill_scope)
                 if result.context_commit is not None and self._context_manager is not None:
                     self._context_manager.commit(result.context_commit)
                     self._history[:] = result.context_commit.history
@@ -397,6 +428,170 @@ class ChatSession:
                         pass
             self._active_turn = None
             self._turn_finished.set()
+
+    async def stream_skill(
+        self,
+        name: str,
+        arguments: str | None,
+        raw_text: str,
+    ) -> AsyncIterator[AgentEvent]:
+        if self._skill_runtime is None:
+            yield UserMessageEvent(ChatMessage.user_text(raw_text))
+            yield AgentErrorEvent("skills_unavailable", "当前会话未启用 Skill。")
+            return
+        scope = self._skill_runtime.begin_task(self._mode)
+        try:
+            snapshot = self._skill_runtime.load_current(name)
+            isolated = snapshot.config.execution_mode.value == "isolated"
+            if isolated:
+                yield UserMessageEvent(ChatMessage.user_text(raw_text))
+            result = await self._skill_runtime.invoke(
+                name,
+                arguments,
+                SkillInvocationSource.EXPLICIT,
+                scope,
+            )
+        except SkillRuntimeError as error:
+            self._skill_runtime.discard_task(scope)
+            if "isolated" not in locals() or not isolated:
+                yield UserMessageEvent(ChatMessage.user_text(raw_text))
+            yield AgentErrorEvent(error.code, str(error))
+            return
+        if result.final_handoff is not None:
+            user_message = ChatMessage.user_text(_expanded_skill_task(name, arguments))
+            final_message = ChatMessage.assistant_text(result.final_handoff)
+            now = datetime.now(UTC)
+            messages = (TurnMessage(user_message, now), TurnMessage(final_message, now))
+            try:
+                if self._session_manager is not None:
+                    commit = await self._session_manager.commit_turn(
+                        messages,
+                        active_skill_names=self._skill_runtime.active_names,
+                    )
+                    self._new_commits.append(commit)
+            except (SessionStorageError, ValueError):
+                self._skill_runtime.discard_task(scope)
+                yield AgentErrorEvent(
+                    "session_storage_error",
+                    "会话保存失败，本轮未提交到当前历史。",
+                )
+                return
+            self._skill_runtime.discard_task(scope)
+            self._history.extend((user_message, final_message))
+            yield FinalResponseEvent(final_message)
+            return
+        async for event in self.stream_reply(
+            _expanded_skill_task(name, arguments),
+            display_text=raw_text,
+            skill_scope=scope,
+        ):
+            yield event
+
+    def skills_status(self) -> str:
+        if self._skill_runtime is None:
+            return "当前会话未启用 Skill。"
+        lines = ["Project Skills:"]
+        for entry in self._skill_runtime.catalog_entries:
+            if entry.snapshot is None:
+                reasons = "; ".join(problem.message for problem in entry.problems)
+                lines.append(f"- {entry.directory_name}: unavailable — {reasons}")
+                continue
+            state = (
+                "active" if entry.snapshot.name in self._skill_runtime.active_names else "available"
+            )
+            lines.append(f"- {entry.snapshot.name}: {state} — {entry.snapshot.description}")
+        if len(lines) == 1:
+            lines.append("- none")
+        return "\n".join(lines)
+
+    def skill_status(self, name: str) -> str:
+        if self._skill_runtime is None:
+            return "当前会话未启用 Skill。"
+        entry = next(
+            (
+                item
+                for item in self._skill_runtime.catalog_entries
+                if item.directory_name.casefold() == name.casefold()
+                or (item.snapshot is not None and item.snapshot.name.casefold() == name.casefold())
+            ),
+            None,
+        )
+        if entry is None:
+            return f"Skill 不存在：{name}"
+        if entry.snapshot is None:
+            details = "\n".join(
+                f"- {problem.severity.value}: {problem.message}" for problem in entry.problems
+            )
+            return f"Skill {entry.directory_name}: unavailable\n{details}"
+        snapshot = entry.snapshot
+        config = snapshot.config
+        state = "active" if snapshot.name in self._skill_runtime.active_names else "available"
+        return (
+            f"Skill {snapshot.name}\n"
+            f"description: {snapshot.description}\n"
+            f"state: {state}\n"
+            f"execution: {config.execution_mode.value}\n"
+            f"context: {config.context_kind.value}\n"
+            f"model: {config.model_name or 'current'}\n"
+            f"allowed-tools: {', '.join(sorted(config.allowed_tools)) or 'none'}"
+        )
+
+    async def deactivate_skill(self, name: str) -> str:
+        if self._skill_runtime is None:
+            return "当前会话未启用 Skill。"
+        try:
+            changed = await self._skill_runtime.deactivate(name)
+        except (SessionStorageError, ValueError):
+            return "Skill 停用状态保存失败，当前状态未改变。"
+        return f"Skill 已停用：{name}" if changed else f"Skill 未激活：{name}"
+
+    async def reload_skills(self) -> str:
+        if self._skill_runtime is None:
+            return "当前会话未启用 Skill。"
+        try:
+            candidate = self._skill_runtime.scan_catalog_candidate()
+            remaining = tuple(
+                name for name in self._skill_runtime.active_names if name in candidate.available
+            )
+            if (
+                remaining != self._skill_runtime.active_names
+                and self._session_manager is not None
+                and self._session_manager.active_session_id is not None
+            ):
+                await self._session_manager.append_skill_state(remaining)
+            removed = self._skill_runtime.commit_catalog(candidate)
+            if self._command_runtime is not None:
+                snapshots = tuple(
+                    entry.snapshot for entry in candidate.entries if entry.snapshot is not None
+                )
+                self._command_runtime.registry.replace_dynamic(
+                    build_skill_command_definitions(snapshots)
+                )
+        except Exception:
+            return "Skill reload 失败，已保留原状态。"
+        suffix = f"；自动停用：{', '.join(removed)}" if removed else ""
+        return f"Skill reload 完成：{len(candidate.available)} 个可用{suffix}"
+
+    async def clear_session(self) -> str:
+        if self._active_turn is not None or self._active_compaction is not None:
+            raise RuntimeError("活动任务期间不能清空会话")
+        self._history.clear()
+        self._mode = AgentMode.AGENT
+        self._startup_restore_event = None
+        if self._session_manager is not None:
+            self._session_manager.begin_new()
+        if self._context_manager is not None:
+            self._context_manager.activate_restore(RestoreContextResult((), None))
+        if self._skill_runtime is not None:
+            self._skill_runtime.clear()
+        if self._permission_session is not None:
+            self._permission_session.clear()
+        if self._prompt_runtime is not None:
+            self._prompt_runtime.reset_mode()
+        clear_queued = getattr(self._runner, "clear_queued_request_supplements", None)
+        if callable(clear_queued):
+            clear_queued(SupplementKind.REMINDER)
+        return "当前会话已清空。"
 
     def cancel_active_turn(self) -> None:
         if self._active_turn is not None:

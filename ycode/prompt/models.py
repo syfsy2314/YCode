@@ -65,6 +65,8 @@ class SupplementKind(StrEnum):
     MEMORY = "memory"
     PROJECT_INSTRUCTIONS = "project_instructions"
     PROJECT_MEMORY = "project_memory"
+    SKILL_CATALOG = "available_skills"
+    SKILL_INSTRUCTIONS = "active_skills"
     REMINDER = "reminder"
     TOOL_CATALOG = "tool_catalog"
 

@@ -607,3 +607,129 @@ async def test_stale_resume_queues_reminder_for_only_next_normal_turn(tmp_path: 
     assert len(runner.used[0]) == 1
     assert "Last active:" in runner.used[0][0].content
     assert runner.used[1] == ()
+
+
+@pytest.mark.asyncio
+async def test_explicit_shared_skill_displays_raw_but_commits_expanded_task(
+    tmp_path: Path,
+) -> None:
+    from ycode.agent import AgentTermination, AgentTurnResult, AgentTurnStream
+    from ycode.skills import (
+        SkillCatalog,
+        SkillLoader,
+        SkillRuntime,
+        SkillValidationEnvironment,
+    )
+
+    skill_dir = tmp_path / ".ycode" / "skills" / "review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: review\ndescription: Review changes\n---\nReview carefully.\n",
+        encoding="utf-8",
+    )
+    catalog = SkillCatalog(
+        tmp_path,
+        SkillLoader(),
+        SkillValidationEnvironment(frozenset(), frozenset(), frozenset()),
+    )
+    catalog.commit(catalog.scan_candidate())
+    runtime = SkillRuntime(catalog, PromptRuntimeContext())
+
+    class ScopedRunner:
+        supported_modes = frozenset({AgentMode.AGENT})
+
+        def start_turn_with_skill_scope(self, history, user_message, mode, scope):
+            async def produce(turn):
+                final = ChatMessage.assistant_text("reviewed")
+                turn.complete(
+                    AgentTurnResult(
+                        AgentTermination.COMPLETED,
+                        (user_message, final),
+                        final,
+                        active_skill_names=runtime.candidate_active_names(scope),
+                        skill_scope=scope,
+                    )
+                )
+                yield FinalResponseEvent(final)
+
+            return AgentTurnStream(produce)
+
+        def start_turn(self, history, user_message, mode):
+            raise AssertionError("显式 Skill 必须传递候选作用域")
+
+        async def close(self):
+            pass
+
+    manager = SessionManager(tmp_path)
+    session = ChatSession(
+        ScopedRunner(),  # type: ignore[arg-type]
+        session_manager=manager,
+        skill_runtime=runtime,
+    )
+
+    events = [event async for event in session.stream_skill("review", "parser", "/review parser")]
+
+    assert isinstance(events[0], UserMessageEvent)
+    assert events[0].message.text == "/review parser"
+    assert session.history[0].text == (
+        'Use the "review" skill for this task.\n\nInvocation arguments:\nparser'
+    )
+    assert runtime.active_names == ("review",)
+    restored = await manager.load(manager.active_session_id or "")
+    assert restored.active_skill_names == ("review",)
+
+
+@pytest.mark.asyncio
+async def test_explicit_isolated_skill_commits_only_expanded_task_and_handoff(
+    tmp_path: Path,
+) -> None:
+    from ycode.skills import (
+        SkillCatalog,
+        SkillLoader,
+        SkillRuntime,
+        SkillValidationEnvironment,
+    )
+
+    skill_dir = tmp_path / ".ycode" / "skills" / "audit"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: audit\ndescription: Audit changes\n"
+        "metadata:\n  ycode-execution-mode: isolated\n"
+        "  ycode-context: none\n---\nAudit carefully.\n",
+        encoding="utf-8",
+    )
+    catalog = SkillCatalog(
+        tmp_path,
+        SkillLoader(),
+        SkillValidationEnvironment(frozenset(), frozenset(), frozenset()),
+    )
+    catalog.commit(catalog.scan_candidate())
+
+    class Executor:
+        async def run(self, snapshot, scope, arguments):
+            return "isolated handoff"
+
+    runtime = SkillRuntime(
+        catalog,
+        PromptRuntimeContext(),
+        isolated_executor=Executor(),
+    )
+    manager = SessionManager(tmp_path)
+    session = ChatSession(
+        PlainChatRunner(FakeProvider([])),
+        session_manager=manager,
+        skill_runtime=runtime,
+    )
+
+    events = [event async for event in session.stream_skill("audit", None, "/audit")]
+
+    assert isinstance(events[0], UserMessageEvent)
+    assert isinstance(events[-1], FinalResponseEvent)
+    assert [(item.role, item.text) for item in session.history] == [
+        (
+            "user",
+            'Use the "audit" skill for this task.\n\nNo arguments were provided.',
+        ),
+        ("assistant", "isolated handoff"),
+    ]
+    assert runtime.active_names == ()

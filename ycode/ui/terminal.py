@@ -130,6 +130,24 @@ class TerminalUI:
         )
         await self._run_event_stream(stream)
 
+    async def invoke_skill(self, name: str, arguments: str | None, raw_text: str) -> None:
+        await self._run_event_stream(self._session.stream_skill(name, arguments, raw_text))
+
+    async def show_skills(self) -> None:
+        self._console.print(self._session.skills_status())
+
+    async def show_skill(self, name: str) -> None:
+        self._console.print(self._session.skill_status(name))
+
+    async def deactivate_skill(self, name: str) -> None:
+        self._console.print(await self._session.deactivate_skill(name))
+
+    async def reload_skills(self) -> None:
+        self._console.print(await self._session.reload_skills())
+
+    async def clear_session(self) -> None:
+        self._console.print(await self._session.clear_session())
+
     async def set_mode(self, mode: str) -> None:
         from ycode.agent import AgentMode
 

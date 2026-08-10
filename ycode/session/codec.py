@@ -23,6 +23,7 @@ from ycode.session.models import (
     ContextCheckpointRecord,
     SessionMessageRecord,
     SessionRecord,
+    SkillStateRecord,
     TurnCommitRecord,
 )
 
@@ -79,6 +80,13 @@ def encode_record(record: SessionRecord) -> str:
             "covered_turn_id": record.covered_turn_id,
             "memory": record.memory.summary,
             "retained_history": [encode_message(message) for message in record.retained_history],
+        }
+    elif isinstance(record, SkillStateRecord):
+        data = {
+            **common,
+            "type": "skill_state",
+            "covered_turn_id": record.covered_turn_id,
+            "active_skill_names": list(record.active_skill_names),
         }
     else:
         raise TypeError("不支持的会话记录")
@@ -143,6 +151,22 @@ def decode_record(line: str) -> SessionRecord:
                 covered_turn_id=data["covered_turn_id"],
                 memory=ConversationMemory(data["memory"]),
                 retained_history=tuple(decode_message(item) for item in retained),
+            )
+        if record_type == "skill_state" and set(data) == {
+            "version",
+            "type",
+            "session_id",
+            "covered_turn_id",
+            "timestamp",
+            "active_skill_names",
+        }:
+            names = data["active_skill_names"]
+            if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+                raise SessionCodecError("Skill 状态名称无效")
+            return SkillStateRecord(
+                **common,
+                covered_turn_id=data["covered_turn_id"],
+                active_skill_names=tuple(names),
             )
     except (KeyError, TypeError, ValueError) as error:
         raise SessionCodecError("会话记录字段无效") from error

@@ -61,3 +61,30 @@ def test_hidden_command_resolves_but_is_not_visible() -> None:
     assert registry.resolve("s") is not None
     assert registry.visible_definitions() == ()
     assert registry.completion_entries() == ()
+
+
+def test_registry_replaces_dynamic_definitions_in_place() -> None:
+    registry = CommandRegistry()
+    registry.register(_definition("help"))
+    original = registry
+
+    registry.replace_dynamic((_definition("zeta"), _definition("alpha")))
+
+    assert registry is original
+    assert [item.name for item in registry.definitions] == ["help", "alpha", "zeta"]
+    assert registry.resolve("alpha") is not None
+
+    registry.replace_dynamic((_definition("review"),))
+    assert [item.name for item in registry.definitions] == ["help", "review"]
+    assert registry.resolve("alpha") is None
+
+
+def test_dynamic_conflict_keeps_previous_registry_state() -> None:
+    registry = CommandRegistry()
+    registry.register(_definition("help"))
+    registry.replace_dynamic((_definition("review"),))
+
+    with pytest.raises(CommandConflictError):
+        registry.replace_dynamic((_definition("help"),))
+
+    assert [item.name for item in registry.definitions] == ["help", "review"]

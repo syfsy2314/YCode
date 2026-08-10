@@ -177,7 +177,8 @@ TerminalUI
             └── AgentLoop
                     ├── AnthropicProvider
                     ├── ToolRegistry
-                    │       ├── 六个内建工具
+                    │       ├── 六个基础内建工具
+                    │       ├── LoadSkillTool / InstallSkillTool
                     │       ├── ToolSearchTool（配置 MCP 时）
                     │       └── MCPToolWrapper...
                     ├── McpManager
@@ -1270,7 +1271,7 @@ ToolDefinition 保存：
 两者都同时提供“发送给模型的 Schema”和“执行前运行时校验”，因此
 Registry、Executor 和权限层不需要区分参数是来自 Pydantic 还是远端 JSON Schema。
 
-### 2. 六个内建工具
+### 2. 基础内建工具与 Anthropic Skill 工具
 
 | 工具 | 分类 | 用途 |
 |---|---|---|
@@ -1280,8 +1281,12 @@ Registry、Executor 和权限层不需要区分参数是来自 Pydantic 还是�
 | write_file | WRITE | 创建或显式覆盖文本文件 |
 | edit_file | WRITE | 使用原文唯一匹配替换文件内容 |
 | run_command | WRITE | 在工作区目录中执行 PowerShell |
+| load_skill | READ | 按需加载并运行项目 Skill |
+| install_skill | WRITE | 从受支持的公开 HTTPS 来源安装单个项目 Skill |
 
-六个内建工具都有可靠分类。MCP Server 的安全 annotations 不被信任，所有
+前六个基础内建工具始终注册；`load_skill` 和 `install_skill` 只在 Anthropic 路径装配。
+启用 MCP 时还会按需注册 `tool_search`。这些本地工具都有可靠分类。MCP Server 的安全
+annotations 不被信任，所有
 `MCPToolWrapper` 固定使用 `UNKNOWN`：它在所有权限模式下默认询问，并按
 非读取工具串行调度。
 
@@ -1549,7 +1554,8 @@ MCP、压缩上下文、恢复会话或请求退出，都由 `TerminalUI` 适配
 
 分类主要用于表达和路由，不自动决定权限、是否访问模型或是否刷新状态。特别是
 `/compact` 虽然内部调用模型生成摘要，仍属于状态命令；`/mcp` 只查询当前状态，不会
-调用模型。第一期没有注册生产 `AI` 命令，只通过测试验证这种扩展能力。
+调用模型。可用项目 Skill 会动态注册为生产 `AI` 命令，提交 `/<skill-name>` 后进入
+Skill 调用链。
 
 AI 命令支持分离两份文本：
 
@@ -1563,7 +1569,7 @@ UI 展示 `display_text`，Agent 请求和成功提交的会话历史使用 `mod
 
 ### 4. 当前命令、帮助与补全
 
-当前生产命令全部由同一注册工厂定义：
+静态生产命令由同一注册工厂定义，项目 Skill 命令由同一 Registry 动态维护：
 
 | 命令 | 类型 | 作用 |
 |---|---|---|
@@ -1575,6 +1581,9 @@ UI 展示 `display_text`，Agent 请求和成功提交的会话历史使用 `mod
 | `/compact` | STATE | 执行可取消的隔离上下文压缩 |
 | `/permission [...]` | STATE | 查询、切换权限模式或清除临时授权 |
 | `/resume <session-id>` | STATE | 原子恢复指定会话 |
+| `/skills [show/deactivate/reload]` | LOCAL/STATE | 查看、停用或重新扫描项目 Skill |
+| `/clear` | STATE | 建立空会话并清除历史、摘要、Skill 和临时授权 |
+| `/<skill-name> [arguments]` | AI | 显式运行当前可用项目 Skill |
 
 `/help`、解析、实际分发和 `CommandCompleter` 都读取同一个 Registry，避免多份手写命令
 清单漂移。补全只在光标位于第一个命令词末尾时工作；单匹配直接替换，多匹配用
@@ -1978,7 +1987,7 @@ TerminalUI 读取 ChatSession.mcp_status 快照并渲染状态表
 
 它不调用模型，不进入对话历史，也不触发重新发现。连接期间可观察 `starting`，完成后
 观察 `ready` 或 `unavailable`。无论单个还是全部 MCP Server 失败，Anthropic Agent
-仍可以使用六个内建工具启动。
+仍可以使用六个基础内建工具和项目 Skill 工具启动。
 
 ### 9. 当前明确不支持的范围
 
@@ -2222,3 +2231,283 @@ Windows ConPTY：完整场景通过；一次既有冷启动用例超时，单独
   `docs/manual-api-test.md`。
 - 在 `.env` 填入真实 MCP API Key 后验证外部 Streamable HTTP Server，并使用
   `/mcp` 确认连接状态。
+
+## Agent Skills：渐进加载、隔离执行与远程安装
+
+Skill 系统位于 `ycode.skills`，只在 Anthropic Agent 路径装配。它把可复用 SOP 保存为
+项目文件，而不是把每种流程写进 YCode 内核。当前只扫描：
+
+~~~text
+<project>/.ycode/skills/<name>/SKILL.md
+~~~
+
+`commit`、`review`、`test` 也是普通外部 Skill，没有专用 Python 分支。OpenAI 仍使用
+`PlainChatRunner`，不会扫描 Skill、注册 Skill 工具或生成动态命令。
+
+### 1. SKILL.md 与运行时模型
+
+`SkillLoader` 严格读取 UTF-8、YAML frontmatter 和 Markdown 正文。标准字段包括
+`name`、`description`、`license`、`compatibility`、`metadata`、`allowed-tools`；YCode
+配置只能放在 `metadata` 的字符串字段中：
+
+| 字段 | 含义 |
+|---|---|
+| `ycode-execution-mode` | `shared` 或 `isolated` |
+| `ycode-model` | 隔离 Skill 使用的已有 Anthropic Provider 名称 |
+| `ycode-context` | `current`、`summary`、`recent` 或 `none` |
+| `ycode-recent-turns` | `recent` 策略携带的完整用户回合数 |
+| `ycode-visible-tools` | 模型在 Skill 作用域内可见的工具白名单 |
+| `ycode-argument-hint` | 动态 Slash Command 的参数提示 |
+
+最小标准 Skill 默认是 `shared + current + 当前模型 + 继承工具 + 无预批准`。共享 Skill
+不能指定模型，且只能使用 `current`；隔离 Skill 必须显式选择 `summary`、`recent` 或
+`none`。`recent` 还必须提供正整数回合数。
+
+主要数据对象的职责是：
+
+- `SkillConfig`：验证执行模式、上下文、模型和工具集合的合法组合。
+- `SkillSnapshot`：保存一次完整校验后的名称、正文、配置、路径和 SHA-256 指纹。
+- `SkillCatalogEntry`：同时表示可用条目和带 error 的不可用条目；warning 可以与有效快照
+  共存。
+- `SkillCatalogState`：按目录名确定性排序的完整目录候选状态。
+- `SkillTaskScope`：保存本回合开始前的共享状态、待提交状态、调用栈和任务级授权。
+- `SkillTaskAuthorization`：保存本任务预批准工具及已经人工批准的 Skill 指纹。
+
+指纹很重要：自动或嵌套调用获得的批准绑定到实际 `SKILL.md` 内容。文件发生变化后，旧
+批准不能静默授权新正文。
+
+### 2. 目录扫描与两级加载
+
+启动时的链路是：
+
+~~~text
+run_app()
+    ↓ 仅 Anthropic
+SkillValidationEnvironment
+    ↓ 当前工具、Anthropic Provider、内置命令名称
+SkillCatalog.scan_candidate()
+    ↓ 逐个读取直接子目录中的 SKILL.md
+SkillCatalog.commit(candidate)
+    ↓
+SkillRuntime.refresh_catalog_prompt()
+    ↓
+PromptRuntimeContext：只注入名称和 description
+~~~
+
+扫描只处理 `.ycode/skills/` 的直接子目录，不递归发现嵌套 Skill，也不接受松散 Markdown
+文件。单项损坏、依赖缺失或命令冲突会形成不可用条目，不阻止其他 Skill 和主程序启动。
+规范化重名的双方都不可用，不按文件系统顺序覆盖。
+
+目录状态使用“先构造候选、后提交”模式。扫描本身失败时旧目录不变；已有 Skill 在真正
+调用前则通过 `reload_one()` 重新读取原路径。这样实现两个不同边界：
+
+- 修改已有 `SKILL.md`：下一次调用立即读取新快照。
+- 新增、删除或重命名目录：执行 `/skills reload` 后才改变目录、帮助、补全和动态命令。
+
+未激活时，Prompt 只包含“名称 + 一句说明”。共享 Skill 激活后，完整正文才以
+`<skill name="...">...</skill>` 形式进入会话级补充提示；资源目录不会自动注入。
+
+### 3. 显式调用、自动调用与嵌套调用
+
+自动调用通过始终可见的 READ 工具 `load_skill(name, arguments)` 进入。动态命令
+`/<skill-name> [arguments]` 则由 `build_skill_command_definitions()` 生成，并走
+`ChatSession.stream_skill()`。两条路径都会在执行前重读文件，但调用来源不同：
+
+| 来源 | `SkillInvocationSource` | 带 `allowed-tools` 时是否额外审批 |
+|---|---|---|
+| 用户提交动态命令 | `EXPLICIT` | 不额外审批，命令提交本身视为本任务授权 |
+| 主 Agent 调用 `load_skill` | `AUTOMATIC` | 必须审批 |
+| Skill 内再次调用 `load_skill` | `NESTED` | 必须审批 |
+
+参数不会替换 SOP。会话和模型收到稳定展开文本：
+
+~~~text
+Use the "<name>" skill for this task.
+
+Invocation arguments:
+<原始参数>
+~~~
+
+无参数时明确写 `No arguments were provided.`。终端仍显示原始 Slash Command，避免 UI
+文本和模型文本互相污染。
+
+`SkillRuntime.enter_call()` 用调用栈拒绝循环，并把最大嵌套深度限制为 3。隔离分支复制
+父调用栈并共享任务授权对象，但不继承主分支的待提交共享状态。因此子 Agent 中激活的
+共享 Skill 不会意外进入主会话。
+
+### 4. 共享模式的事务边界
+
+共享 Skill 不在 `invoke()` 时直接写入长期状态，而是先进入
+`SkillTaskScope.pending_shared`：
+
+~~~text
+load_skill / 显式命令
+    ↓ 调用时重读并校验
+pending_shared + 临时 SOP + 本任务预批准
+    ↓ Agent 回合继续
+COMPLETED
+    ↓ SessionManager 先写消息、skill_state、turn_commit
+SkillRuntime.commit_task()
+    ↓
+active_shared 成为下一回合状态
+~~~
+
+若 Agent 达到上限、失败、取消或会话落盘失败，`discard_task()` 会丢弃待激活快照、调用栈
+和任务级授权，并恢复已提交共享提示词。已发生的文件或命令副作用不自动回滚。
+
+多个共享 Skill 按名称排序注入。工具白名单的处理不是简单交集：如果所有激活快照都声明
+白名单，先取这些白名单的并集，再与当前模式基础工具取交集；只要其中一个 Skill 未声明
+白名单，就继承基础工具集合。
+
+### 5. 隔离模式与上下文策略
+
+`IsolatedSkillRunner` 为每次隔离调用创建临时 Anthropic Provider、独立
+`PromptRuntimeContext` 和临时 `AgentLoop`。它只注入当前 Skill 的完整 SOP，并按配置构造
+历史：
+
+- `summary`：用当前已提交摘要和全部已提交历史生成临时最新摘要。
+- `recent=N`：只携带最近 N 个完整用户回合；工具调用和结果不会被拆散。
+- `none`：不携带旧历史。
+
+当前任务始终传入。执行成功后只返回非空最终文本 `handoff`；Thinking、工具调用、工具
+结果和内部消息都不进入主会话，也不产生可恢复子会话。显式隔离调用只把展开后的用户任务
+和最终交接作为一个完整主会话回合提交；自动或嵌套隔离调用把交接作为 `load_skill` 的工具
+结果交给直接父 Agent。
+
+隔离 Skill 可以引用现有命名 Anthropic Provider，不能定义 API Key、base URL 或新
+Provider；共享 Skill 始终使用当前会话模型。取消会传给活动隔离 AgentTurn，Runner 最终
+关闭临时循环和 Provider 资源。
+
+### 6. 工具可见性、预批准与安全边界
+
+Skill 对工具有两个独立维度：
+
+~~~text
+ycode-visible-tools
+    → 模型是否看得到工具，只能收窄
+
+allowed-tools
+    → 本 Skill 任务中是否免普通人工询问，不增加可见工具
+~~~
+
+Loader 将 `Read`、`Write`、`Edit`、`Bash`、`PowerShell`、`Glob`、`Grep`、
+`ToolSearch` 映射为 YCode 工具名。`Bash(git:*)` 这类参数表达式当前不执行：它产生
+warning，但不使 Skill 不可用，也不授予 `run_command` 预批准；Git 命令仍可通过普通
+`run_command` 权限流程执行。因此“bash 中 git 的 Skill 默认不可用”不是设计结论，准确
+说法是“参数级 git 预授权不生效”。
+
+预批准只把原本的 ASK 转为 ALLOW，不能覆盖：
+
+- plan-only 的访问分类限制；
+- 项目安全配置的 DENY；
+- 工作区路径边界；
+- PowerShell 命令安全检查；
+- ToolExecutor 的最终访问分类复核。
+
+自动或嵌套激活若声明普通 `allowed-tools`，PermissionEngine 会展示 Skill 名称和预批准
+工具，并要求单次审批。批准绑定当前指纹且只活到本任务结束。历史上已激活、但本任务没有
+再次调用的共享 Skill 不贡献预批准。
+
+### 7. 管理命令与会话恢复
+
+`/skills` 显示可用、激活和不可用状态；`show` 显示执行模式、上下文、模型、预批准及
+诊断；`deactivate` 停用共享 Skill；`reload` 事务式刷新目录和动态命令。
+
+共享 Skill 状态以 `SkillStateRecord` 写入会话 JSONL。它可以和本回合消息一起在
+`turn_commit` 前写入，也可以在停用或 reload 自动移除时作为覆盖当前已提交回合的独立
+状态记录追加。恢复会话时只读取名称，再按当前磁盘重新加载：有效共享 Skill 恢复，删除、
+改名、失效或隔离 Skill 跳过并告警。旧 SOP、隔离内部历史和任务预批准都不持久化。
+
+`/clear` 创建新的空会话，清除历史、上下文摘要、活动共享 Skill 和临时权限，并把模式
+重置为 agent；项目 Skill 目录、MCP 连接、项目记忆和权限配置模式保留。
+
+### 8. install_skill 的主动调用设计
+
+`install_skill` 的工具描述明确告诉模型：用户提供以下 URL 并要求安装时应直接调用工具，
+不要先用文本再次询问；真正调用会自动触发 PermissionEngine 的人工审批。这解决了“工具
+存在但模型不主动使用”的提示歧义。
+
+参数统一为 `source_url`，支持四种来源：
+
+| 来源 | 识别和构造方式 |
+|---|---|
+| 直接 ZIP | 下载后安全解压唯一顶层 Skill 目录 |
+| `skills.sh/<owner>/<repo>/<skill>` | 查询 GitHub 递归 tree，定位父目录名与 slug 匹配的唯一 `SKILL.md`，再下载该目录 |
+| GitHub `tree/<ref>/<path>` | 通过 Contents API 从最长候选 ref 开始解析，递归下载明确目录 |
+| 原始 `SKILL.md` URL | 读取 frontmatter name，只创建 `<name>/SKILL.md`，不猜相邻资源 |
+
+普通 HTML 页面不会被当成 skills.sh 来源；若 URL 不是前三类且末尾不是 `SKILL.md`，才按
+ZIP 处理。skills.sh 和 GitHub tree 会保留 `scripts/`、`references/`、`assets/` 等随附
+资源；原始文件来源不会扩展抓取范围。
+
+### 9. 安装事务、限制与临时缓存清理
+
+安装采用临时构造后原子落位：
+
+~~~text
+.ycode/skills/.install-*/content/<name>/...
+    ↓ 完整下载、解压、名称和结构检查
+os.replace(<temporary-skill-dir>, .ycode/skills/<name>)
+    ↓ Loader 判断 available / unavailable
+刷新 Catalog 与动态 Slash Command
+    ↓
+finally 删除整个 .install-* 临时目录
+~~~
+
+因此安装成功、失败和取消都会清理下载 ZIP、GitHub API 响应构造物及其他临时缓存文件。
+如果原子落位后刷新目录失败，目标 Skill 目录也会删除，避免出现“文件已安装但运行时没
+刷新”的半提交状态。同名目标存在时直接拒绝覆盖。
+
+功能性安全检查包括：
+
+- 输入、重定向、API 地址和文件下载地址逐次验证 HTTPS；拒绝 URL 凭据、localhost 和
+  字面量非公网 IP。
+- 整次来源解析和下载共享 30 MB 累计预算。
+- ZIP 同时检查声明解压量和实际写入量不超过 30 MB。
+- ZIP 拒绝绝对路径、`..`、少于两层的根文件、symlink 和重解析点。
+- GitHub 目录拒绝 symlink、submodule、不安全名称和缺少下载地址的条目。
+- 顶层目录名必须等于 frontmatter `name`，且名称满足标准约束。
+
+当前按批准范围只做功能性实现，并未做 DNS 解析结果审计、DNS rebinding 防护、恶意公网
+样本库、压缩炸弹攻防矩阵或多平台安全验证。域名是否最终解析到私网地址不在本期功能性
+校验内，不能把现有 URL 检查描述成生产级 SSRF 防护。
+
+### 10. 当前实现与验证事实
+
+实现完成时的功能性质量检查记录为：
+
+~~~text
+ruff format --check .：通过
+ruff check .：All checks passed
+compileall -q ycode tests：通过
+pytest -q：655 passed, 2 skipped
+~~~
+
+2026-08-10 整理本笔记时，再次运行 Skill 定向测试：
+
+~~~text
+pytest -q tests/unit/skills tests/unit/tools/test_skill_tools.py \
+    tests/integration/test_skill_install.py
+结果：62 passed, 1 failed
+~~~
+
+失败发生在仓库示例扫描用例：工作区后来出现的
+`.ycode/skills/frontend-design/SKILL.md` 在当前执行环境返回 Windows
+`PermissionError: [WinError 5]`。其余定向用例通过。这个结果说明目录扫描会实际触碰当前
+项目中的每个直接 Skill 目录，也说明最新验证结论必须以工作区实时状态为准，不能沿用之前
+的全绿数字。
+
+现有自动化覆盖 Loader、Catalog、Runtime、隔离上下文、隔离 Runner、动态命令、工具与
+权限、四种安装来源及安装清理。批准文档中列出的
+`tests/integration/test_skill_agent_flow.py` 和 `tests/integration/test_skill_sessions.py`
+当前并不存在；真实 Skill 会话链路主要由相关单元测试、`test_app.py`、
+`test_terminal_chat.py` 及现有集成测试分散覆盖。因此学习笔记以代码和实际测试文件为
+事实来源，不把 checklist 中尚未落地的文件名当作已实现测试。
+
+### 面试表述
+
+YCode 的 Skill 系统以项目 `SKILL.md` 为扩展边界：启动只披露名称和说明，调用时重读并
+生成不可变快照。共享 Skill 在整轮会话事务成功后才持久激活；隔离 Skill 使用临时
+Anthropic Agent，只向父上下文返回最终交接。工具可见性和任务预批准彼此独立，且不能
+绕过 plan-only、项目拒绝、路径和执行器安全边界。安装器识别 ZIP、skills.sh、GitHub
+tree 和原始 SKILL.md，在临时目录完整构造后原子落位，并在成功、失败或取消时清理缓存。

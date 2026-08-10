@@ -14,11 +14,13 @@ _SESSION_SUPPLEMENT_ORDER = {
     SupplementKind.PROJECT_INSTRUCTIONS: 0,
     SupplementKind.PROJECT_MEMORY: 1,
     SupplementKind.MEMORY: 2,
-    SupplementKind.TOOL_STATE: 3,
-    SupplementKind.REMINDER: 4,
-    SupplementKind.ENVIRONMENT: 5,
-    SupplementKind.MODE: 6,
-    SupplementKind.TOOL_CATALOG: 7,
+    SupplementKind.SKILL_CATALOG: 3,
+    SupplementKind.SKILL_INSTRUCTIONS: 4,
+    SupplementKind.TOOL_STATE: 5,
+    SupplementKind.REMINDER: 6,
+    SupplementKind.ENVIRONMENT: 7,
+    SupplementKind.MODE: 8,
+    SupplementKind.TOOL_CATALOG: 9,
 }
 
 
@@ -82,6 +84,39 @@ class PromptRuntimeContext:
         if not isinstance(kind, SupplementKind):
             raise TypeError("会话补充类型必须是 SupplementKind")
         self._session_supplements.pop(kind, None)
+
+    def set_skill_catalog(self, items: Sequence[tuple[str, str]]) -> None:
+        ordered = tuple(sorted(items, key=lambda item: item[0]))
+        if not ordered:
+            self.remove_session_supplement(SupplementKind.SKILL_CATALOG)
+            return
+        lines = [
+            "Project skills available on demand. Use load_skill when a task matches:",
+            *(f"- {name}: {description}" for name, description in ordered),
+        ]
+        self.set_session_supplement(
+            SystemSupplement(
+                SupplementKind.SKILL_CATALOG,
+                "\n".join(lines),
+                SupplementScope.SESSION,
+            )
+        )
+
+    def set_skill_instructions(self, items: Sequence[tuple[str, str]]) -> None:
+        ordered = tuple(sorted(items, key=lambda item: item[0]))
+        if not ordered:
+            self.remove_session_supplement(SupplementKind.SKILL_INSTRUCTIONS)
+            return
+        sections = [
+            f'<skill name="{name}">\n{instructions}\n</skill>' for name, instructions in ordered
+        ]
+        self.set_session_supplement(
+            SystemSupplement(
+                SupplementKind.SKILL_INSTRUCTIONS,
+                "\n\n".join(sections),
+                SupplementScope.SESSION,
+            )
+        )
 
     def reset_mode(self) -> None:
         """会话切换后让下一轮重新注入完整模式说明。"""

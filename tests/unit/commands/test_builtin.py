@@ -26,6 +26,8 @@ async def test_production_definitions_and_help_come_from_registry() -> None:
         "compact",
         "permission",
         "resume",
+        "skills",
+        "clear",
     ]
     assert runtime.registry.resolve("QUIT").name == "exit"
     controller = Controller()
@@ -66,6 +68,11 @@ async def test_help_alias_detail_and_hidden_command() -> None:
         ("/resume Session-AbC", ("resume_session", "Session-AbC")),
         ("/resume Session With Spaces", ("resume_session", "Session With Spaces")),
         ("/quit", ("request_exit",)),
+        ("/skills", ("show_skills",)),
+        ("/skills review", ("show_skill", "review")),
+        ("/skills reload", ("reload_skills",)),
+        ("/skills deactivate review", ("deactivate_skill", "review")),
+        ("/clear", ("clear_session",)),
     ],
 )
 async def test_builtin_controller_calls(command: str, expected: tuple) -> None:

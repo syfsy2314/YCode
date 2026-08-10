@@ -48,6 +48,7 @@ from ycode.security import (
     PermissionSession,
 )
 from ycode.session.assembler import ResponseAssembler
+from ycode.skills.runtime import SkillRuntime
 from ycode.tools.contracts import (
     ToolAccess,
     ToolContext,
@@ -82,6 +83,7 @@ class AgentLoop:
         plan_only_mcp_tools: frozenset[str] = frozenset(),
         resource_manager: "_AsyncCloseable | None" = None,
         context_manager: ContextManager | None = None,
+        skill_runtime: SkillRuntime | None = None,
         max_rounds: int = 10,
     ) -> None:
         if not isinstance(max_rounds, int) or isinstance(max_rounds, bool) or max_rounds < 1:
@@ -100,6 +102,7 @@ class AgentLoop:
         self._plan_only_mcp_tools = plan_only_mcp_tools
         self._resource_manager = resource_manager
         self._context_manager = context_manager
+        self._skill_runtime = skill_runtime
         self._close_task: asyncio.Task[None] | None = None
         self._max_rounds = max_rounds
         self._queued_request_supplements: list[SystemSupplement] = []
@@ -128,7 +131,20 @@ class AgentLoop:
         queued = tuple(self._queued_request_supplements)
         self._queued_request_supplements.clear()
         return AgentTurnStream(
-            lambda turn: self._run(turn, history_snapshot, user_message, mode, queued)
+            lambda turn: self._run(turn, history_snapshot, user_message, mode, queued, None)
+        )
+
+    def start_turn_with_skill_scope(
+        self,
+        history: Sequence[ChatMessage],
+        user_message: ChatMessage,
+        mode: AgentMode,
+        skill_scope,
+    ) -> AgentTurn:
+        queued = tuple(self._queued_request_supplements)
+        self._queued_request_supplements.clear()
+        return AgentTurnStream(
+            lambda turn: self._run(turn, tuple(history), user_message, mode, queued, skill_scope)
         )
 
     async def close(self) -> None:
@@ -150,6 +166,7 @@ class AgentLoop:
         user_message: ChatMessage,
         mode: AgentMode,
         queued_supplements: tuple[SystemSupplement, ...],
+        provided_skill_scope=None,
     ) -> AsyncIterator[AgentEvent]:
         working_messages = [*history, user_message]
         turn_messages = [TurnMessage(user_message, datetime.now(UTC))]
@@ -175,8 +192,12 @@ class AgentLoop:
             and (mode is AgentMode.AGENT or tool.definition.name in self._plan_only_mcp_tools)
         )
         exposure = ToolExposureSession(deferred_names)
-        context = ToolContext(self._context.workspace, exposure)
+        skill_scope = provided_skill_scope
+        if skill_scope is None and self._skill_runtime is not None:
+            skill_scope = self._skill_runtime.begin_task(mode)
+        context = ToolContext(self._context.workspace, exposure, skill_scope)
         usage = TokenUsage()
+        completed = False
 
         try:
             environment = await turn.run_child(self._environment.collect())
@@ -196,19 +217,39 @@ class AgentLoop:
                         f"Current permission mode: {self._permission_session.mode.value}.",
                     )
                 )
+            system_prompt = self._prompt_bundle.content_blocks
             prompt_context = self._prompt_runtime.begin_turn(
                 mode.value,
                 tuple(request_supplements),
             )
-            system_prompt = self._prompt_bundle.content_blocks
-            supplements = tuple(
-                supplement.tagged_content for supplement in prompt_context.supplements
+            request_kinds = {item.kind for item in request_supplements}
+            fixed_supplements = tuple(
+                item
+                for item in prompt_context.supplements
+                if item.kind in request_kinds or item.kind is SupplementKind.MODE
             )
             for round_number in range(1, self._max_rounds + 1):
+                if self._skill_runtime is not None and skill_scope is not None:
+                    self._skill_runtime.refresh_task_prompt(skill_scope)
+                supplements = tuple(
+                    supplement.tagged_content
+                    for supplement in (
+                        *self._prompt_runtime.session_supplements,
+                        *fixed_supplements,
+                    )
+                )
                 definitions = self._registry.definitions(allowed_access, exposure.exposed_names)
                 if mode is AgentMode.PLAN_ONLY and not deferred_names:
                     definitions = tuple(
                         definition for definition in definitions if definition.name != "tool_search"
+                    )
+                if self._skill_runtime is not None and skill_scope is not None:
+                    visible = self._skill_runtime.visible_tools(
+                        skill_scope,
+                        frozenset(definition.name for definition in definitions),
+                    )
+                    definitions = tuple(
+                        definition for definition in definitions if definition.name in visible
                     )
                 advertised_names = frozenset(definition.name for definition in definitions)
                 model_request = AgentModelRequest(
@@ -295,8 +336,15 @@ class AgentLoop:
                                 if context_transaction is not None
                                 else None
                             ),
+                            active_skill_names=(
+                                self._skill_runtime.candidate_active_names(skill_scope)
+                                if self._skill_runtime is not None and skill_scope is not None
+                                else ()
+                            ),
+                            skill_scope=skill_scope,
                         )
                     )
+                    completed = True
                     yield FinalResponseEvent(assistant_message)
                     return
 
@@ -343,6 +391,7 @@ class AgentLoop:
                                 self._permission_session,
                                 allowed_access=allowed_access,
                                 plan_only=mode is AgentMode.PLAN_ONLY,
+                                skill_scope=skill_scope,
                             )
                         )
                         if decision.action is PermissionAction.ALLOW:
@@ -355,6 +404,15 @@ class AgentLoop:
                                 decision,
                             )
                             choice = await turn.run_child(turn.consume_approval())
+                            if (
+                                choice is not ApprovalChoice.DENY
+                                and decision.reason_code == "skill_activation_approval"
+                                and self._skill_runtime is not None
+                                and skill_scope is not None
+                            ):
+                                name = str(decision.subject.normalized_arguments["name"])
+                                snapshot = self._skill_runtime.load_current(name)
+                                self._skill_runtime.approve_activation(skill_scope, snapshot)
                             if choice is ApprovalChoice.ALLOW_SESSION and decision.allow_session:
                                 self._permission_session.grant(decision.subject.session_key)
                                 continue
@@ -478,6 +536,8 @@ class AgentLoop:
             )
         finally:
             exposure.clear()
+            if not completed and self._skill_runtime is not None and skill_scope is not None:
+                self._skill_runtime.discard_task(skill_scope)
 
     @staticmethod
     def _finish_error(

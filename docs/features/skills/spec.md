@@ -1,6 +1,6 @@
 # YCode Agent Skills Spec
 
-> 状态：待批准
+> 状态：修订已批准（2026-08-10）
 
 ## 背景
 
@@ -17,7 +17,7 @@ Agent 按需使用。
 Skill 可以在主会话内持续工作，也可以在隔离上下文中执行并只返回最终交接结果。
 
 同时，Skill 需要与现有命令、工具、权限、上下文和会话边界协同，并支持从用户提供的
-HTTPS ZIP 地址安全安装到当前项目。
+公开 HTTPS Skill 来源地址安全安装到当前项目。
 
 ## 目标
 
@@ -30,7 +30,8 @@ HTTPS ZIP 地址安全安装到当前项目。
 - 分离工具可见白名单和任务级预批准工具，同时保持现有模式、权限和执行器安全边界。
 - 支持 Skill 嵌套调用，并限制循环和最大深度。
 - 提供 Skill 状态查看、详情、停用、重新扫描和对话清空能力。
-- 支持 Agent 通过内置安装工具，从公开 HTTPS ZIP 安全安装单个标准 Skill。
+- 支持 Agent 通过内置安装工具，从直接 ZIP、skills.sh 详情页、GitHub tree 目录或原始
+  `SKILL.md` URL 安全安装单个标准 Skill。
 - 支持调用时重新读取源文件，并在显式重新扫描后更新目录、状态和 Slash Command。
 - 以普通外部 Skill 形式提供 `commit`、`review`、`test` 三个生产力样板，不为它们
   编写专用内部流程。
@@ -164,12 +165,15 @@ Skill。
 - `Grep` → `grep`
 - `ToolSearch` → `tool_search`
 
-本期不支持 `Bash(git:*)` 等参数级表达式。
+本期不执行 `Bash(git:*)` 等参数级授权表达式。这类表达式不授予预批准权限，但不使
+Skill 整体不可用；`/skills show` 必须显示降级警告，Skill 仍可通过映射后的普通工具并
+遵循原有权限流程执行对应命令。同一 `allowed-tools` 中可识别的普通工具名称继续生效。
 
 ### F11：任务级预批准
 
-标准 `allowed-tools` 表示本次 Skill 任务内免人工审批的工具集合，必须属于当前可见工具
-集合。
+标准 `allowed-tools` 中可识别的普通工具名称表示本次 Skill 任务内免人工审批的工具集合，
+必须属于当前可见工具集合。未声明 `allowed-tools` 或只声明不支持的参数级表达式时不获得
+预批准权限。
 
 预批准只由本次实际调用的 Skill 及其嵌套 Skill 贡献，并在任务完成、失败或取消后立即
 清除。以前激活但本次没有再次调用的共享 Skill 不贡献预批准权限。
@@ -271,17 +275,26 @@ Skill 可以包含 `scripts/`、`references/`、`assets/` 及其他标准随附�
 
 ### F20：远程安装工具
 
-系统提供模型可调用的 `install_skill` 工具。工具接收公开 HTTPS ZIP URL，并始终要求
-人工审批。
+系统提供模型可调用的 `install_skill` 工具。工具接收公开 HTTPS Skill 来源 URL，并始终
+要求人工审批。支持以下来源：
 
-ZIP 必须：
+- 只包含一个 Skill 顶层目录的直接 ZIP URL；
+- `https://skills.sh/<owner>/<repo>/<skill>` 形式的 Skill 详情页；
+- 指向单个 Skill 目录的公开 GitHub `tree` URL；
+- 指向原始 `SKILL.md` 内容的公开 HTTPS URL。
+
+skills.sh 与 GitHub tree 来源安装目标目录中的 `SKILL.md` 及随附资源。原始 `SKILL.md`
+来源只安装该文件，不推测或抓取未明确提供的相邻资源。安装器根据 URL 类型选择解析器，
+不得把普通 HTML 页面直接当作 ZIP。
+
+ZIP 与目录来源必须：
 
 - 下载体积和解压后总量均不超过 30 MB；
 - 只包含一个顶层 Skill 目录；
 - 顶层目录名与 `SKILL.md` 的 `name` 一致；
 - 不包含绝对路径、目录越界、符号链接或 Junction。
 
-安装过程先在临时区域完整下载、解压和校验，再原子写入
+安装过程先在临时区域完整解析来源、下载、构造和校验，再原子写入
 `.ycode/skills/<name>/`。同名 Skill 已存在时拒绝覆盖。
 
 安装成功后立即刷新目录和 Slash Command，但不自动激活或执行 Skill。合法包若因模型、
@@ -289,10 +302,12 @@ ZIP 必须：
 
 ### F21：安装范围
 
-`install_skill` 只支持公开 HTTPS ZIP：
+`install_skill` 只支持上述公开 HTTPS 来源：
 
 - 不支持认证 Header、URL 内凭据或私有仓库认证；
-- 不支持 Git clone；
+- GitHub 与 skills.sh 只允许解析并下载单个明确 Skill，不执行 Git clone，不安装整个仓库；
+- 所有重定向、解析出的下载地址和文件地址都必须重新通过公开 HTTPS 校验；
+- 单次来源解析、下载内容及最终构造目录的总量均不得超过 30 MB；
 - 不支持市场查询、版本选择、更新或覆盖安装；
 - 安装失败不得留下半安装目录。
 
@@ -330,7 +345,8 @@ ZIP 必须：
 - **N2：标准兼容性**  
   不包含 YCode 扩展字段的合法 Anthropic Agent Skill 必须能够直接发现、安装和运行。
   YCode 扩展只能位于标准允许的 `metadata` 中，不能破坏 Skill 在其他兼容 Agent 中的
-  基本可读性。
+  基本可读性。标准 `allowed-tools` 中本期不支持的参数级表达式只能安全降级为普通权限
+  流程，不能导致整个 Skill 不可用。
 
 - **N3：确定性**  
   相同项目内容必须产生稳定的 Skill 目录顺序、激活顺序、工具集合、命令帮助和补全
@@ -390,14 +406,16 @@ ZIP 必须：
 - 不扫描或安装用户级 Skill；`%USERPROFILE%/.ycode/skills/` 列为待开发内容。
 - 不扫描父目录、子项目或嵌套 `.ycode/skills/`；本期只使用当前项目根目录。
 - 不支持 `.ycode/skills/<name>.md` 等松散单文件格式。
-- 不支持一个 ZIP 安装多个 Skill，也不支持 `SKILL.md` 直接位于 ZIP 根目录。
+- 不支持一个来源安装多个 Skill，也不支持 `SKILL.md` 直接位于 ZIP 根目录。
 - 不提供 Skill 市场、搜索、发布、推荐、签名、版本管理、自动更新或覆盖安装。
 - 不支持私有 URL、认证 Header、URL 凭据、Git 仓库克隆或本地归档安装。
+- 不从 skills.sh 搜索、推荐或选择 Skill；只解析用户明确提供的单个详情页。
+- 原始 `SKILL.md` URL 不自动猜测或下载相邻的 `scripts/`、`references/`、`assets/` 等资源。
 - 不提供 `/skills uninstall`；用户可以删除对应项目目录后执行 `/skills reload`。
 - 不自动监视文件系统变化；新增、删除和重命名通过 reload 生效，已有 Skill 在调用时
   重读。
 - 不支持 `$ARGUMENTS`、`$0`、动态 Shell 注入或其他 Claude Code 专属正文扩展。
-- 不支持 `Bash(git:*)` 等参数级工具授权表达式。
+- 不执行 `Bash(git:*)` 等参数级工具授权表达式；对应命令仍可通过普通工具与权限流程运行。
 - 不允许 Skill 定义 API Key、`base_url`、新 Provider 或新的权限模式。
 - 不实现 Skill 专属结构化工具、私有子进程工具协议、Skill 内 MCP Server 或插件运行时。
 - 不把 `scripts/` 自动注册成模型工具；脚本仅通过现有命令工具按 SOP 执行。
@@ -450,11 +468,13 @@ ZIP 必须：
 
 - **AC10（F10）工具可见白名单**  
   单个和多个共享 Skill 激活时，模型工具列表分别等于声明白名单及其并集，并继续受当前
-  模式限制。标准名称和 YCode 原生名称映射到相同工具；未知名称使 Skill 不可用。
+  模式限制。标准名称和 YCode 原生名称映射到相同工具；未知普通名称使 Skill 不可用。
+  `Bash(git:*)` 等参数级表达式产生可见警告但不使 Skill 不可用，也不授予预批准。
 
 - **AC11（F11、F12）预批准与自动激活审批**  
-  显式 Skill 任务中，`allowed-tools` 免除本任务人工审批；任务结束后授权消失。Agent
-  自动或嵌套加载带预批准工具的 Skill 时先请求确认，拒绝后不授予权限且父任务可以继续。
+  显式 Skill 任务中，`allowed-tools` 内可识别的普通工具免除本任务人工审批；任务结束后
+  授权消失。Agent 自动或嵌套加载带这些预批准工具的 Skill 时先请求确认，拒绝后不授予
+  权限且父任务可以继续。仅含不支持参数级表达式的 Skill 不因该字段额外请求审批。
 
 - **AC12（F11、F13）底层权限优先**  
   预批准工具仍不能突破安全拒绝、工作区边界或 plan-only。plan-only 中加载和执行 Skill
@@ -477,13 +497,15 @@ ZIP 必须：
   Skill 产生告警但不阻止恢复；任务级预批准和隔离 Skill 状态不恢复。
 
 - **AC17（F20、F21）URL 安装成功**  
-  Agent 调用 `install_skill` 时显示 HTTPS URL 并请求审批。批准后，一个符合严格顶层目录
-  规则且不超过 30 MB 的 ZIP 被原子安装到项目目录，立即出现在 `/skills`、帮助和补全中，
-  但不会自动执行。
+  Agent 调用 `install_skill` 时显示用户提供的 HTTPS URL 并请求审批。批准后，直接 ZIP、
+  skills.sh 单 Skill 详情页、GitHub tree 单 Skill 目录和原始 `SKILL.md` URL 均能解析为
+  一个不超过 30 MB 的标准 Skill 并原子安装，立即出现在 `/skills`、帮助和补全中，但不会
+  自动执行。原始 `SKILL.md` 来源只安装该文件。
 
 - **AC18（F20、F21）URL 安装失败与不可用状态**  
-  HTTP 失败、超限、损坏 ZIP、多个顶层目录、名称不匹配、路径越界、链接或同名目录不会
-  留下半安装内容。结构合法但依赖缺失的 Skill 完成安装，并显示“已安装但不可用”及原因。
+  不支持的网页、来源解析失败、HTTP 失败、非公开解析结果、超限、损坏 ZIP、多个顶层
+  目录、名称不匹配、路径越界、链接或同名目录不会留下半安装内容。结构合法但依赖缺失
+  的 Skill 完成安装，并显示“已安装但不可用”及原因。
 
 - **AC19（F22）动态命令冲突**  
   Skill 与内置命令冲突时内置命令行为不变；两个规范化名称冲突时不会随机覆盖。reload

@@ -14,6 +14,7 @@ from ycode.errors import YCodeError
 SESSION_FORMAT_VERSION = 1
 _SESSION_ID = re.compile(r"^\d{8}-\d{6}-[^<>:\"/\\|?*\x00-\x1f.][^<>:\"/\\|?*\x00-\x1f]*$")
 _TURN_ID = re.compile(r"^(?!000000)\d{6}$")
+_SKILL_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 
 
 def require_utc(value: datetime, name: str = "时间") -> None:
@@ -100,7 +101,31 @@ class ContextCheckpointRecord:
         object.__setattr__(self, "retained_history", retained)
 
 
-type SessionRecord = SessionMessageRecord | TurnCommitRecord | ContextCheckpointRecord
+@dataclass(frozen=True, slots=True)
+class SkillStateRecord:
+    version: int
+    session_id: str
+    covered_turn_id: str
+    timestamp: datetime
+    active_skill_names: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.version != SESSION_FORMAT_VERSION:
+            raise ValueError("会话记录版本无效")
+        require_session_id(self.session_id)
+        require_turn_id(self.covered_turn_id)
+        require_utc(self.timestamp)
+        names = tuple(self.active_skill_names)
+        if any(not _SKILL_NAME.fullmatch(name) or "--" in name for name in names):
+            raise ValueError("Skill 状态包含非法名称")
+        if len(set(names)) != len(names):
+            raise ValueError("Skill 状态名称重复")
+        object.__setattr__(self, "active_skill_names", tuple(sorted(names)))
+
+
+type SessionRecord = (
+    SessionMessageRecord | TurnCommitRecord | ContextCheckpointRecord | SkillStateRecord
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +160,7 @@ class SessionSnapshot:
     last_turn_id: str | None
     last_active_at: datetime
     warnings: tuple[SessionWarning, ...] = ()
+    active_skill_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         require_session_id(self.session_id)
@@ -145,6 +171,10 @@ class SessionSnapshot:
         if self.last_turn_id is not None:
             require_turn_id(self.last_turn_id)
         require_utc(self.last_active_at)
+        names = tuple(self.active_skill_names)
+        if any(not _SKILL_NAME.fullmatch(name) or "--" in name for name in names):
+            raise ValueError("会话快照包含非法 Skill 名称")
+        object.__setattr__(self, "active_skill_names", tuple(sorted(set(names))))
 
 
 @dataclass(frozen=True, slots=True)

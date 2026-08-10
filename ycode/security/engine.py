@@ -3,7 +3,11 @@
 import fnmatch
 import json
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ycode.skills.models import SkillTaskScope
+    from ycode.skills.runtime import SkillRuntime
 
 from ycode.core.messages import ToolCallBlock, freeze_json, thaw_json
 from ycode.security.models import (
@@ -33,12 +37,14 @@ class PermissionEngine:
         resolver: WorkspacePathResolver,
         config: SecurityConfig,
         command_checker: PowerShellSafetyChecker,
+        skill_runtime: "SkillRuntime | None" = None,
     ) -> None:
         self._registry = registry
         self._resolver = resolver
         self._config = config
         self._command_checker = command_checker
         self._plan_only_mcp_tools = frozenset(config.plan_only.allow_mcp_tools)
+        self._skill_runtime = skill_runtime
 
     async def evaluate(
         self,
@@ -47,6 +53,7 @@ class PermissionEngine:
         *,
         allowed_access: frozenset[ToolAccess],
         plan_only: bool = False,
+        skill_scope: "SkillTaskScope | None" = None,
     ) -> PermissionDecision:
         try:
             tool = self._registry.get(call.name)
@@ -90,19 +97,31 @@ class PermissionEngine:
                     _action_message(rule.action, f"项目规则 {rule.id}"),
                     rule.id,
                 )
+            if call.name == "install_skill":
+                return PermissionDecision(
+                    PermissionAction.ASK,
+                    subject,
+                    "skill_install_approval",
+                    "安装 Skill 将写入项目目录，需要本次人工确认。",
+                    allow_session=False,
+                )
+            activation = self._skill_activation_decision(call, subject, skill_scope)
+            if activation is not None:
+                return activation
             if (
                 plan_only
                 and tool.definition.name in self._plan_only_mcp_tools
                 and tool.definition.access is ToolAccess.UNKNOWN
                 and tool.definition.defer_loading
             ):
-                return PermissionDecision(
+                decision = PermissionDecision(
                     PermissionAction.ASK,
                     subject,
                     "plan_only_mcp_approval",
                     "plan-only 模式下 MCP 工具每次都需要确认。",
                     allow_session=False,
                 )
+                return self._apply_skill_preapproval(decision, call.name, skill_scope)
             if session.allows(subject.session_key):
                 return PermissionDecision(
                     PermissionAction.ALLOW,
@@ -111,20 +130,22 @@ class PermissionEngine:
                     "本会话已允许相同工具调用。",
                 )
             if rule is not None:
-                return PermissionDecision(
+                decision = PermissionDecision(
                     rule.action,
                     subject,
                     "project_rule",
                     _action_message(rule.action, f"项目规则 {rule.id}"),
                     rule.id,
                 )
+                return self._apply_skill_preapproval(decision, call.name, skill_scope)
             action = _mode_action(session.mode, tool.definition.access)
-            return PermissionDecision(
+            decision = PermissionDecision(
                 action,
                 subject,
                 f"mode_{session.mode.value}",
                 _action_message(action, f"{session.mode.value} 权限模式"),
             )
+            return self._apply_skill_preapproval(decision, call.name, skill_scope)
         except (ToolArgumentValidationError, ToolError, TypeError, ValueError, KeyError):
             return self._fallback_denial(
                 call,
@@ -137,6 +158,58 @@ class PermissionEngine:
                 "permission_internal_error",
                 "权限检查失败，已拒绝执行。",
             )
+
+    def _skill_activation_decision(
+        self,
+        call: ToolCallBlock,
+        subject: PermissionSubject,
+        scope: "SkillTaskScope | None",
+    ) -> PermissionDecision | None:
+        if call.name != "load_skill" or self._skill_runtime is None or scope is None:
+            return None
+        from ycode.skills.models import SkillInvocationSource
+
+        snapshot = self._skill_runtime.load_current(str(subject.normalized_arguments["name"]))
+        source = (
+            SkillInvocationSource.NESTED if scope.call_stack else SkillInvocationSource.AUTOMATIC
+        )
+        if not self._skill_runtime.needs_activation_approval(snapshot, source):
+            return None
+        tools = ", ".join(sorted(snapshot.config.allowed_tools))
+        approval_subject = PermissionSubject(
+            call=subject.call,
+            normalized_arguments=subject.normalized_arguments,
+            session_key=subject.session_key,
+            approval_summary=f"Skill: {snapshot.name}\n预授权工具: {tools}",
+        )
+        return PermissionDecision(
+            PermissionAction.ASK,
+            approval_subject,
+            "skill_activation_approval",
+            "Skill 请求为本次任务预授权工具。",
+            allow_session=False,
+        )
+
+    @staticmethod
+    def _apply_skill_preapproval(
+        decision: PermissionDecision,
+        tool_name: str,
+        scope: "SkillTaskScope | None",
+    ) -> PermissionDecision:
+        if (
+            decision.action is not PermissionAction.ASK
+            or scope is None
+            or tool_name not in scope.preapproved_tools
+        ):
+            return decision
+        return PermissionDecision(
+            PermissionAction.ALLOW,
+            decision.subject,
+            "skill_preapproval",
+            "当前 Skill 已为本次任务预授权此工具。",
+            decision.rule_id,
+            decision.allow_session,
+        )
 
     def _normalize(
         self,

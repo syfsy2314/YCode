@@ -11,6 +11,7 @@ from ycode.context.models import ContextCommit
 from ycode.core.events import TokenUsage
 from ycode.core.messages import ChatMessage
 from ycode.security.models import ApprovalChoice
+from ycode.skills.models import SkillTaskScope
 
 
 class AgentMode(StrEnum):
@@ -52,6 +53,8 @@ class AgentTurnResult:
     error_message: str = ""
     usage: TokenUsage = field(default_factory=TokenUsage)
     context_commit: ContextCommit | None = None
+    active_skill_names: tuple[str, ...] = ()
+    skill_scope: SkillTaskScope | None = None
 
     def __init__(
         self,
@@ -62,6 +65,8 @@ class AgentTurnResult:
         error_message: str = "",
         usage: TokenUsage | None = None,
         context_commit: ContextCommit | None = None,
+        active_skill_names: Sequence[str] = (),
+        skill_scope: SkillTaskScope | None = None,
         *,
         messages: Sequence[ChatMessage] | None = None,
     ) -> None:
@@ -81,6 +86,8 @@ class AgentTurnResult:
         object.__setattr__(self, "error_message", error_message)
         object.__setattr__(self, "usage", usage if usage is not None else TokenUsage())
         object.__setattr__(self, "context_commit", context_commit)
+        object.__setattr__(self, "active_skill_names", tuple(sorted(set(active_skill_names))))
+        object.__setattr__(self, "skill_scope", skill_scope)
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -103,6 +110,10 @@ class AgentTurnResult:
 
         if self.termination is not AgentTermination.COMPLETED and self.context_commit is not None:
             raise ValueError("非正常完成不能携带上下文提交")
+        if self.termination is not AgentTermination.COMPLETED and (
+            self.active_skill_names or self.skill_scope is not None
+        ):
+            raise ValueError("非正常完成不能携带 Skill 候选状态")
 
         if self.termination is AgentTermination.ERROR:
             if not self.error_code or not self.error_message:

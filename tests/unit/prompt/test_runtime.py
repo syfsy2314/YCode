@@ -130,3 +130,48 @@ def test_runtime_rejects_wrong_supplement_scope() -> None:
         runtime.set_session_supplement(request_item)
     with pytest.raises(ValueError, match="request"):
         runtime.begin_turn("agent", (session_item,))
+
+
+def test_runtime_skill_catalog_contains_only_sorted_name_and_description() -> None:
+    runtime = PromptRuntimeContext()
+
+    runtime.set_skill_catalog(
+        (
+            ("zeta", "Last skill"),
+            ("alpha", "First skill"),
+        )
+    )
+
+    supplement = next(
+        item for item in runtime.session_supplements if item.kind is SupplementKind.SKILL_CATALOG
+    )
+    assert supplement.scope is SupplementScope.SESSION
+    assert supplement.content.index("alpha") < supplement.content.index("zeta")
+    assert "SOP" not in supplement.content
+
+
+def test_runtime_replaces_and_clears_aggregated_skill_instructions() -> None:
+    runtime = PromptRuntimeContext()
+    runtime.set_skill_instructions((("review", "SECRET SOP"), ("commit", "COMMIT SOP")))
+
+    supplement = next(
+        item
+        for item in runtime.session_supplements
+        if item.kind is SupplementKind.SKILL_INSTRUCTIONS
+    )
+    assert supplement.content.index("commit") < supplement.content.index("review")
+    assert "SECRET SOP" in supplement.content
+
+    runtime.set_skill_instructions((("commit", "UPDATED SOP"),))
+    replacement = next(
+        item
+        for item in runtime.session_supplements
+        if item.kind is SupplementKind.SKILL_INSTRUCTIONS
+    )
+    assert "UPDATED SOP" in replacement.content
+    assert "SECRET SOP" not in replacement.content
+
+    runtime.set_skill_instructions(())
+    assert all(
+        item.kind is not SupplementKind.SKILL_INSTRUCTIONS for item in runtime.session_supplements
+    )

@@ -107,6 +107,25 @@ def build_command_runtime(
         await controller.resume_session(session_id)
         await controller.refresh_status()
 
+    async def skills_handler(invocation: CommandInvocation, controller: UIController) -> None:
+        parts = invocation.arguments.split()
+        if not parts:
+            await controller.show_skills()
+        elif len(parts) == 1 and parts[0] != "reload":
+            await controller.show_skill(parts[0])
+        elif parts == ["reload"]:
+            await controller.reload_skills()
+        elif len(parts) == 2 and parts[0] == "deactivate":
+            await controller.deactivate_skill(parts[1])
+        else:
+            raise CommandUsageError
+        await controller.refresh_status()
+
+    async def clear_handler(invocation: CommandInvocation, controller: UIController) -> None:
+        _no_arguments(invocation)
+        await controller.clear_session()
+        await controller.refresh_status()
+
     definitions = (
         CommandDefinition(
             "help",
@@ -149,6 +168,18 @@ def build_command_runtime(
             CommandKind.STATE,
             "<session-id>",
             resume_handler,
+        ),
+        CommandDefinition(
+            "skills",
+            (),
+            "查看或管理项目 Skill",
+            "/skills [name|reload|deactivate <name>]",
+            CommandKind.STATE,
+            "[name|reload|deactivate <name>]",
+            skills_handler,
+        ),
+        CommandDefinition(
+            "clear", (), "清空当前会话", "/clear", CommandKind.STATE, "", clear_handler
         ),
     )
     for definition in (*definitions, *tuple(extra_definitions)):

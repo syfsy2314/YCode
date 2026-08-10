@@ -12,6 +12,7 @@ from ycode.session.models import (
     SessionSnapshot,
     SessionStorageError,
     SessionWarning,
+    SkillStateRecord,
     TurnCommitRecord,
 )
 
@@ -27,5 +28,6 @@ __all__ = [
     "SessionSnapshot",
     "SessionStorageError",
     "SessionWarning",
+    "SkillStateRecord",
     "TurnCommitRecord",
 ]

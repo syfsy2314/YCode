@@ -22,6 +22,7 @@ from ycode.session.models import (
     SessionSnapshot,
     SessionStorageError,
     SessionWarning,
+    SkillStateRecord,
     TurnCommitRecord,
     require_session_id,
 )
@@ -69,13 +70,35 @@ class SessionManager:
         messages: Sequence[TurnMessage],
         *,
         checkpoint: tuple[ConversationMemory, tuple[ChatMessage, ...]] | None = None,
+        active_skill_names: Sequence[str] | None = None,
     ) -> SessionCommit:
         items = tuple(messages)
         if not items or any(not isinstance(item, TurnMessage) for item in items):
             raise ValueError("会话提交必须包含带时间消息")
         if not _valid_complete_turn(tuple(item.message for item in items)):
             raise ValueError("会话提交消息不是完整结构回合")
-        return await asyncio.to_thread(self._commit_turn, items, checkpoint)
+        skill_names = None if active_skill_names is None else tuple(active_skill_names)
+        return await asyncio.to_thread(self._commit_turn, items, checkpoint, skill_names)
+
+    async def append_skill_state(
+        self,
+        active_skill_names: Sequence[str],
+    ) -> SkillStateRecord:
+        if self._active_session_id is None or self._last_turn_number < 1:
+            raise SessionStorageError("当前没有可写入 Skill 状态的会话")
+        record = SkillStateRecord(
+            SESSION_FORMAT_VERSION,
+            self._active_session_id,
+            f"{self._last_turn_number:06d}",
+            self._utc_now(),
+            tuple(active_skill_names),
+        )
+        await asyncio.to_thread(
+            self._append_lines,
+            self._path(self._active_session_id),
+            (encode_record(record),),
+        )
+        return record
 
     async def append_checkpoint(
         self,
@@ -129,6 +152,7 @@ class SessionManager:
         self,
         messages: tuple[TurnMessage, ...],
         checkpoint: tuple[ConversationMemory, tuple[ChatMessage, ...]] | None,
+        active_skill_names: tuple[str, ...] | None,
     ) -> SessionCommit:
         session_id = self._active_session_id
         if session_id is None:
@@ -159,6 +183,18 @@ class SessionManager:
                         self._utc_now(),
                         memory,
                         retained,
+                    )
+                )
+            )
+        if active_skill_names is not None:
+            lines.append(
+                encode_record(
+                    SkillStateRecord(
+                        SESSION_FORMAT_VERSION,
+                        session_id,
+                        turn_id,
+                        self._utc_now(),
+                        active_skill_names,
                     )
                 )
             )
@@ -205,7 +241,9 @@ class SessionManager:
         history: list[ChatMessage] = []
         pending: list[SessionMessageRecord] = []
         pending_checkpoint: ContextCheckpointRecord | None = None
+        pending_skill_state: SkillStateRecord | None = None
         memory: ConversationMemory | None = None
+        active_skill_names: tuple[str, ...] = ()
         last_turn_id: str | None = None
         last_active_at: datetime | None = None
         safe_offset = 0
@@ -247,6 +285,20 @@ class SessionManager:
                         else:
                             structural_error = True
                             break
+                    elif isinstance(record, SkillStateRecord):
+                        if pending and record.covered_turn_id == expected_turn:
+                            pending_skill_state = record
+                        elif (
+                            not pending
+                            and last_turn_id is not None
+                            and record.covered_turn_id == last_turn_id
+                        ):
+                            active_skill_names = record.active_skill_names
+                            last_active_at = record.timestamp
+                            safe_offset = end_offset
+                        else:
+                            structural_error = True
+                            break
                     else:
                         messages = tuple(item.message for item in pending)
                         if (
@@ -263,14 +315,22 @@ class SessionManager:
                             history.extend(messages)
                         last_turn_id = record.turn_id
                         last_active_at = record.timestamp
+                        if pending_skill_state is not None:
+                            active_skill_names = pending_skill_state.active_skill_names
                         safe_offset = end_offset
                         pending.clear()
                         pending_checkpoint = None
+                        pending_skill_state = None
                 file_size = stream.tell()
         except OSError as error:
             raise SessionStorageError("会话读取失败") from error
 
-        if structural_error or pending or file_size > safe_offset:
+        if (
+            structural_error
+            or pending
+            or pending_skill_state is not None
+            or file_size > safe_offset
+        ):
             try:
                 with path.open("r+b") as stream:
                     stream.truncate(safe_offset)
@@ -286,6 +346,7 @@ class SessionManager:
             last_turn_id,
             last_active_at,
             tuple(warnings),
+            active_skill_names,
         )
 
     def _list_sessions(self) -> tuple[SessionDescriptor, ...]:

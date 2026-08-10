@@ -717,6 +717,7 @@ def test_windows_terminal_plan_mode_and_tool_filter(
         "read_file",
         "glob",
         "grep",
+        "load_skill",
     ]
     assert any(
         message["role"] == "system"

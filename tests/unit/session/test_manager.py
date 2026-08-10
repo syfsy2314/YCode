@@ -63,6 +63,38 @@ async def test_commit_appends_messages_then_boundary_and_flushes(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_commit_and_restore_skill_state_with_turn(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path, clock=lambda: NOW)
+    commit = await manager.commit_turn(
+        _turn("Skill turn"),
+        active_skill_names=("review", "commit"),
+    )
+
+    snapshot = await manager.load(commit.session_id)
+
+    assert snapshot.active_skill_names == ("commit", "review")
+
+
+@pytest.mark.asyncio
+async def test_append_skill_state_updates_existing_committed_session(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path, clock=lambda: NOW)
+    commit = await manager.commit_turn(_turn("Skill turn"), active_skill_names=("review",))
+
+    await manager.append_skill_state(())
+    snapshot = await manager.load(commit.session_id)
+
+    assert snapshot.active_skill_names == ()
+
+
+@pytest.mark.asyncio
+async def test_append_skill_state_requires_committed_session(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path, clock=lambda: NOW)
+
+    with pytest.raises(SessionStorageError, match="没有可写入"):
+        await manager.append_skill_state(("review",))
+
+
+@pytest.mark.asyncio
 async def test_load_skips_bad_json_and_repairs_incomplete_tail(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path, clock=lambda: NOW)
     commit = await manager.commit_turn(_turn())

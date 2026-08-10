@@ -22,6 +22,7 @@ from ycode.session.codec import (
 from ycode.session.models import (
     ContextCheckpointRecord,
     SessionMessageRecord,
+    SkillStateRecord,
     TurnCommitRecord,
 )
 
@@ -62,6 +63,7 @@ def test_record_codec_round_trips_all_record_types() -> None:
             (message,),
         ),
         TurnCommitRecord(1, SESSION_ID, "000001", NOW, 1),
+        SkillStateRecord(1, SESSION_ID, "000001", NOW, ("review", "commit")),
     )
     assert tuple(decode_record(encode_record(record)) for record in records) == records
 

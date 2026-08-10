@@ -4,10 +4,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
-from ycode.agent import AgentLoop, PlainChatRunner
+import httpx
+
+from ycode.agent import AgentLoop, AgentMode, PlainChatRunner
 from ycode.commands import CommandDefinitionError, build_command_runtime
 from ycode.config.discovery import discover_config
-from ycode.config.loader import load_config
+from ycode.config.loader import load_config, load_named_anthropic_provider
 from ycode.config.models import ProviderConfig, ProviderProtocol
 from ycode.context import (
     ContextArtifactStore,
@@ -34,7 +36,13 @@ from ycode.security import (
 )
 from ycode.session.chat import ChatSession
 from ycode.session.manager import SessionManager
+from ycode.skills import SkillCatalog, SkillLoader, SkillRuntime, SkillValidationEnvironment
+from ycode.skills.commands import build_skill_command_definitions
+from ycode.skills.context import SkillContextBuilder
+from ycode.skills.installer import SkillInstaller
+from ycode.skills.isolated import IsolatedSkillRunner, ScopedSkillConversationRunner
 from ycode.tools import ToolContext, ToolExecutor, ToolScheduler, create_builtin_registry
+from ycode.tools.builtin import InstallSkillTool, LoadSkillTool
 from ycode.tools.builtin.tool_search import ToolSearchTool
 from ycode.tools.command import PowerShellCommandRunner
 from ycode.tools.paths import WorkspacePathResolver
@@ -65,6 +73,7 @@ async def run_app(
     session: ChatSession | None = None
     command_runtime = None
     has_enabled_mcp = False
+    skill_http_client: httpx.AsyncClient | None = None
     try:
         if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
             try:
@@ -92,8 +101,52 @@ async def run_app(
             if config.mcp.servers or config.mcp.issues:
                 manager = McpManager(config.mcp, registry, config.redactor)
                 has_enabled_mcp = any(server.enabled for server in config.mcp.servers)
-                if has_enabled_mcp:
-                    registry.register(ToolSearchTool(registry))
+            builtin_commands = frozenset(
+                definition.name for definition in command_runtime.registry.definitions
+            )
+            provider_names = frozenset(
+                entry.name
+                for entry in config.app.providers
+                if entry.as_mapping().get("protocol") == ProviderProtocol.ANTHROPIC
+            )
+            skill_environment = SkillValidationEnvironment(
+                frozenset(
+                    {
+                        *(tool.definition.name for tool in registry),
+                        "load_skill",
+                        "install_skill",
+                        *(("tool_search",) if has_enabled_mcp else ()),
+                    }
+                ),
+                provider_names,
+                builtin_commands,
+            )
+            skill_catalog = SkillCatalog(workspace, SkillLoader(), skill_environment)
+            skill_catalog.commit(skill_catalog.scan_candidate())
+            skill_runtime = SkillRuntime(skill_catalog, prompt_runtime, session_manager)
+            command_runtime.registry.replace_dynamic(
+                build_skill_command_definitions(tuple(skill_catalog.state.available.values()))
+            )
+
+            async def refresh_skills() -> None:
+                candidate = skill_runtime.scan_catalog_candidate()
+                skill_runtime.commit_catalog(candidate)
+                command_runtime.registry.replace_dynamic(
+                    build_skill_command_definitions(tuple(candidate.available.values()))
+                )
+
+            skill_http_client = httpx.AsyncClient(follow_redirects=False)
+            installer = SkillInstaller(
+                workspace,
+                skill_http_client,
+                SkillLoader(),
+                skill_environment,
+                refresh_skills,
+            )
+            registry.register(LoadSkillTool(skill_runtime))
+            registry.register(InstallSkillTool(installer))
+            if has_enabled_mcp:
+                registry.register(ToolSearchTool(registry))
             security_result = load_security_config(workspace, registry)
             if manager is not None:
                 manager.set_security_warnings(security_result.warnings)
@@ -102,6 +155,17 @@ async def run_app(
                     def refresh_security_warnings() -> None:
                         refreshed = load_security_config(workspace, registry)
                         manager.set_security_warnings(refreshed.warnings)
+                        updated_environment = SkillValidationEnvironment(
+                            frozenset(tool.definition.name for tool in registry),
+                            provider_names,
+                            builtin_commands,
+                        )
+                        skill_catalog.set_environment(updated_environment)
+                        candidate = skill_runtime.scan_catalog_candidate()
+                        skill_runtime.commit_catalog(candidate)
+                        command_runtime.registry.replace_dynamic(
+                            build_skill_command_definitions(tuple(candidate.available.values()))
+                        )
 
                     manager.add_startup_callback(refresh_security_warnings)
             permission_session = PermissionSession(security_result.config.mode)
@@ -110,7 +174,39 @@ async def run_app(
                 resolver,
                 security_result.config,
                 PowerShellSafetyChecker(workspace),
+                skill_runtime,
             )
+
+            def isolated_loop_factory(temp_provider, temp_prompt, scope):
+                loop = AgentLoop(
+                    temp_provider,
+                    registry,
+                    ToolScheduler(registry, ToolExecutor(registry)),
+                    build_builtin_prompt(),
+                    temp_prompt,
+                    EnvironmentCollector(workspace),
+                    ToolContext(workspace),
+                    permission_engine=permission_engine,
+                    permission_session=permission_session,
+                    plan_only_mcp_tools=frozenset(security_result.config.plan_only.allow_mcp_tools),
+                    skill_runtime=skill_runtime,
+                )
+                return ScopedSkillConversationRunner(loop, scope)
+
+            session_ref: dict[str, ChatSession] = {}
+            isolated_runner = IsolatedSkillRunner(
+                config.active_provider,
+                lambda name: load_named_anthropic_provider(config, name),
+                lambda item: cast(AgentChatProvider, provider_factory(item)),
+                isolated_loop_factory,
+                SkillContextBuilder(ConversationCompactor(cast(AgentChatProvider, provider))),
+                lambda: session_ref["session"].history if "session" in session_ref else (),
+                lambda: context_manager.memory if context_manager is not None else None,
+                lambda: (
+                    session_ref["session"].mode if "session" in session_ref else AgentMode.AGENT
+                ),
+            )
+            skill_runtime.set_isolated_executor(isolated_runner)
             runner = AgentLoop(
                 cast(AgentChatProvider, provider),
                 registry,
@@ -124,6 +220,7 @@ async def run_app(
                 plan_only_mcp_tools=frozenset(security_result.config.plan_only.allow_mcp_tools),
                 resource_manager=manager,
                 context_manager=context_manager,
+                skill_runtime=skill_runtime,
             )
         else:
             runner = PlainChatRunner(provider)
@@ -139,7 +236,9 @@ async def run_app(
                 memory_updater=MemoryUpdater(cast(AgentChatProvider, provider)),
                 startup_warnings=tuple(warning.message for warning in project_context.warnings),
                 command_runtime=command_runtime,
+                skill_runtime=skill_runtime,
             )
+            session_ref["session"] = session
             if continue_session:
                 try:
                     await session.restore()
@@ -152,15 +251,19 @@ async def run_app(
         ui = ui_factory(config.active_provider, session)
         await ui.run()
     finally:
-        if session is not None:
-            await session.close()
-        else:
-            try:
-                if manager is not None:
-                    await manager.close()
-            finally:
+        try:
+            if session is not None:
+                await session.close()
+            else:
                 try:
-                    await provider.close()
+                    if manager is not None:
+                        await manager.close()
                 finally:
-                    if context_manager is not None:
-                        await context_manager.close()
+                    try:
+                        await provider.close()
+                    finally:
+                        if context_manager is not None:
+                            await context_manager.close()
+        finally:
+            if skill_http_client is not None:
+                await skill_http_client.aclose()

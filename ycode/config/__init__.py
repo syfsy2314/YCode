@@ -2,7 +2,7 @@
 
 from ycode.config.discovery import discover_config, resolve_project_root
 from ycode.config.environment import EnvironmentResolver, SecretRedactor, load_project_dotenv
-from ycode.config.loader import load_config
+from ycode.config.loader import load_config, load_named_anthropic_provider
 from ycode.config.mcp import (
     HttpMcpServerConfig,
     LoadedAppConfig,
@@ -30,6 +30,7 @@ __all__ = [
     "discover_config",
     "load_mcp_servers",
     "load_config",
+    "load_named_anthropic_provider",
     "load_project_dotenv",
     "resolve_project_root",
 ]
