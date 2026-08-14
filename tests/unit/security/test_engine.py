@@ -173,6 +173,44 @@ async def test_normalizes_real_path_and_uses_exact_tool_session_key(
 
 
 @pytest.mark.asyncio
+async def test_prepare_keeps_hard_checks_separate_from_project_policy(tmp_path: Path) -> None:
+    (tmp_path / "notes.md").write_text("", encoding="utf-8")
+    engine = make_engine(
+        tmp_path,
+        config=SecurityConfig(
+            mode=PermissionMode.ALLOW,
+            rules=(SecurityRule(id="deny-read", action="deny", tool="read_file"),),
+        ),
+    )
+    preparation = await engine.prepare(
+        ToolCallBlock("read", "read_file", {"path": ".\\notes.md"}),
+        allowed_access=ALL_ACCESS,
+    )
+
+    assert preparation.denial is None
+    assert preparation.subject.normalized_arguments["path"] == "notes.md"
+    decision = engine.evaluate_policy(preparation, PermissionSession(PermissionMode.ALLOW))
+    assert decision.action is PermissionAction.DENY
+    assert decision.rule_id == "deny-read"
+
+
+@pytest.mark.asyncio
+async def test_prepare_returns_dangerous_command_as_hard_denial(tmp_path: Path) -> None:
+    engine = make_engine(
+        tmp_path,
+        checker=FakeChecker(CommandSafetyResult(False, "disk_damage", "禁止磁盘破坏。")),
+    )
+
+    preparation = await engine.prepare(
+        ToolCallBlock("run", "run_command", {"command": "danger"}),
+        allowed_access=ALL_ACCESS,
+    )
+
+    assert preparation.denial is not None
+    assert preparation.denial.reason_code == "hard_disk_damage"
+
+
+@pytest.mark.asyncio
 async def test_write_preview_is_bounded_but_run_command_remains_complete(
     tmp_path: Path,
 ) -> None:

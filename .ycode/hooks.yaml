@@ -1,0 +1,43 @@
+hooks:
+  # 当前 Agent 动作仅在终端打印占位信息，不会真正启动子 Agent。
+  - id: session-start-notice
+    enabled: true
+    event: session.start
+    once: true
+    action:
+      type: agent
+
+  # 在工具执行前拦截包含高风险关键词的命令，并将拒绝原因反馈给模型。
+  - id: block-destructive-command
+    enabled: false
+    event: tool.before_execute
+    conditions:
+      any:
+        tool.arguments.command:
+          regex: "(?i)(git reset --hard|remove-item.+-recurse)"
+    permission: deny
+    action:
+      type: agent
+
+  # 工具执行失败后，向下一次模型请求注入临时 System Reminder。
+  - id: review-tool-error
+    enabled: false
+    event: tool.after_execute
+    conditions:
+      all:
+        tool.result.is_error:
+          exact: true
+    action:
+      type: reminder
+      content: "工具 {{ tool.name }} 执行失败，请根据结果调整方案：{{ tool.result.content }}"
+
+  # Shell 示例默认禁用；启用后每个 YCode 会话仅异步执行一次。
+  - id: notify-turn-start
+    enabled: false
+    event: turn.start
+    once: true
+    async: true
+    timeout_seconds: 5
+    action:
+      type: shell
+      command: "echo YCode turn started: {{ turn.id }}"

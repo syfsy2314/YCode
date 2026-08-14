@@ -33,6 +33,7 @@ from ycode.context import (
 )
 from ycode.core import ChatMessage, StopReason, StreamEnd, TextDelta
 from ycode.errors import ProviderError
+from ycode.hooks import HookContextFactory, HookRule, HookRuntime
 from ycode.mcp.models import McpConnectionState, McpServerStatus, McpStatusReport
 from ycode.memory import MemoryStore, MemoryUpdater, MemoryUpdateStatus
 from ycode.prompt import PromptRuntimeContext
@@ -353,6 +354,30 @@ async def test_blank_input_and_idempotent_close() -> None:
     await session.close()
 
     assert provider.requests == []
+    assert provider.close_count == 1
+
+
+async def test_session_hook_start_notice_and_end_notice(tmp_path, capsys) -> None:
+    provider = FakeProvider([])
+    runtime = HookRuntime(
+        tuple(
+            HookRule.model_validate({"id": rule_id, "event": event, "action": {"type": "agent"}})
+            for rule_id, event in (("started", "session.start"), ("ended", "session.end"))
+        ),
+        tmp_path,
+    )
+    session = ChatSession(
+        PlainChatRunner(provider),
+        hook_runtime=runtime,
+        hook_context=HookContextFactory(tmp_path, "session-test"),
+    )
+
+    await session.start_hooks()
+    await session.close()
+    await session.close()
+
+    assert session.startup_warnings == ("子 Agent Hook 尚未实现：started",)
+    assert capsys.readouterr().out.count("hook: 子 Agent Hook 尚未实现：ended") == 1
     assert provider.close_count == 1
 
 

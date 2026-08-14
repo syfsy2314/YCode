@@ -3,8 +3,10 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Protocol
+from uuid import uuid4
 
 from ycode.agent.contracts import (
     AgentMode,
@@ -24,6 +26,7 @@ from ycode.agent.events import (
     ContextCompactedEvent,
     ContextCompactionFailedEvent,
     FinalResponseEvent,
+    HookNoticeEvent,
     ToolApprovalRequested,
     ToolExecutionCancelled,
     ToolExecutionCompleted,
@@ -39,11 +42,13 @@ from ycode.core.messages import (
 )
 from ycode.core.provider import AgentChatProvider, AgentModelRequest
 from ycode.errors import MessageAssemblyError, ProviderError
+from ycode.hooks import HookContextFactory, HookEventName, HookRuntime
 from ycode.prompt import EnvironmentCollector, PromptBundle, PromptRuntimeContext
 from ycode.prompt.models import SupplementKind, SystemSupplement
 from ycode.security import (
     ApprovalChoice,
     PermissionAction,
+    PermissionDecision,
     PermissionEngine,
     PermissionSession,
 )
@@ -84,6 +89,8 @@ class AgentLoop:
         resource_manager: "_AsyncCloseable | None" = None,
         context_manager: ContextManager | None = None,
         skill_runtime: SkillRuntime | None = None,
+        hook_runtime: HookRuntime | None = None,
+        hook_context: HookContextFactory | None = None,
         max_rounds: int = 10,
     ) -> None:
         if not isinstance(max_rounds, int) or isinstance(max_rounds, bool) or max_rounds < 1:
@@ -103,6 +110,10 @@ class AgentLoop:
         self._resource_manager = resource_manager
         self._context_manager = context_manager
         self._skill_runtime = skill_runtime
+        if (hook_runtime is None) != (hook_context is None):
+            raise ValueError("Hook 运行时和上下文工厂必须同时提供")
+        self._hook_runtime = hook_runtime
+        self._hook_context = hook_context
         self._close_task: asyncio.Task[None] | None = None
         self._max_rounds = max_rounds
         self._queued_request_supplements: list[SystemSupplement] = []
@@ -168,6 +179,7 @@ class AgentLoop:
         queued_supplements: tuple[SystemSupplement, ...],
         provided_skill_scope=None,
     ) -> AsyncIterator[AgentEvent]:
+        turn_id = uuid4().hex
         working_messages = [*history, user_message]
         turn_messages = [TurnMessage(user_message, datetime.now(UTC))]
         context_transaction = (
@@ -199,7 +211,41 @@ class AgentLoop:
         usage = TokenUsage()
         completed = False
 
+        async def finish_error(code: str, message: str) -> tuple[AgentEvent, ...]:
+            events: list[AgentEvent] = []
+            if self._hook_runtime is not None and self._hook_context is not None:
+                error_result = await self._hook_runtime.dispatch(
+                    self._hook_context.simple(
+                        HookEventName.AGENT_ERROR,
+                        turn={"id": turn_id},
+                        error={"code": code, "message": message},
+                    )
+                )
+                events.extend(HookNoticeEvent(item) for item in error_result.notices)
+                end_result = await self._hook_runtime.dispatch(
+                    self._hook_context.simple(
+                        HookEventName.TURN_END,
+                        turn={"id": turn_id, "status": "error"},
+                        error={"code": code, "message": message},
+                    )
+                )
+                events.extend(HookNoticeEvent(item) for item in end_result.notices)
+            events.append(self._finish_error(turn, turn_messages, code, message, usage))
+            return tuple(events)
+
         try:
+            if self._hook_runtime is not None and self._hook_context is not None:
+                hook_result = await turn.run_child(
+                    self._hook_runtime.dispatch(
+                        self._hook_context.simple(
+                            HookEventName.TURN_START,
+                            turn={"id": turn_id},
+                            message={"role": user_message.role, "content": user_message.text},
+                        )
+                    )
+                )
+                for notice in hook_result.notices:
+                    yield HookNoticeEvent(notice)
             environment = await turn.run_child(self._environment.collect())
             request_supplements = [*queued_supplements, environment.to_supplement()]
             if deferred_names:
@@ -267,29 +313,53 @@ class AgentLoop:
                     except ContextLimitError as error:
                         if error.failure_report is not None:
                             yield ContextCompactionFailedEvent(error.failure_report)
-                        yield self._finish_error(
-                            turn,
-                            turn_messages,
-                            error.code,
-                            str(error),
-                            usage,
-                        )
+                        for terminal_event in await finish_error(error.code, str(error)):
+                            yield terminal_event
                         return
                     except ContextStorageError:
-                        yield self._finish_error(
-                            turn,
-                            turn_messages,
-                            "context_storage_error",
-                            "无法安全保存超限工具结果。",
-                            usage,
-                        )
+                        for terminal_event in await finish_error(
+                            "context_storage_error", "无法安全保存超限工具结果。"
+                        ):
+                            yield terminal_event
                         return
                     working_messages = list(prepared.messages)
                     model_request = prepared.request
                     if prepared.compaction_report is not None:
+                        if self._hook_runtime is not None and self._hook_context is not None:
+                            hook_result = await turn.run_child(
+                                self._hook_runtime.dispatch(
+                                    self._hook_context.compacted(
+                                        turn_id, prepared.compaction_report
+                                    )
+                                )
+                            )
+                            for notice in hook_result.notices:
+                                yield HookNoticeEvent(notice)
                         yield ContextCompactedEvent(prepared.compaction_report)
                     if prepared.failure_report is not None:
                         yield ContextCompactionFailedEvent(prepared.failure_report)
+
+                if self._hook_runtime is not None and self._hook_context is not None:
+                    hook_result = await turn.run_child(
+                        self._hook_runtime.dispatch(
+                            self._hook_context.message(
+                                HookEventName.MESSAGE_BEFORE_SEND,
+                                turn_id,
+                                model_request.messages[-1],
+                            )
+                        )
+                    )
+                    for notice in hook_result.notices:
+                        yield HookNoticeEvent(notice)
+                    reminders = self._hook_runtime.take_reminders()
+                    if reminders:
+                        model_request = replace(
+                            model_request,
+                            supplements=(
+                                *model_request.supplements,
+                                *(item.tagged_content for item in reminders),
+                            ),
+                        )
 
                 assembler = ResponseAssembler()
                 stream = self._provider.stream_agent(model_request)
@@ -313,6 +383,18 @@ class AgentLoop:
                         )
 
                 assistant_message = assembler.finish()
+                if self._hook_runtime is not None and self._hook_context is not None:
+                    hook_result = await turn.run_child(
+                        self._hook_runtime.dispatch(
+                            self._hook_context.message(
+                                HookEventName.MESSAGE_AFTER_RECEIVE,
+                                turn_id,
+                                assistant_message,
+                            )
+                        )
+                    )
+                    for notice in hook_result.notices:
+                        yield HookNoticeEvent(notice)
                 if self._context_manager is not None and prepared is not None:
                     self._context_manager.observe_main_usage(
                         prepared.estimate.local_tokens,
@@ -325,6 +407,17 @@ class AgentLoop:
                 turn_messages.append(TurnMessage(assistant_message, datetime.now(UTC)))
 
                 if stop_reason is StopReason.END_TURN and not tool_calls:
+                    if self._hook_runtime is not None and self._hook_context is not None:
+                        hook_result = await turn.run_child(
+                            self._hook_runtime.dispatch(
+                                self._hook_context.simple(
+                                    HookEventName.TURN_END,
+                                    turn={"id": turn_id, "status": "completed"},
+                                )
+                            )
+                        )
+                        for notice in hook_result.notices:
+                            yield HookNoticeEvent(notice)
                     turn.complete(
                         AgentTurnResult(
                             termination=AgentTermination.COMPLETED,
@@ -359,17 +452,15 @@ class AgentLoop:
                         if code == "inconsistent_response"
                         else f"模型以异常原因停止：{stop_reason or StopReason.UNKNOWN}。"
                     )
-                    yield self._finish_error(turn, turn_messages, code, message, usage)
+                    for terminal_event in await finish_error(code, message):
+                        yield terminal_event
                     return
 
                 if not tool_calls:
-                    yield self._finish_error(
-                        turn,
-                        turn_messages,
-                        "missing_tool_calls",
-                        "模型声明使用工具，但响应中没有工具调用。",
-                        usage,
-                    )
+                    for terminal_event in await finish_error(
+                        "missing_tool_calls", "模型声明使用工具，但响应中没有工具调用。"
+                    ):
+                        yield terminal_event
                     return
 
                 denied_results = {
@@ -385,15 +476,45 @@ class AgentLoop:
                     for position, call in enumerate(tool_calls):
                         if position in denied_results:
                             continue
-                        decision = await turn.run_child(
-                            self._permission_engine.evaluate(
+                        preparation = await turn.run_child(
+                            self._permission_engine.prepare(
                                 call,
-                                self._permission_session,
                                 allowed_access=allowed_access,
                                 plan_only=mode is AgentMode.PLAN_ONLY,
-                                skill_scope=skill_scope,
                             )
                         )
+                        decision = preparation.denial
+                        if decision is None:
+                            hook_permission = None
+                            if self._hook_runtime is not None and self._hook_context is not None:
+                                hook_result = await turn.run_child(
+                                    self._hook_runtime.dispatch(
+                                        self._hook_context.tool_before(
+                                            turn_id,
+                                            call,
+                                            preparation.subject.normalized_arguments,
+                                        )
+                                    )
+                                )
+                                for notice in hook_result.notices:
+                                    yield HookNoticeEvent(notice)
+                                hook_permission = hook_result.permission
+                            if hook_permission is None:
+                                decision = self._permission_engine.evaluate_policy(
+                                    preparation,
+                                    self._permission_session,
+                                    skill_scope=skill_scope,
+                                )
+                            else:
+                                action = PermissionAction(hook_permission.value)
+                                decision = PermissionDecision(
+                                    action,
+                                    preparation.subject,
+                                    "hook_rule",
+                                    hook_result.reason or "Hook 已决定此工具调用。",
+                                    allow_session=False,
+                                )
+                        assert decision is not None
                         if decision.action is PermissionAction.ALLOW:
                             continue
                         if decision.action is PermissionAction.ASK:
@@ -440,6 +561,18 @@ class AgentLoop:
                         )
                     elif isinstance(scheduled_event, ScheduledToolCompleted):
                         records.append(scheduled_event.record)
+                        if (
+                            scheduled_event.record.position not in denied_results
+                            and self._hook_runtime is not None
+                            and self._hook_context is not None
+                        ):
+                            hook_result = await turn.run_child(
+                                self._hook_runtime.dispatch(
+                                    self._hook_context.tool_after(turn_id, scheduled_event.record)
+                                )
+                            )
+                            for notice in hook_result.notices:
+                                yield HookNoticeEvent(notice)
                         yield ToolExecutionCompleted(round_number, scheduled_event.record)
                     elif isinstance(scheduled_event, ScheduledToolCancelled):
                         yield ToolExecutionCancelled(
@@ -449,13 +582,10 @@ class AgentLoop:
                         )
 
                 if len(records) != len(tool_calls):
-                    yield self._finish_error(
-                        turn,
-                        turn_messages,
-                        "incomplete_tool_batch",
-                        "工具批次没有产生完整结果。",
-                        usage,
-                    )
+                    for terminal_event in await finish_error(
+                        "incomplete_tool_batch", "工具批次没有产生完整结果。"
+                    ):
+                        yield terminal_event
                     return
 
                 records.sort(key=lambda record: record.position)
@@ -479,6 +609,18 @@ class AgentLoop:
 
                 if round_number == self._max_rounds:
                     message = f"Agent 已达到最大轮数 {self._max_rounds}。"
+                    if self._hook_runtime is not None and self._hook_context is not None:
+                        hook_result = await turn.run_child(
+                            self._hook_runtime.dispatch(
+                                self._hook_context.simple(
+                                    HookEventName.TURN_END,
+                                    turn={"id": turn_id, "status": "limit_reached"},
+                                    error={"message": message},
+                                )
+                            )
+                        )
+                        for notice in hook_result.notices:
+                            yield HookNoticeEvent(notice)
                     turn.complete(
                         AgentTurnResult(
                             termination=AgentTermination.LIMIT_REACHED,
@@ -501,39 +643,35 @@ class AgentLoop:
                     usage=usage,
                 )
             )
+            if self._hook_runtime is not None and self._hook_context is not None:
+                hook_result = await self._hook_runtime.dispatch(
+                    self._hook_context.simple(
+                        HookEventName.TURN_END,
+                        turn={"id": turn_id, "status": "cancelled"},
+                        error={"message": message},
+                    )
+                )
+                for notice in hook_result.notices:
+                    yield HookNoticeEvent(notice)
             yield AgentCancelledEvent(message)
         except ProviderError as error:
-            yield self._finish_error(
-                turn,
-                turn_messages,
-                error.code,
-                error.user_message,
-                usage,
-            )
+            for terminal_event in await finish_error(error.code, error.user_message):
+                yield terminal_event
         except MessageAssemblyError:
-            yield self._finish_error(
-                turn,
-                turn_messages,
-                "invalid_response",
-                "模型响应结构无效，请重试。",
-                usage,
-            )
+            for terminal_event in await finish_error(
+                "invalid_response", "模型响应结构无效，请重试。"
+            ):
+                yield terminal_event
         except ContextStorageError:
-            yield self._finish_error(
-                turn,
-                turn_messages,
-                "context_storage_error",
-                "无法安全保存超限工具结果。",
-                usage,
-            )
+            for terminal_event in await finish_error(
+                "context_storage_error", "无法安全保存超限工具结果。"
+            ):
+                yield terminal_event
         except Exception:
-            yield self._finish_error(
-                turn,
-                turn_messages,
-                "agent_internal_error",
-                "Agent 运行时发生内部错误。",
-                usage,
-            )
+            for terminal_event in await finish_error(
+                "agent_internal_error", "Agent 运行时发生内部错误。"
+            ):
+                yield terminal_event
         finally:
             exposure.clear()
             if not completed and self._skill_runtime is not None and skill_scope is not None:

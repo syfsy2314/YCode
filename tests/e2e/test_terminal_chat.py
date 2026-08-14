@@ -508,6 +508,87 @@ def test_windows_terminal_agent_executes_six_tools(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
+def test_windows_terminal_hook_ask_deny_and_session_end(
+    tmp_path: Path,
+    sse_server: SSETestServer,
+) -> None:
+    project = tmp_path / "hook-flow"
+    project.mkdir()
+    sse_server.enqueue(
+        anthropic_tool_response(
+            [
+                ("write-hook", "write_file", {"path": "allowed.txt", "content": "ok"}),
+                ("run-hook", "run_command", {"command": "Write-Output blocked"}),
+            ]
+        )
+    )
+    sse_server.enqueue(anthropic_text_response("hook adjusted safely"))
+    write_anthropic_config(
+        project / ".ycode" / "config.yaml",
+        sse_server,
+        thinking=False,
+    )
+    (project / ".ycode" / "hooks.yaml").write_text(
+        """
+hooks:
+  - id: startup-shell
+    event: session.start
+    action: {type: shell, command: echo hook-ready}
+  - id: ask-write
+    event: tool.before_execute
+    conditions:
+      all:
+        tool.name: {exact: write_file}
+    permission: ask
+    action: {type: agent}
+  - id: deny-command
+    event: tool.before_execute
+    conditions:
+      all:
+        tool.name: {exact: run_command}
+    permission: deny
+    action: {type: agent}
+  - id: end-marker
+    event: session.end
+    action: {type: shell, command: echo ended>hook-ended.txt}
+""",
+        encoding="utf-8",
+    )
+
+    process, reader = spawn_ycode(project)
+    try:
+        output = reader.wait_for("项目 Hook 配置可执行本地命令或发起 HTTP 请求。", timeout=15)
+        assert output.count("项目 Hook 配置可执行本地命令或发起 HTTP 请求。") == 1
+        reader.wait_for("Send a message...", timeout=15)
+        process.write("exercise hooks\r")
+        reader.wait_for("工具审批：write_file", timeout=20)
+        process.write("2")
+        reader.wait_for("hook: 子 Agent Hook 尚未实现：deny-command", timeout=20)
+        reader.wait_for("hook adjusted safely", timeout=20)
+        reader.wait_for("Send a message...", timeout=15, count=2)
+        assert reader.snapshot().count("工具审批：write_file") == 1
+        assert "工具审批：run_command" not in reader.snapshot()
+        process.write("/exit\r")
+        wait_for_exit(process)
+        assert "Traceback" not in reader.snapshot()
+    finally:
+        stop_process(process)
+
+    assert (project / "allowed.txt").read_text(encoding="utf-8") == "ok"
+    assert (project / "hook-ended.txt").read_text(encoding="utf-8").strip() == "ended"
+    result_blocks = [
+        block
+        for message in sse_server.requests[1].json["messages"]
+        if message["role"] == "user" and isinstance(message["content"], list)
+        for block in message["content"]
+        if block["type"] == "tool_result"
+    ]
+    denied = next(block for block in result_blocks if block["tool_use_id"] == "run-hook")
+    assert denied["is_error"] is True
+    assert "Hook 规则 deny-command" in denied["content"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
 def test_windows_terminal_dangerous_command_is_denied_without_approval(
     tmp_path: Path,
     sse_server: SSETestServer,

@@ -10,6 +10,7 @@ from ycode.agent import (
     ContextCompactedEvent,
     ContextCompactionFailedEvent,
     ContextCompactionNotNeededEvent,
+    HookNoticeEvent,
     PlainChatRunner,
     ToolApprovalRequested,
     ToolExecutionCancelled,
@@ -417,6 +418,7 @@ async def test_terminal_renders_context_status_events() -> None:
 
         async def stream_reply(self, text: str):
             yield UserMessageEvent(ChatMessage.user_text(text))
+            yield HookNoticeEvent("placeholder")
             yield ContextCompactedEvent(ContextCompactionReport(170_000, 12_000))
             yield ContextCompactionFailedEvent(
                 ContextFailureReport("summary_invalid", "摘要无效", 3, True, False)
@@ -437,6 +439,7 @@ async def test_terminal_renders_context_status_events() -> None:
     await ui.run()
 
     output = target.getvalue()
+    assert "hook: placeholder" in output
     assert "170,000 → 12,000 tokens" in output
     assert "连续 3 次" in output
     assert "自动摘要已熔断" in output

@@ -39,3 +39,4 @@ mcp_servers:
     transport: stdio
     command: python
     args: ["-m", "disabled_mcp_server"]
+

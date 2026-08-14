@@ -185,6 +185,15 @@ class AgentErrorEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class HookNoticeEvent:
+    message: str
+
+    def __post_init__(self) -> None:
+        if not self.message.strip():
+            raise ValueError("Hook 通知不能为空")
+
+
+@dataclass(frozen=True, slots=True)
 class McpStatusEvent:
     report: McpStatusReport
 
@@ -257,6 +266,7 @@ type AgentEvent = (
     | AgentLimitReachedEvent
     | AgentCancelledEvent
     | AgentErrorEvent
+    | HookNoticeEvent
     | McpStatusEvent
     | ContextCompactedEvent
     | ContextCompactionFailedEvent

@@ -3,6 +3,7 @@
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
+from uuid import uuid4
 
 import httpx
 
@@ -19,6 +20,12 @@ from ycode.context import (
 )
 from ycode.core.provider import AgentChatProvider, ChatProvider
 from ycode.errors import ConfigError
+from ycode.hooks import (
+    HookContextFactory,
+    HookRuntime,
+    format_hook_diagnostic,
+    load_hook_config,
+)
 from ycode.mcp.manager import McpManager
 from ycode.memory import MemoryStore, MemoryUpdater
 from ycode.prompt import (
@@ -74,6 +81,7 @@ async def run_app(
     command_runtime = None
     has_enabled_mcp = False
     skill_http_client: httpx.AsyncClient | None = None
+    hook_runtime: HookRuntime | None = None
     try:
         if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
             try:
@@ -176,6 +184,9 @@ async def run_app(
                 PowerShellSafetyChecker(workspace),
                 skill_runtime,
             )
+            hook_result = load_hook_config(workspace)
+            hook_runtime = HookRuntime(hook_result.rules, workspace)
+            hook_context = HookContextFactory(workspace, uuid4().hex)
 
             def isolated_loop_factory(temp_provider, temp_prompt, scope):
                 loop = AgentLoop(
@@ -221,6 +232,8 @@ async def run_app(
                 resource_manager=manager,
                 context_manager=context_manager,
                 skill_runtime=skill_runtime,
+                hook_runtime=hook_runtime,
+                hook_context=hook_context,
             )
         else:
             runner = PlainChatRunner(provider)
@@ -234,9 +247,19 @@ async def run_app(
                 prompt_runtime=prompt_runtime,
                 memory_store=memory_store,
                 memory_updater=MemoryUpdater(cast(AgentChatProvider, provider)),
-                startup_warnings=tuple(warning.message for warning in project_context.warnings),
+                startup_warnings=(
+                    *(warning.message for warning in project_context.warnings),
+                    *(format_hook_diagnostic(item) for item in hook_result.diagnostics),
+                    *(
+                        ("项目 Hook 配置可执行本地命令或发起 HTTP 请求。",)
+                        if hook_result.external_action_warning
+                        else ()
+                    ),
+                ),
                 command_runtime=command_runtime,
                 skill_runtime=skill_runtime,
+                hook_runtime=hook_runtime,
+                hook_context=hook_context,
             )
             session_ref["session"] = session
             if continue_session:
@@ -244,6 +267,7 @@ async def run_app(
                     await session.restore()
                 except Exception as error:
                     raise ConfigError("最近会话恢复失败") from error
+            await session.start_hooks()
         else:
             session = ChatSession(runner, permission_session, manager, context_manager)
         if manager is not None and has_enabled_mcp:
@@ -262,8 +286,12 @@ async def run_app(
                     try:
                         await provider.close()
                     finally:
-                        if context_manager is not None:
-                            await context_manager.close()
+                        try:
+                            if context_manager is not None:
+                                await context_manager.close()
+                        finally:
+                            if hook_runtime is not None:
+                                await hook_runtime.close()
         finally:
             if skill_http_client is not None:
                 await skill_http_client.aclose()

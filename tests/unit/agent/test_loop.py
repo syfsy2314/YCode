@@ -38,6 +38,7 @@ from ycode.core import (
     ToolCallStart,
     ToolResultBlock,
 )
+from ycode.hooks import HookContextFactory, HookRuntime
 from ycode.prompt import (
     EnvironmentCollector,
     PromptRuntimeContext,
@@ -138,6 +139,8 @@ def create_loop(
     permission_mode: PermissionMode | None = None,
     plan_only_mcp_tools: frozenset[str] = frozenset(),
     context_manager: ContextManager | None = None,
+    hook_runtime: HookRuntime | None = None,
+    hook_context: HookContextFactory | None = None,
 ) -> AgentLoop:
     registry = ToolRegistry()
     for tool in tools:
@@ -179,6 +182,8 @@ def create_loop(
         permission_session=permission_session,
         plan_only_mcp_tools=plan_only_mcp_tools,
         context_manager=context_manager,
+        hook_runtime=hook_runtime,
+        hook_context=hook_context,
         max_rounds=max_rounds,
     )
 

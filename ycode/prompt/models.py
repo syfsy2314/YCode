@@ -68,6 +68,7 @@ class SupplementKind(StrEnum):
     SKILL_CATALOG = "available_skills"
     SKILL_INSTRUCTIONS = "active_skills"
     REMINDER = "reminder"
+    SYSTEM_REMINDER = "system-reminder"
     TOOL_CATALOG = "tool_catalog"
 
 

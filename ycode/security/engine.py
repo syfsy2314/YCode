@@ -15,6 +15,7 @@ from ycode.security.models import (
     PermissionAction,
     PermissionDecision,
     PermissionMode,
+    PermissionPreparation,
     PermissionSession,
     PermissionSubject,
     SecurityConfig,
@@ -55,26 +56,44 @@ class PermissionEngine:
         plan_only: bool = False,
         skill_scope: "SkillTaskScope | None" = None,
     ) -> PermissionDecision:
+        preparation = await self.prepare(
+            call,
+            allowed_access=allowed_access,
+            plan_only=plan_only,
+        )
+        if preparation.denial is not None:
+            return preparation.denial
+        return self.evaluate_policy(preparation, session, skill_scope=skill_scope)
+
+    async def prepare(
+        self,
+        call: ToolCallBlock,
+        *,
+        allowed_access: frozenset[ToolAccess],
+        plan_only: bool = False,
+    ) -> PermissionPreparation:
         try:
             tool = self._registry.get(call.name)
             if tool is None:
-                return self._fallback_denial(
+                denial = self._fallback_denial(
                     call,
                     "unknown_tool",
                     "工具未注册，已拒绝执行。",
                 )
+                return PermissionPreparation(denial.subject, denial, plan_only)
             subject = self._normalize(call, tool.definition.access)
 
             if call.name == "run_command":
                 command = str(subject.normalized_arguments["command"])
                 safety = await self._command_checker.check(command)
                 if not safety.safe:
-                    return PermissionDecision(
+                    denial = PermissionDecision(
                         PermissionAction.DENY,
                         subject,
                         f"hard_{safety.category}",
                         safety.message,
                     )
+                    return PermissionPreparation(subject, denial, plan_only)
             if tool.definition.access not in allowed_access:
                 if not (
                     plan_only
@@ -82,12 +101,42 @@ class PermissionEngine:
                     and tool.definition.access is ToolAccess.UNKNOWN
                     and tool.definition.defer_loading
                 ):
-                    return PermissionDecision(
+                    denial = PermissionDecision(
                         PermissionAction.DENY,
                         subject,
                         "access_not_available",
                         "当前模式不允许执行该工具。",
                     )
+                    return PermissionPreparation(subject, denial, plan_only)
+            return PermissionPreparation(subject, plan_only=plan_only)
+        except (ToolArgumentValidationError, ToolError, TypeError, ValueError, KeyError):
+            denial = self._fallback_denial(
+                call,
+                "invalid_or_unsafe_arguments",
+                "工具参数无法安全验证，已拒绝执行。",
+            )
+            return PermissionPreparation(denial.subject, denial, plan_only)
+        except Exception:
+            denial = self._fallback_denial(
+                call,
+                "permission_internal_error",
+                "权限检查失败，已拒绝执行。",
+            )
+            return PermissionPreparation(denial.subject, denial, plan_only)
+
+    def evaluate_policy(
+        self,
+        preparation: PermissionPreparation,
+        session: PermissionSession,
+        *,
+        skill_scope: "SkillTaskScope | None" = None,
+    ) -> PermissionDecision:
+        subject = preparation.subject
+        call = subject.call
+        try:
+            tool = self._registry.get(call.name)
+            if tool is None:
+                return self._fallback_denial(call, "unknown_tool", "工具未注册，已拒绝执行。")
             rule = self._first_matching_rule(call.name, subject.normalized_arguments)
             if rule is not None and rule.action is PermissionAction.DENY:
                 return PermissionDecision(
@@ -109,7 +158,7 @@ class PermissionEngine:
             if activation is not None:
                 return activation
             if (
-                plan_only
+                preparation.plan_only
                 and tool.definition.name in self._plan_only_mcp_tools
                 and tool.definition.access is ToolAccess.UNKNOWN
                 and tool.definition.defer_loading

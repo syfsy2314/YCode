@@ -24,6 +24,7 @@ from ycode.agent.events import (
     ContextCompactionFailedEvent,
     ContextCompactionNotNeededEvent,
     FinalResponseEvent,
+    HookNoticeEvent,
     McpStatusEvent,
     ModeChangedEvent,
     PermissionGrantsClearedEvent,
@@ -38,6 +39,7 @@ from ycode.context import (
     RestoreContextResult,
 )
 from ycode.core.messages import ChatMessage
+from ycode.hooks import HookContextFactory, HookEventName, HookRuntime
 from ycode.mcp.models import McpStatusProvider
 from ycode.memory import (
     MemoryStore,
@@ -85,6 +87,8 @@ class ChatSession:
         startup_warnings: tuple[str, ...] = (),
         command_runtime: CommandRuntime | None = None,
         skill_runtime: SkillRuntime | None = None,
+        hook_runtime: HookRuntime | None = None,
+        hook_context: HookContextFactory | None = None,
     ) -> None:
         self._runner = runner
         self._history: list[ChatMessage] = []
@@ -99,6 +103,10 @@ class ChatSession:
         self._startup_warnings = tuple(startup_warnings)
         self._command_runtime = command_runtime
         self._skill_runtime = skill_runtime
+        if (hook_runtime is None) != (hook_context is None):
+            raise ValueError("Hook 运行时和上下文工厂必须同时提供")
+        self._hook_runtime = hook_runtime
+        self._hook_context = hook_context
         self._active_turn: AgentTurn | None = None
         self._active_compaction: asyncio.Task[object] | None = None
         self._turn_finished = asyncio.Event()
@@ -133,6 +141,14 @@ class ChatSession:
     @property
     def startup_warnings(self) -> tuple[str, ...]:
         return self._startup_warnings
+
+    async def start_hooks(self) -> None:
+        if self._hook_runtime is None or self._hook_context is None:
+            return
+        result = await self._hook_runtime.dispatch(
+            self._hook_context.simple(HookEventName.SESSION_START)
+        )
+        self._startup_warnings = (*self._startup_warnings, *result.notices)
 
     @property
     def startup_restore_event(self) -> SessionRestoredEvent | None:
@@ -263,6 +279,12 @@ class ChatSession:
                 else:
                     self._context_manager.activate_compaction(candidate)
                     self._history[:] = candidate.history
+                    if self._hook_runtime is not None and self._hook_context is not None:
+                        hook_result = await self._hook_runtime.dispatch(
+                            self._hook_context.compacted("manual", candidate.report)
+                        )
+                        for notice in hook_result.notices:
+                            yield HookNoticeEvent(notice)
                     yield ContextCompactedEvent(candidate.report)
         finally:
             if not task.done():
@@ -641,6 +663,13 @@ class ChatSession:
             self.cancel_active_turn()
             await self._turn_finished.wait()
         try:
+            if self._hook_runtime is not None and self._hook_context is not None:
+                result = await self._hook_runtime.dispatch(
+                    self._hook_context.simple(HookEventName.SESSION_END)
+                )
+                for notice in result.notices:
+                    print(f"hook: {notice}")
+                await self._hook_runtime.close()
             await self._runner.close()
         finally:
             if self._context_manager is not None:

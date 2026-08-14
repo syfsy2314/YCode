@@ -16,6 +16,7 @@ from ycode.agent import (
     ContextCompactionFailedEvent,
     ContextCompactionNotNeededEvent,
     FinalResponseEvent,
+    HookNoticeEvent,
     McpStatusEvent,
     ModeChangedEvent,
     PermissionGrantsClearedEvent,
@@ -353,6 +354,8 @@ class TerminalUI:
             self._console.print(event.message)
         elif isinstance(event, SessionRestoredEvent):
             self._render_restored(event)
+        elif isinstance(event, HookNoticeEvent):
+            self._console.print(f"hook: {event.message}")
         elif isinstance(event, FinalResponseEvent):
             await start()
             await renderer.complete(event.message)

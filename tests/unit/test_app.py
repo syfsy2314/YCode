@@ -125,6 +125,52 @@ async def test_app_assembles_anthropic_agent_with_builtin_tools(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_anthropic_loads_hooks_and_openai_ignores_them(tmp_path: Path) -> None:
+    hooks_path = tmp_path / ".ycode" / "hooks.yaml"
+    hooks_path.parent.mkdir(parents=True)
+    hooks_path.write_text(
+        """
+hooks:
+  - id: startup
+    event: session.start
+    action: {type: agent}
+  - id: external
+    event: turn.start
+    action: {type: shell, command: echo ok}
+  - id: invalid
+    event: missing
+    action: {type: agent}
+""",
+        encoding="utf-8",
+    )
+    warnings_by_protocol: dict[str, tuple[str, ...]] = {}
+
+    class FakeUI:
+        def __init__(self, config: object, session: object) -> None:
+            self._protocol = config.protocol.value
+            self._session = session
+
+        async def run(self) -> None:
+            warnings_by_protocol[self._protocol] = self._session.startup_warnings
+
+    for protocol in ("anthropic", "openai"):
+        write_config(tmp_path / ".ycode" / "config.yaml", protocol)
+        await run_app(
+            start_dir=tmp_path,
+            provider_factory=lambda config: FakeProvider([]),
+            ui_factory=FakeUI,
+        )
+
+    anthropic = warnings_by_protocol["anthropic"]
+    assert "子 Agent Hook 尚未实现：startup" in anthropic
+    assert "项目 Hook 配置可执行本地命令或发起 HTTP 请求。" in anthropic
+    diagnostic = next(item for item in anthropic if item.startswith("Hook 配置错误"))
+    assert str(hooks_path) in diagnostic
+    assert "规则 #3 (invalid)" in diagnostic
+    assert not any("Hook" in item for item in warnings_by_protocol["openai"])
+
+
+@pytest.mark.asyncio
 async def test_anthropic_injects_project_instruction_and_memory_index(tmp_path: Path) -> None:
     path = tmp_path / ".ycode" / "config.yaml"
     write_config(path, "anthropic")

@@ -139,6 +139,19 @@ class PermissionDecision:
             raise ValueError("权限决策必须携带原因")
 
 
+@dataclass(frozen=True, slots=True)
+class PermissionPreparation:
+    subject: PermissionSubject
+    denial: PermissionDecision | None = None
+    plan_only: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.subject, PermissionSubject):
+            raise TypeError("权限预检必须携带 PermissionSubject")
+        if self.denial is not None and not isinstance(self.denial, PermissionDecision):
+            raise TypeError("权限预检拒绝必须是 PermissionDecision")
+
+
 class PermissionSession:
     def __init__(self, mode: PermissionMode = PermissionMode.DEFAULT) -> None:
         if not isinstance(mode, PermissionMode):

@@ -17,6 +17,7 @@ from ycode.agent import (
     ContextCompactionFailedEvent,
     ContextCompactionNotNeededEvent,
     FinalResponseEvent,
+    HookNoticeEvent,
     ModeChangedEvent,
     SessionRestoredEvent,
     ToolApprovalRequested,
@@ -46,6 +47,8 @@ def test_agent_events_are_frozen_and_validate_fields() -> None:
         AgentTextDelta(round_number=0, index=0, text="hello")
     with pytest.raises(ValueError, match="不能为空"):
         AgentErrorEvent(code="", message="error")
+    with pytest.raises(ValueError, match="不能为空"):
+        HookNoticeEvent("")
 
     mode = ModeChangedEvent(AgentMode.AGENT, AgentMode.PLAN_ONLY)
     assert mode.mode is AgentMode.PLAN_ONLY

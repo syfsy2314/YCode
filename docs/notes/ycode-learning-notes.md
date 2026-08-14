@@ -84,7 +84,7 @@ def main(argv=None) -> int:
 `run_app()` 是组合根：它读取配置、只创建 `active` 指向的 Provider，并根据协议选择
 对话运行器。Provider 工厂在协议分支内局部导入实现，因此活动配置为 Anthropic 时不会
 导入 OpenAI Provider 或 OpenAI SDK。Anthropic 路径还会装配命令框架、内建工具、MCP、
-权限系统和 AgentLoop；OpenAI 仍保持纯聊天。
+权限系统、项目 Hook 和 AgentLoop；OpenAI 仍保持纯聊天，也不加载 Hook。
 
 简化后的核心逻辑：
 
@@ -120,6 +120,9 @@ if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
     permission_engine = PermissionEngine(
         registry, resolver, security_result.config, PowerShellSafetyChecker(workspace)
     )
+    hook_result = load_hook_config(workspace)
+    hook_runtime = HookRuntime(hook_result.rules, workspace)
+    hook_context = HookContextFactory(workspace, uuid4().hex)
     runner = AgentLoop(
         provider,
         registry,
@@ -135,6 +138,8 @@ if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
         ),
         resource_manager=manager,
         context_manager=context_manager,
+        hook_runtime=hook_runtime,
+        hook_context=hook_context,
     )
 else:
     runner = PlainChatRunner(provider)
@@ -151,9 +156,12 @@ if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
         memory_store=memory_store,
         memory_updater=MemoryUpdater(provider),
         command_runtime=command_runtime,
+        hook_runtime=hook_runtime,
+        hook_context=hook_context,
     )
     if continue_session:
         await session.restore()
+    await session.start_hooks()
 else:
     session = ChatSession(runner)
 
@@ -188,6 +196,10 @@ TerminalUI
                     ├── PermissionEngine
                     │       ├── PermissionSession
                     │       └── PowerShellSafetyChecker
+                    ├── HookRuntime
+                    │       ├── RuntimeHookRule
+                    │       └── HookActionExecutors
+                    ├── HookContextFactory
                     ├── PromptBundle
                     ├── PromptRuntimeContext
                     ├── ProjectContextLoader
@@ -195,6 +207,7 @@ TerminalUI
                     ├── ContextManager
                     └── ToolContext
             ├── SessionManager
+            ├── HookRuntime / HookContextFactory
             ├── MemoryStore
             └── MemoryUpdater
 ~~~
@@ -215,21 +228,24 @@ TerminalUI
 - Anthropic 装配集中式命令运行时；OpenAI 不装配命令注册、分发或补全。
 - Anthropic 使用 `config.project_root` 统一工具、项目指令、会话、上下文和记忆的路径
   边界，并支持 `--continue`。
+- Anthropic 从最近的 `.ycode/hooks.yaml` 创建一个应用会话级 `HookRuntime`，只注入主
+  AgentLoop 与 ChatSession；隔离 Skill AgentLoop 不继承它。
 - OpenAI 只通过 PlainChatRunner 发起一次模型请求，没有工具定义、Agent system prompt 或 plan-only 能力。
-- OpenAI 不装配持久化会话和项目记忆，使用 `--continue` 会在创建 Provider 前失败。
+- OpenAI 不装配持久化会话、项目记忆或 Hook，使用 `--continue` 会在创建 Provider 前失败。
 - `enabled: true` 的 MCP 在 UI 装配完成后后台连接；`enabled: false` 不创建连接任务。
 
-退出时，`finally` 调用 `session.close()`。Session 再关闭 Runner，AgentLoop 先通过
-`resource_manager` 关闭 MCP：未完成的后台启动先取消，READY 连接再正常退出，最后关闭
-HTTP Client、stdio 子进程和 Provider。
+退出时，`finally` 调用 `session.close()`。Session 先触发 `session.end`，再让
+`HookRuntime.close()` 最多等待后台 Hook 3 秒并取消剩余任务，然后关闭 Runner。
+AgentLoop 通过 `resource_manager` 关闭 MCP：未完成的后台启动先取消，READY 连接再正常
+退出，最后关闭 HTTP Client、stdio 子进程和 Provider。
 
 ### 面试表述
 
 YCode 通过 `pyproject.toml` 注册 CLI 入口。`cli.main()` 负责参数解析和启动 asyncio
 事件循环，`run_app()` 是组合根：它按 `active` 延迟导入单个 Provider，在 Anthropic
-路径装配命令、工具、权限与 AgentLoop，然后让启用的 MCP 后台连接并立即进入 UI；
-OpenAI 保持 PlainChatRunner。资源关闭沿 Session、Runner 传递，MCP 后台任务和 Provider
-都会被释放。
+路径装配命令、工具、权限、Hook 与 AgentLoop，然后让启用的 MCP 后台连接并立即进入
+UI；OpenAI 保持 PlainChatRunner 且不加载 Hook。资源关闭从 Session 先经过 Hook 收尾，
+再沿 Runner 传递，MCP 后台任务和 Provider 都会被释放。
 
 ## 核心数据与组件关系
 
@@ -338,6 +354,7 @@ AgentLoop 或 PlainChatRunner 把 Provider 事件转换为供应商无关的 Age
 | ContextCompactedEvent | 自动或手动上下文压缩成功 |
 | ContextCompactionFailedEvent | 上下文压缩失败及熔断状态 |
 | ContextCompactionNotNeededEvent | 当前没有需要压缩的历史 |
+| HookNoticeEvent | Hook 产生的终端通知，不进入消息或会话历史 |
 | FinalResponseEvent | Agent 正常完成后的最终回复 |
 | AgentLimitReachedEvent | 达到最大模型轮数 |
 | AgentCancelledEvent | 用户取消当前回合 |
@@ -482,6 +499,7 @@ ChatSession 负责：
 - 保证同一时间只有一个活动 AgentTurn。
 - 处理 `/plan`、`/agent` 和 `/permission`。
 - 处理 `/compact` 和 `/resume <session-id>`。
+- 触发 `session.start/end` 和手动压缩 Hook，并保存共享 HookRuntime。
 - 协调 `SessionManager`、`ContextManager`、`MemoryStore` 和 `MemoryUpdater`。
 - 累积本进程中新提交的 `SessionCommit`，只供退出记忆整理使用。
 - 把终端审批选择转交给当前 AgentTurn。
@@ -544,6 +562,8 @@ async for event in session.stream_reply(user_text):
     elif isinstance(event, ToolApprovalRequested):
         # 暂停普通 Ctrl+C 监听，进入三选一审批输入
         ...
+    elif isinstance(event, HookNoticeEvent):
+        console.print(f"hook: {event.message}")
     elif isinstance(event, FinalResponseEvent):
         await renderer.complete(event.message)
 ~~~
@@ -554,6 +574,7 @@ UI 的展示原则：
 - 工具开始、成功、失败和取消显示安全摘要。
 - 写文件内容和完整命令输出不会直接显示。
 - 工具调用轮的文本是过程文本，不会混入最终 Markdown。
+- HookNoticeEvent 只显示为终端通知，不会变成 ChatMessage 或提交到会话。
 - 只有 FinalResponseEvent 携带的最后一轮消息进行 Markdown 渲染。
 - 上限、错误和取消都会停止计时与 Rich Live，并恢复输入。
 
@@ -583,7 +604,9 @@ OpenAI 没有装配权限会话和命令运行时，保持兼容输入路径。
 | EnvironmentCollector | 采集请求级环境与 Git 摘要 |
 | ResponseAssembler | 把单次 StreamEvent 流组装成 Assistant 消息 |
 | AgentLoop | 多轮判断、工具执行、结果回填和 Agent 终止 |
-| PermissionEngine | 工具执行前的硬边界、规则、会话授权和模式判定 |
+| HookRuntime | 按事件与条件分发规则，维护 executed、Reminder、权限汇总和后台任务 |
+| HookContextFactory | 构造供应商无关、可供匹配与模板读取的 Hook 事件上下文 |
+| PermissionEngine | 分离工具硬预检与普通策略，供 Hook 插入两阶段之间 |
 | PermissionSession | 当前权限模式和内存中的本会话授权 |
 | PowerShellSafetyChecker | 使用 PowerShell AST 识别已定义的危险命令 |
 | PlainChatRunner | 把单次纯聊天包装成 AgentTurn |
@@ -608,6 +631,7 @@ Provider 负责翻译一次响应
 Prompt System 负责决定发什么系统上下文
 Assembler 负责拼装一次响应
 AgentLoop 负责多轮行动
+HookRuntime 负责生命周期扩展、临时提醒和工具权限干预
 Tool 系统负责执行本地能力
 SessionManager 负责磁盘会话事实
 ChatSession 负责跨组件事务和活动状态
@@ -617,14 +641,18 @@ TerminalUI 负责交互与展示
 
 ### 面试表述
 
-YCode 使用两层供应商无关事件隔离职责：Provider 将 SDK SSE 转换为单次请求级 StreamEvent，AgentLoop 或 PlainChatRunner 再转换为整轮对话级 AgentEvent。ResponseAssembler 负责单次响应完整性，AgentLoop 负责 ReAct 循环和工具回填，ChatSession 只在 COMPLETED 后事务式提交整轮历史，TerminalUI 完全不感知 StreamEnd。
+YCode 使用两层供应商无关事件隔离职责：Provider 将 SDK SSE 转换为单次请求级
+StreamEvent，AgentLoop 或 PlainChatRunner 再转换为整轮对话级 AgentEvent。
+ResponseAssembler 负责单次响应完整性，AgentLoop 负责 ReAct 循环、Hook 节点和工具回填，
+ChatSession 只在 COMPLETED 后事务式提交整轮历史，TerminalUI 完全不感知 StreamEnd；
+HookNoticeEvent 也只属于过程展示，不属于对话事实。
 
 ## 提示词系统
 
 提示词系统的核心目标是把“长期稳定、适合缓存的内容”和“每轮可能变化的上下文”
 分开，同时保持动态内容的 system 语义。
 
-### 1. 五类请求内容
+### 1. 请求内容分层
 
 `AgentModelRequest` 明确区分四个字段，当前用户输入已经包含在真实消息中：
 
@@ -660,7 +688,7 @@ identity → behavior → tool-use → coding → safety → output
 `SystemSupplement` 包含：
 
 - `kind`：environment、task mode、tool state、project instructions、project memory、
-  conversation memory、reminder 或 tool catalog。
+  conversation memory、reminder、`system-reminder`、Skill 或 tool catalog 等。
 - `scope`：`request` 或 `session`。
 - `content`：正文。
 
@@ -702,9 +730,10 @@ PromptRuntimeContext.begin_turn(mode, environment)
 创建 AgentModelRequest
 ~~~
 
-同一用户任务中的多次工具轮次只扩展 `working_messages`，继续复用相同的
-`system_prompt`、`supplements` 和工具定义。这保证环境与模式提醒不会在一次 ReAct
-循环中重复生成。
+同一用户任务中的多次工具轮次只扩展 `working_messages`，稳定提示词和任务开始时确定的
+补充继续复用；但每次请求发送前仍会触发 `message.before_send`。Hook 产生的请求级
+`<system-reminder>` 会在这里追加到当前请求，随后由 `take_reminders()` 原子取出并清空，
+所以不会重复注入，也不会写入 ChatMessage 或会话历史。
 
 ### 5. Anthropic 缓存与兼容降级
 
@@ -746,9 +775,9 @@ AnthropicProvider：只做协议序列化、兼容重试和响应解析
 
 YCode 用 `PromptBundle` 保存确定性排序的稳定指令，用 `SystemSupplement` 表达带请求级
 或会话级生命周期的动态系统上下文，再通过 `AgentModelRequest` 与真实历史和工具定义
-分离。AgentLoop 每个用户任务生成一次动态上下文并在工具轮次复用；AnthropicProvider
-只负责缓存断点、system message 兼容降级和 usage 解析，因此提示词策略没有泄漏到
-供应商协议层。
+分离。AgentLoop 每个用户任务生成固定动态上下文，同时允许 Hook 在单次请求边界追加并
+消费 `<system-reminder>`；AnthropicProvider 只负责缓存断点、system message 兼容降级和
+usage 解析，因此提示词策略没有泄漏到供应商协议层。
 
 ## 项目上下文、会话持久化与项目记忆
 
@@ -1377,7 +1406,11 @@ Scheduler 负责连续读取并发及非读取屏障，Executor 负责最终参�
 ~~~text
 模型返回 ToolCallBlock
     ↓
-PermissionEngine 规范化并判定
+PermissionEngine.prepare() 规范化并执行硬检查
+    ↓ 硬检查通过
+tool.before_execute Hook
+    ├── ALLOW / ASK / DENY：替代普通策略
+    └── 无决定：PermissionEngine.evaluate_policy()
     ├── ALLOW：允许进入待执行批次
     ├── DENY：生成预计算错误结果
     └── ASK：发出 ToolApprovalRequested，严格等待用户
@@ -1416,11 +1449,13 @@ rules: []
 `/permission clear` 只清除本会话授权；它们不请求模型、不进入历史、也不修改配置。
 永久规则只能手工写入项目配置。
 
-### 2. 固定判定顺序与不可覆盖边界
+### 2. 两阶段判定顺序与不可覆盖边界
 
-`PermissionEngine.evaluate()` 的核心顺序以当前实现为准：
+`PermissionEngine.evaluate()` 仍是无 Hook 调用方的兼容入口，内部组合 `prepare()` 与
+`evaluate_policy()`。主 AgentLoop 为了插入 Hook，显式使用两阶段接口：
 
 ~~~text
+prepare()
 工具查找与 ToolArguments 参数校验
     ↓
 真实路径规范化、审批摘要和 session_key
@@ -1429,6 +1464,15 @@ run_command 的 PowerShell 危险命令检查
     ↓
 当前任务模式 allowed_access（包括 plan-only）
     ↓
+硬拒绝？直接生成工具错误，不触发 before Hook
+    ↓ 否
+tool.before_execute Hook
+    ├── DENY：直接拒绝并停止后续 before 规则
+    ├── ASK：只允许本次审批，不写入会话授权
+    ├── ALLOW：跳过普通权限策略
+    └── 无决定：进入 evaluate_policy()
+    ↓
+evaluate_policy()
 项目 DENY 规则
     ↓
 plan-only MCP 白名单工具强制 ASK
@@ -1449,8 +1493,9 @@ strict / default / allow 默认值
 动态或编码执行、关机与启动破坏、高破坏性 Git、工作区外权限接管等类别会硬拒绝。
 解析失败也拒绝。
 
-危险命令、路径沙箱和 plan-only 访问边界不能被 allow 模式、项目 allow 规则或本会话
-允许覆盖。这是纵深防御中最重要的一层。
+危险命令、路径沙箱和 plan-only 访问边界不能被 Hook allow、allow 模式、项目 allow
+规则或本会话允许覆盖。项目 DENY 属于普通策略，因此显式 Hook allow 可以替代它；这与
+前面的硬拒绝边界不同。
 
 ### 3. 阻塞审批与会话授权
 
@@ -1491,15 +1536,213 @@ MCP 传输或 JSON-RPC。当前 MCP 工具已由 `MCPToolWrapper` 包装成普�
 plan-only 默认既不列出 MCP 名称，也不暴露 Schema。只有
 `.ycode/security.yaml` 中 `plan_only.allow_mcp_tools` 精确列出的 `mcp_*` 工具
 才能被搜索和调用；该白名单不会把工具变成 READ，每次调用仍强制人工确认，
-且不提供“本会话允许”。项目 DENY 规则仍然可以在此之前直接拒绝。
+且不提供“本会话允许”。这里的“强制”是无 Hook 决定时的普通策略：显式 Hook allow
+可以跳过这次 ASK 和项目规则，但不能让未进入白名单的 MCP 通过 `prepare()` 硬检查。
 
 ### 面试表述
 
-YCode 在 AgentLoop 与 Scheduler 之间设置统一 PermissionEngine：先做参数和真实路径
-规范化，再执行不可覆盖的危险命令与任务模式检查，之后才看会话授权、项目规则和权限
-模式。ASK 通过 AgentEvent 和 AgentTurn 单一 Future 严格阻塞，整批审完后 Scheduler
-才执行；拒绝作为结构化 ToolResult 回填。这样既保留 ReAct 自我修正，也保证工具在
-获准前没有副作用。
+YCode 在 AgentLoop 与 Scheduler 之间把权限拆成硬预检和普通策略：`prepare()` 先做参数、
+真实路径、危险命令与任务模式检查，硬检查通过后才触发 before Hook；Hook 没有决定时再
+由 `evaluate_policy()` 检查项目规则、会话授权和权限模式。ASK 通过 AgentEvent 和
+AgentTurn 单一 Future 严格阻塞，拒绝作为结构化 ToolResult 回填。这样 Hook 可以调整
+普通策略，同时不能越过真正的安全边界。
+
+## Hook 系统：生命周期扩展、权限干预与临时提醒
+
+Hook 系统位于 `ycode.hooks`，只在 Anthropic 主 Agent 路径装配。它从当前目录向上发现
+最近的 `.ycode/hooks.yaml`，用“事件 + 可选条件 + 一个动作”描述项目自动化规则。
+OpenAI PlainChatRunner 和隔离 Skill AgentLoop 都不会创建或触发 HookRuntime。
+
+### 1. 配置加载与规则模型
+
+配置顶层只能包含 `hooks` 列表。每条 `HookRule` 的主要字段是：
+
+| 字段 | 含义 |
+|---|---|
+| `id` | 配置内唯一的小写 kebab-case 规则 ID |
+| `enabled` | 固定启用标记，默认 `true` |
+| `event` | 必填生命周期事件 |
+| `conditions` | 可选的 `all` 或 `any` 条件组 |
+| `action` | 一个 Shell、HTTP、Reminder 或 Agent 占位动作 |
+| `permission` | 仅 `tool.before_execute` 可用的固定决定 |
+| `once` | 是否只消费第一次匹配，默认 `false` |
+| `async` | 是否后台执行，仅 Shell/HTTP 可用 |
+| `timeout_seconds` | 动作超时，默认 30 秒 |
+
+`HookRule` 本身冻结；可变状态放在 `RuntimeHookRule.executed`。加载时 `executed` 总是
+`false`，不从 YAML 读取，也不持久化。事件和条件匹配后、动作启动前立即设为 `true`：
+
+~~~text
+enabled == false                 → 永远跳过，executed 不变
+once == true 且 executed == true → 后续跳过
+条件未命中                       → executed 不变
+条件命中                         → 先 executed = true，再启动动作
+动作失败、超时或取消             → 不恢复 executed
+once == false                    → executed 为 true 也可再次触发
+~~~
+
+文件级 YAML/顶层错误会禁用整份配置；单条规则错误或重复 ID 只跳过该条，重复 ID 保留
+第一条。`HookDiagnostic` 保存配置路径、规则序号、可识别 ID 和字段错误，启动时集中展示。
+只有已启用的 Shell/HTTP 才产生一次外部操作风险提示。
+
+当前仓库的 `.ycode/hooks.yaml` 是可加载示例：只有启动占位通知启用；高风险命令拦截、
+工具失败 Reminder 和异步 Shell 示例都处于禁用状态。当前 `.ycode/config.example.yaml`
+没有 Hook 节点。Hook 必须放在独立 `hooks.yaml`，不能直接成为 `config.yaml` 的顶层字段。
+
+### 2. 事件、上下文与条件
+
+第一期事件分四级并补充系统事件：
+
+| 层级 | 事件 |
+|---|---|
+| 会话 | `session.start`、`session.end` |
+| 用户任务 | `turn.start`、`turn.end` |
+| 模型请求 | `message.before_send`、`message.after_receive` |
+| 工具 | `tool.before_execute`、`tool.after_execute` |
+| 系统 | `context.compacted`、`agent.error` |
+
+`HookContextFactory` 为所有事件加入 `event.name`、`project.path` 和 `session.id`，再按事件
+加入 `turn`、`message`、`tool`、`file`、`context` 或 `error`。before 工具事件使用
+`PermissionEngine.prepare()` 得到的规范化参数；存在字符串 `path` 时额外提供
+`file.path`。消息上下文只暴露角色和完整 TextBlock 文本，不暴露 Thinking 或供应商内部
+事件。
+
+条件通过点路径读取上下文，也支持数组索引，例如：
+
+~~~yaml
+conditions:
+  all:
+    tool.name: {exact: write_file}
+    tool.arguments.path: {glob: "*.py"}
+~~~
+
+一条规则只能选择 `all` 或 `any`，不支持嵌套逻辑表达式。操作符为 `exact`、大小写敏感
+Glob、正则搜索和包装单个正向匹配器的 `not`。字段不存在时始终不匹配，包括 `not`；
+JSON null 与字段缺失不是同一个内部状态；不过当前 `exact` 不接受 null，其他正向操作符
+也只处理字符串，所以两者在可配置条件中都不会形成匹配。
+
+### 3. 模板与四类动作
+
+模板只识别 `{{ field.path }}`，做一次文本替换。缺失字段变成空串；对象、数组、布尔值和
+数字转成稳定 JSON 文本；替换值里即使再次出现 `{{ ... }}` 也不会二次解析。
+
+四类动作的当前语义：
+
+| 动作 | 当前行为 |
+|---|---|
+| `shell` | 使用平台默认 Shell、项目根 cwd 执行，捕获输出，可同步或异步 |
+| `http` | 支持 GET/POST/PUT/PATCH/DELETE，模板化 URL、头和文本/JSON body |
+| `reminder` | 生成请求级 `<system-reminder>`，只供模型下一次请求使用 |
+| `agent` | 不启动子 Agent，只产生“子 Agent Hook 尚未实现：<rule-id>”终端通知 |
+
+同步 `tool.before_execute` Shell 只要有非空 stdout，就会尝试把整段 stdout 解析为严格的
+权限 JSON：
+
+~~~json
+{
+  "permissionDecision": "deny",
+  "permissionDecisionReason": "blocked by project hook"
+}
+~~~
+
+额外字段、非法 JSON 或非零退出会让动态决定失败，再回退到本规则的固定 `permission`；
+没有固定决定时等于不干预。普通 Shell/HTTP 输出只进入有界日志，不会自动显示在终端或
+进入模型上下文。
+
+当前没有通用 `print` 动作。若只是想打印任意模板内容，不能把 `shell: echo` 当成终端
+输出；`agent` 也只有固定占位文字。轻量 `print` 动作已经记录在 Hook task 的后续待办，
+尚未进入 Spec、实现或验收范围。
+
+### 4. HookRuntime 分发与后台任务
+
+`HookRuntime.dispatch()` 按 YAML 声明顺序遍历规则：先检查事件、enabled、once 和条件，
+再消费 executed 并执行动作。同步动作串行完成；异步 Shell/HTTP 使用 asyncio Task 后台
+运行，立即把控制权还给 Agent。动作异常、超时和取消统一转成 HookActionResult 并记录
+有界日志，不触发新的 `agent.error`。
+
+Reminder 进入运行时队列，由 `take_reminders()` 一次性取出并清空。Agent 占位消息进入
+`HookDispatchResult.notices`：Agent Loop 中转换成 `HookNoticeEvent`，`session.start` 合并
+到启动提示，`session.end` 在关闭阶段直接输出。
+
+关闭顺序是：
+
+~~~text
+ChatSession.close()
+    ↓ session.end
+HookRuntime.close()
+    ↓ 最多等待后台任务 3 秒
+    ↓ 取消剩余任务并关闭自有 HTTP Client
+AgentLoop.close()
+    ↓ MCP / Provider 等资源
+~~~
+
+### 5. 权限决定的汇总与短路
+
+单条规则的动态 Shell 决定优先于固定 `permission`。多条 before 规则按声明顺序执行，
+总优先级固定为：
+
+~~~text
+deny > ask > allow > 无决定
+~~~
+
+遇到 deny 会立即返回，不再执行后续 before 规则；ask 不会被后续 allow 降级。AgentLoop
+把 Hook 决定转换成现有 `PermissionDecision`，并设置 `allow_session=false`：
+
+- allow：跳过项目规则、会话授权和权限模式。
+- ask：最多发出一次现有审批，只允许本次，不产生会话授权。
+- deny：生成结构化 permission_denied 工具结果，把原因反馈给模型。
+- 无决定：继续 `evaluate_policy()` 的原有流程。
+
+Hook 位于 `prepare()` 之后，所以无效参数、越界路径、危险 PowerShell 和 plan-only 访问
+限制仍不可绕过。被硬检查、普通权限或 Hook 拒绝的调用没有真正进入 ToolExecutor，也就
+不触发 `tool.after_execute`；真实工具返回成功或错误都会触发 after 事件。
+
+### 6. Agent Loop 和会话生命周期
+
+一个用户任务生成一个 turn ID，内部每次模型请求分别触发消息事件：
+
+~~~text
+turn.start
+    ↓
+每次请求：context.compacted（如果本轮自动压缩成功）
+    ↓ message.before_send
+    ↓ 消费 Reminder 并发送模型请求
+    ↓ message.after_receive（完整消息组装后）
+    ↓ 有工具时：prepare → tool.before_execute → 权限/审批
+    ↓ 真正执行后：tool.after_execute
+    ↓ 下一次模型请求
+    ↓
+turn.end(completed / cancelled / error / limit_reached)
+~~~
+
+导致任务失败时先触发 `agent.error`，再触发 `turn.end(status=error)`。流式 TextDelta、
+ThinkingDelta 和单个内容块不会触发消息 Hook。自动压缩由 AgentLoop 触发
+`context.compacted`；手动 `/compact` 在新检查点成功保存并激活后由 ChatSession 触发。
+
+System Reminder 的关键边界是：
+
+- before_send 产生的 Reminder 进入当前请求。
+- after_receive 或 tool.after_execute 产生的 Reminder 进入下一次请求。
+- Reminder 是 `SystemSupplement(SYSTEM_REMINDER)`，不是用户消息。
+- 使用后队列清空，不进入 ChatSession.history 或 JSONL。
+- `session.end` 配置 Reminder 会在加载阶段被判为非法规则。
+
+### 7. 当前验证与边界
+
+自动化已经覆盖配置降级、条件和模板、once/executed、Shell 权限输出、HTTP、Reminder、
+运行时权限优先级、Agent Loop deny/ask/Reminder/状态集成，以及 Windows ConPTY 中真实的
+ask、deny、模型调整和 session.end 收尾。
+
+当前明确只做功能性实验：没有配置热加载、持久化执行状态、后台重试、生产级 Shell
+沙箱、日志审计、压力/性能/长稳、复杂故障注入、多平台矩阵或真实付费 API 验证。
+
+### 面试表述
+
+YCode 用项目级 YAML 把 Hook 规则映射到会话、任务、模型请求、工具和压缩生命周期。
+HookRuntime 维护会话内 once/executed 状态、同步或后台动作、一次性 System Reminder 和
+权限汇总。工具 before Hook 被放在不可绕过的 `prepare()` 硬检查之后、普通权限策略之前，
+因此既能让 Agent 根据 deny 原因自我调整，也不能越过参数、路径、危险命令和 plan-only
+边界。Hook 错误只进入日志，不污染 Agent 错误事件或会话历史。
 
 ## 内置命令框架
 
@@ -1882,7 +2125,10 @@ ToolSearch 和隐藏 MCP 调用，后者仍会得到 `tool_not_discovered`，不
 ~~~text
 ToolCallBlock(mcp_server_tool, arguments)
     ↓
-PermissionEngine.evaluate()
+PermissionEngine.prepare()
+    ↓ 硬检查通过
+tool.before_execute Hook
+    ↓ Hook 无决定时 evaluate_policy()
     ↓
 人工允许或项目规则放行
     ↓
@@ -2019,7 +2265,11 @@ Token 占用且防止同批次绕过。所有 MCP 工具固定为 UNKNOWN，在�
 AgentLoop 的一轮是：
 
 ~~~text
+turn.start（每个用户任务一次）
+    ↓
 用稳定提示词、动态补充、消息和工具创建 AgentModelRequest
+    ↓
+message.before_send → 消费当前 Hook Reminder
     ↓
 调用 AgentChatProvider.stream_agent()
     ↓
@@ -2027,13 +2277,17 @@ AgentLoop 的一轮是：
     ↓
 ResponseAssembler 组装 Assistant ChatMessage
     ↓
+message.after_receive
+    ↓
 累计本次请求的 TokenUsage
     ↓
 检查 StopReason 与 ToolCallBlock
     ↓
-有工具：PermissionEngine 按位置判定，必要时阻塞审批
+有工具：PermissionEngine.prepare → tool.before_execute → 普通策略/审批
     ↓
 Scheduler 合并拒绝结果并执行允许项
+    ↓
+真实执行完成后触发 tool.after_execute
     ↓
 结果转成 ToolResultBlock
     ↓
@@ -2093,7 +2347,10 @@ ToolResultBlock(
 
 ### 面试表述
 
-YCode 的 AgentLoop 实现最小 ReAct：每轮创建新的 ResponseAssembler，完成一次模型请求后检查停止原因；工具调用交给 Scheduler，结构化结果按调用 ID 回填，再继续请求。无工具调用的 END_TURN 才形成最终回复。循环默认 10 轮，并把正常完成、上限、取消和异常统一成四种终止结果。
+YCode 的 AgentLoop 实现最小 ReAct：每轮创建新的 ResponseAssembler，在完整请求和工具
+边界触发 Hook，完成一次模型请求后检查停止原因；工具先经过两阶段权限与 before Hook，
+再交给 Scheduler，结构化结果按调用 ID 回填。无工具调用的 END_TURN 才形成最终回复。
+循环默认 10 轮，并把正常完成、上限、取消和异常统一成四种 turn.end 状态。
 
 ## 模式、事务与取消
 
@@ -2118,13 +2375,13 @@ plan-only 对普通工具有三层保护：
 
 ~~~text
 第一层：Registry 只把 READ ToolDefinition 发给模型
-第二层：PermissionEngine 在调度前使用 allowed_access 硬拒绝 WRITE/UNKNOWN
+第二层：PermissionEngine.prepare 在 Hook 前使用 allowed_access 硬拒绝 WRITE/UNKNOWN
 第三层：Executor 执行前再次使用 allowed_access 复核
 ~~~
 
 对 MCP 存在一个严格受控的例外：只有 `plan_only.allow_mcp_tools` 白名单中的
 工具才进入可搜索名称，AgentLoop 为执行阶段临时增加 `UNKNOWN`，但
-PermissionEngine 仍对每次调用强制 ASK，不允许会话授权。这不是将 MCP 降级为
+PermissionEngine 的普通策略仍对每次调用强制 ASK，不允许会话授权。这不是将 MCP 降级为
 READ，而是一条显式白名单加逐次审批的例外通道。
 
 最终计划输出后不会自动退出 plan-only。OpenAI 使用 PlainChatRunner 且不装配命令
@@ -2190,21 +2447,29 @@ prompt_toolkit 的基础绑定会忽略 `Ctrl+C`，因此这个显式绑定是�
 
 YCode 把整个用户回合作为会话事务：只有 COMPLETED 才先落盘并再提交内存状态，
 达到上限、用户取消和异常都丢弃临时消息。plan-only 同时限制模型可见工具，
-并由 PermissionEngine 与 Executor 双重复核。活动操作中的 Ctrl+C 取消模型流、阻塞
+并由 PermissionEngine.prepare 与 Executor 双重复核。活动操作中的 Ctrl+C 取消模型流、阻塞
 审批、调度任务或 PowerShell 进程树并恢复输入；空闲输入中的 Ctrl+C 则进入统一安全
 退出管线。
 
 ## 当前验证状态
 
-以 2026-08-04 完成内置命令框架和启动性能优化后的最近一次工作区验证为准：
+截至 2026-08-14，Hook 实现完成后的最新工作区验证为：
 
 ~~~text
-ruff format --check .：通过
-ruff check .：All checks passed
+ruff format --check ycode tests：227 files already formatted
+ruff check ycode tests：All checks passed
 compileall -q ycode tests：通过
-pytest -q：570 passed, 2 skipped
-Windows ConPTY：完整场景通过；一次既有冷启动用例超时，单独重跑通过
+Hook 集成测试：4 passed
+Hook Windows ConPTY 场景：1 passed, 22 deselected
+非 E2E 全量：683 passed, 2 skipped, 1 failed
 ~~~
+
+唯一非 E2E 失败仍是当前工作区
+`.ycode/skills/frontend-design/SKILL.md` 返回 Windows `PermissionError: [WinError 5]`；
+它也会导致对 `.` 执行 Ruff 时 Ruff 自身崩溃，所以本次格式和静态检查明确限定为实际
+Python 源目录 `ycode tests`。完整 E2E 首轮中的既有审批 Ctrl+C 用例曾因 ConPTY 按键
+传递波动失败，单独重跑为 `1 passed`。因此当前不能把全项目状态记录为全绿，但 Hook
+定向单元、集成和真实终端主链路已有实际通过证据。
 
 新增实现与验证覆盖：
 
@@ -2215,6 +2480,10 @@ Windows ConPTY：完整场景通过；一次既有冷启动用例超时，单独
 - 省略 MCP 启动超时时使用 5 秒，显式 10 秒仍优先。
 - 后台启动中的 MCP 可在退出时取消并完成资源清理。
 - 用户在真实空闲输入框中手动确认 `Ctrl+C` 可以直接退出。
+- Hook deny 阻止工具副作用并把原因作为工具结果反馈模型。
+- Hook ask 复用现有审批槽且不产生会话授权。
+- 工具 after Reminder 只进入下一次模型请求，不进入会话历史。
+- 真实终端验证启动风险提示、ask/deny、模型调整和 session.end 收尾。
 
 记忆系统 E2E 使用本地假 SSE Provider，连续启动三个真实 YCode 进程，覆盖：
 
