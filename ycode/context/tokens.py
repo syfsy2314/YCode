@@ -66,6 +66,9 @@ def _request_bytes(request: AgentModelRequest) -> int:
         "supplements": list(request.supplements),
         "tools": [_tool_value(tool) for tool in request.tools],
         "messages": [_message_value(message) for message in request.messages],
+        "continuation_messages": [
+            _message_value(message) for message in request.continuation_messages
+        ],
     }
     serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return len(serialized.encode("utf-8"))

@@ -9,11 +9,14 @@ from typing import Protocol
 from uuid import uuid4
 
 from ycode.agent.contracts import (
+    AgentLoopOptions,
     AgentMode,
+    AgentRequestSnapshot,
     AgentTermination,
     AgentTurn,
     AgentTurnResult,
     AgentTurnStream,
+    ToolPolicyDecision,
     TurnMessage,
 )
 from ycode.agent.events import (
@@ -50,6 +53,7 @@ from ycode.security import (
     PermissionAction,
     PermissionDecision,
     PermissionEngine,
+    PermissionMode,
     PermissionSession,
 )
 from ycode.session.assembler import ResponseAssembler
@@ -92,6 +96,7 @@ class AgentLoop:
         hook_runtime: HookRuntime | None = None,
         hook_context: HookContextFactory | None = None,
         max_rounds: int = 10,
+        options: AgentLoopOptions | None = None,
     ) -> None:
         if not isinstance(max_rounds, int) or isinstance(max_rounds, bool) or max_rounds < 1:
             raise ValueError("Agent 最大轮数必须是正整数")
@@ -116,6 +121,7 @@ class AgentLoop:
         self._hook_context = hook_context
         self._close_task: asyncio.Task[None] | None = None
         self._max_rounds = max_rounds
+        self._options = options or AgentLoopOptions()
         self._queued_request_supplements: list[SystemSupplement] = []
 
     def queue_request_supplement(self, supplement: SystemSupplement) -> None:
@@ -141,8 +147,21 @@ class AgentLoop:
             raise ValueError("AgentLoop 不支持当前模式")
         queued = tuple(self._queued_request_supplements)
         self._queued_request_supplements.clear()
+        turn_id = uuid4().hex
+        if self._options.tool_scope is not None:
+            self._options.tool_scope.turn_id = turn_id
+            self._options.tool_scope.current_snapshot = None
         return AgentTurnStream(
-            lambda turn: self._run(turn, history_snapshot, user_message, mode, queued, None)
+            lambda turn: self._run(
+                turn,
+                history_snapshot,
+                user_message,
+                mode,
+                queued,
+                None,
+                None,
+            ),
+            turn_id=turn_id,
         )
 
     def start_turn_with_skill_scope(
@@ -154,8 +173,42 @@ class AgentLoop:
     ) -> AgentTurn:
         queued = tuple(self._queued_request_supplements)
         self._queued_request_supplements.clear()
+        turn_id = uuid4().hex
+        if self._options.tool_scope is not None:
+            self._options.tool_scope.turn_id = turn_id
+            self._options.tool_scope.current_snapshot = None
         return AgentTurnStream(
-            lambda turn: self._run(turn, tuple(history), user_message, mode, queued, skill_scope)
+            lambda turn: self._run(
+                turn,
+                tuple(history),
+                user_message,
+                mode,
+                queued,
+                skill_scope,
+                None,
+            ),
+            turn_id=turn_id,
+        )
+
+    def start_seeded_turn(
+        self,
+        request: AgentModelRequest,
+        mode: AgentMode,
+    ) -> AgentTurn:
+        if mode not in self.supported_modes:
+            raise ValueError("AgentLoop 不支持当前模式")
+        if not request.continuation_messages:
+            raise ValueError("Seeded turn 必须包含 continuation 任务消息")
+        user_message = request.continuation_messages[-1]
+        if user_message.role != "user":
+            raise ValueError("Seeded turn 最后一条 continuation 必须是用户消息")
+        turn_id = uuid4().hex
+        if self._options.tool_scope is not None:
+            self._options.tool_scope.turn_id = turn_id
+            self._options.tool_scope.current_snapshot = None
+        return AgentTurnStream(
+            lambda turn: self._run(turn, (), user_message, mode, (), None, request),
+            turn_id=turn_id,
         )
 
     async def close(self) -> None:
@@ -168,7 +221,8 @@ class AgentLoop:
             if self._resource_manager is not None:
                 await self._resource_manager.close()
         finally:
-            await self._provider.close()
+            if self._options.owns_provider:
+                await self._provider.close()
 
     async def _run(
         self,
@@ -178,12 +232,21 @@ class AgentLoop:
         mode: AgentMode,
         queued_supplements: tuple[SystemSupplement, ...],
         provided_skill_scope=None,
+        seed_request: AgentModelRequest | None = None,
     ) -> AsyncIterator[AgentEvent]:
-        turn_id = uuid4().hex
-        working_messages = [*history, user_message]
+        turn_id = turn.turn_id
+        seed_messages = list(seed_request.messages) if seed_request is not None else []
+        working_messages = (
+            list(seed_request.continuation_messages)
+            if seed_request is not None
+            else [*history, user_message]
+        )
         turn_messages = [TurnMessage(user_message, datetime.now(UTC))]
         context_transaction = (
-            self._context_manager.begin_turn(history, user_message)
+            self._context_manager.begin_turn(
+                tuple(working_messages[:-1]) if seed_request is not None else history,
+                user_message,
+            )
             if self._context_manager is not None
             else None
         )
@@ -207,14 +270,27 @@ class AgentLoop:
         skill_scope = provided_skill_scope
         if skill_scope is None and self._skill_runtime is not None:
             skill_scope = self._skill_runtime.begin_task(mode)
-        context = ToolContext(self._context.workspace, exposure, skill_scope)
+        context = ToolContext(
+            self._context.workspace,
+            exposure,
+            skill_scope,
+            self._options.tool_scope,
+        )
         usage = TokenUsage()
         completed = False
+        runtime_notifications: list[SystemSupplement] = []
+
+        async def dispatch_hook(event):
+            assert self._hook_runtime is not None
+            return await self._hook_runtime.dispatch(
+                event,
+                scope_id=self._options.hook_scope_id,
+            )
 
         async def finish_error(code: str, message: str) -> tuple[AgentEvent, ...]:
             events: list[AgentEvent] = []
             if self._hook_runtime is not None and self._hook_context is not None:
-                error_result = await self._hook_runtime.dispatch(
+                error_result = await dispatch_hook(
                     self._hook_context.simple(
                         HookEventName.AGENT_ERROR,
                         turn={"id": turn_id},
@@ -222,7 +298,7 @@ class AgentLoop:
                     )
                 )
                 events.extend(HookNoticeEvent(item) for item in error_result.notices)
-                end_result = await self._hook_runtime.dispatch(
+                end_result = await dispatch_hook(
                     self._hook_context.simple(
                         HookEventName.TURN_END,
                         turn={"id": turn_id, "status": "error"},
@@ -236,7 +312,7 @@ class AgentLoop:
         try:
             if self._hook_runtime is not None and self._hook_context is not None:
                 hook_result = await turn.run_child(
-                    self._hook_runtime.dispatch(
+                    dispatch_hook(
                         self._hook_context.simple(
                             HookEventName.TURN_START,
                             turn={"id": turn_id},
@@ -246,69 +322,106 @@ class AgentLoop:
                 )
                 for notice in hook_result.notices:
                     yield HookNoticeEvent(notice)
-            environment = await turn.run_child(self._environment.collect())
-            request_supplements = [*queued_supplements, environment.to_supplement()]
-            if deferred_names:
-                request_supplements.append(
-                    SystemSupplement(
-                        SupplementKind.TOOL_CATALOG,
-                        "Available deferred MCP tools (use tool_search before calling): "
-                        + ", ".join(sorted(deferred_names)),
+            fixed_supplement_contents: tuple[str, ...]
+            if seed_request is None:
+                environment = await turn.run_child(self._environment.collect())
+                request_supplements = [*queued_supplements, environment.to_supplement()]
+                if deferred_names:
+                    request_supplements.append(
+                        SystemSupplement(
+                            SupplementKind.TOOL_CATALOG,
+                            "Available deferred MCP tools (use tool_search before calling): "
+                            + ", ".join(sorted(deferred_names)),
+                        )
                     )
-                )
-            if self._permission_session is not None:
-                request_supplements.append(
-                    SystemSupplement(
-                        SupplementKind.TOOL_STATE,
-                        f"Current permission mode: {self._permission_session.mode.value}.",
+                if self._permission_session is not None:
+                    request_supplements.append(
+                        SystemSupplement(
+                            SupplementKind.TOOL_STATE,
+                            f"Current permission mode: {self._permission_session.mode.value}.",
+                        )
                     )
+                system_prompt = self._prompt_bundle.content_blocks
+                prompt_context = self._prompt_runtime.begin_turn(
+                    mode.value,
+                    tuple(request_supplements),
                 )
-            system_prompt = self._prompt_bundle.content_blocks
-            prompt_context = self._prompt_runtime.begin_turn(
-                mode.value,
-                tuple(request_supplements),
-            )
-            request_kinds = {item.kind for item in request_supplements}
-            fixed_supplements = tuple(
-                item
-                for item in prompt_context.supplements
-                if item.kind in request_kinds or item.kind is SupplementKind.MODE
-            )
+                request_kinds = {item.kind for item in request_supplements}
+                fixed_supplement_contents = tuple(
+                    item.tagged_content
+                    for item in prompt_context.supplements
+                    if item.kind in request_kinds or item.kind is SupplementKind.MODE
+                )
+            else:
+                system_prompt = seed_request.system_prompt
+                fixed_supplement_contents = seed_request.supplements
             for round_number in range(1, self._max_rounds + 1):
                 if self._skill_runtime is not None and skill_scope is not None:
                     self._skill_runtime.refresh_task_prompt(skill_scope)
-                supplements = tuple(
-                    supplement.tagged_content
-                    for supplement in (
-                        *self._prompt_runtime.session_supplements,
-                        *fixed_supplements,
+                if self._options.notification_source is not None:
+                    runtime_notifications.extend(self._options.notification_source.take_pending())
+                session_supplements = (
+                    tuple(
+                        supplement.tagged_content
+                        for supplement in self._prompt_runtime.session_supplements
                     )
+                    if seed_request is None
+                    else ()
                 )
-                definitions = self._registry.definitions(allowed_access, exposure.exposed_names)
-                if mode is AgentMode.PLAN_ONLY and not deferred_names:
-                    definitions = tuple(
-                        definition for definition in definitions if definition.name != "tool_search"
-                    )
-                if self._skill_runtime is not None and skill_scope is not None:
-                    visible = self._skill_runtime.visible_tools(
-                        skill_scope,
-                        frozenset(definition.name for definition in definitions),
-                    )
-                    definitions = tuple(
-                        definition for definition in definitions if definition.name in visible
-                    )
+                supplements = (
+                    *session_supplements,
+                    *fixed_supplement_contents,
+                    *(item.tagged_content for item in runtime_notifications),
+                )
+                if seed_request is None:
+                    definitions = self._registry.definitions(allowed_access, exposure.exposed_names)
+                    if mode is AgentMode.PLAN_ONLY and not deferred_names:
+                        definitions = tuple(
+                            definition
+                            for definition in definitions
+                            if definition.name != "tool_search"
+                        )
+                    if self._skill_runtime is not None and skill_scope is not None:
+                        visible = self._skill_runtime.visible_tools(
+                            skill_scope,
+                            frozenset(definition.name for definition in definitions),
+                        )
+                        definitions = tuple(
+                            definition for definition in definitions if definition.name in visible
+                        )
+                else:
+                    definitions = seed_request.tools
                 advertised_names = frozenset(definition.name for definition in definitions)
                 model_request = AgentModelRequest(
-                    messages=tuple(working_messages),
+                    messages=(
+                        tuple(seed_messages)
+                        if seed_request is not None
+                        else tuple(working_messages)
+                    ),
                     system_prompt=system_prompt,
                     supplements=supplements,
+                    continuation_messages=(
+                        tuple(working_messages) if seed_request is not None else ()
+                    ),
                     tools=definitions,
+                    max_output_tokens=(
+                        seed_request.max_output_tokens if seed_request is not None else None
+                    ),
+                    thinking_enabled=(
+                        seed_request.thinking_enabled if seed_request is not None else None
+                    ),
                 )
                 prepared = None
                 if context_transaction is not None:
                     try:
                         prepared = await turn.run_child(
-                            context_transaction.prepare_request(model_request)
+                            context_transaction.prepare_request(
+                                model_request,
+                                preserve_messages=(
+                                    seed_request is not None and self._options.preserve_seed_prefix
+                                ),
+                                allow_preserved_compaction=round_number > 1,
+                            )
                         )
                     except ContextLimitError as error:
                         if error.failure_report is not None:
@@ -322,12 +435,16 @@ class AgentLoop:
                         ):
                             yield terminal_event
                         return
-                    working_messages = list(prepared.messages)
+                    if seed_request is None:
+                        working_messages = list(prepared.messages)
+                    else:
+                        seed_messages = list(prepared.request.messages)
+                        working_messages = list(prepared.request.continuation_messages)
                     model_request = prepared.request
                     if prepared.compaction_report is not None:
                         if self._hook_runtime is not None and self._hook_context is not None:
                             hook_result = await turn.run_child(
-                                self._hook_runtime.dispatch(
+                                dispatch_hook(
                                     self._hook_context.compacted(
                                         turn_id, prepared.compaction_report
                                     )
@@ -341,17 +458,21 @@ class AgentLoop:
 
                 if self._hook_runtime is not None and self._hook_context is not None:
                     hook_result = await turn.run_child(
-                        self._hook_runtime.dispatch(
+                        dispatch_hook(
                             self._hook_context.message(
                                 HookEventName.MESSAGE_BEFORE_SEND,
                                 turn_id,
-                                model_request.messages[-1],
+                                (
+                                    model_request.continuation_messages[-1]
+                                    if model_request.continuation_messages
+                                    else model_request.messages[-1]
+                                ),
                             )
                         )
                     )
                     for notice in hook_result.notices:
                         yield HookNoticeEvent(notice)
-                    reminders = self._hook_runtime.take_reminders()
+                    reminders = self._hook_runtime.take_reminders(self._options.hook_scope_id)
                     if reminders:
                         model_request = replace(
                             model_request,
@@ -360,6 +481,20 @@ class AgentLoop:
                                 *(item.tagged_content for item in reminders),
                             ),
                         )
+
+                if self._options.tool_scope is not None:
+                    permission_mode = (
+                        self._permission_session.mode
+                        if self._permission_session is not None
+                        else PermissionMode.DEFAULT
+                    )
+                    self._options.tool_scope.current_snapshot = AgentRequestSnapshot(
+                        turn_id,
+                        model_request,
+                        mode,
+                        permission_mode,
+                        frozenset(definition.name for definition in model_request.tools),
+                    )
 
                 assembler = ResponseAssembler()
                 stream = self._provider.stream_agent(model_request)
@@ -385,7 +520,7 @@ class AgentLoop:
                 assistant_message = assembler.finish()
                 if self._hook_runtime is not None and self._hook_context is not None:
                     hook_result = await turn.run_child(
-                        self._hook_runtime.dispatch(
+                        dispatch_hook(
                             self._hook_context.message(
                                 HookEventName.MESSAGE_AFTER_RECEIVE,
                                 turn_id,
@@ -409,7 +544,7 @@ class AgentLoop:
                 if stop_reason is StopReason.END_TURN and not tool_calls:
                     if self._hook_runtime is not None and self._hook_context is not None:
                         hook_result = await turn.run_child(
-                            self._hook_runtime.dispatch(
+                            dispatch_hook(
                                 self._hook_context.simple(
                                     HookEventName.TURN_END,
                                     turn={"id": turn_id, "status": "completed"},
@@ -472,6 +607,13 @@ class AgentLoop:
                         and call.name not in advertised_names
                     )
                 }
+                if self._options.tool_policy is not None:
+                    for position, call in enumerate(tool_calls):
+                        if position in denied_results:
+                            continue
+                        policy_decision = self._options.tool_policy.evaluate(call)
+                        if not policy_decision.allowed:
+                            denied_results[position] = _tool_policy_denied_result(policy_decision)
                 if self._permission_engine is not None and self._permission_session is not None:
                     for position, call in enumerate(tool_calls):
                         if position in denied_results:
@@ -488,7 +630,7 @@ class AgentLoop:
                             hook_permission = None
                             if self._hook_runtime is not None and self._hook_context is not None:
                                 hook_result = await turn.run_child(
-                                    self._hook_runtime.dispatch(
+                                    dispatch_hook(
                                         self._hook_context.tool_before(
                                             turn_id,
                                             call,
@@ -518,6 +660,9 @@ class AgentLoop:
                         if decision.action is PermissionAction.ALLOW:
                             continue
                         if decision.action is PermissionAction.ASK:
+                            if self._options.non_interactive_approvals:
+                                denied_results[position] = _permission_denied_result(decision)
+                                continue
                             turn.begin_approval()
                             yield ToolApprovalRequested(
                                 round_number,
@@ -567,7 +712,7 @@ class AgentLoop:
                             and self._hook_context is not None
                         ):
                             hook_result = await turn.run_child(
-                                self._hook_runtime.dispatch(
+                                dispatch_hook(
                                     self._hook_context.tool_after(turn_id, scheduled_event.record)
                                 )
                             )
@@ -611,7 +756,7 @@ class AgentLoop:
                     message = f"Agent 已达到最大轮数 {self._max_rounds}。"
                     if self._hook_runtime is not None and self._hook_context is not None:
                         hook_result = await turn.run_child(
-                            self._hook_runtime.dispatch(
+                            dispatch_hook(
                                 self._hook_context.simple(
                                     HookEventName.TURN_END,
                                     turn={"id": turn_id, "status": "limit_reached"},
@@ -644,7 +789,7 @@ class AgentLoop:
                 )
             )
             if self._hook_runtime is not None and self._hook_context is not None:
-                hook_result = await self._hook_runtime.dispatch(
+                hook_result = await dispatch_hook(
                     self._hook_context.simple(
                         HookEventName.TURN_END,
                         turn={"id": turn_id, "status": "cancelled"},
@@ -674,6 +819,8 @@ class AgentLoop:
                 yield terminal_event
         finally:
             exposure.clear()
+            if self._options.clear_hook_scope_on_finish and self._hook_runtime is not None:
+                self._hook_runtime.clear_scope(self._options.hook_scope_id)
             if not completed and self._skill_runtime is not None and skill_scope is not None:
                 self._skill_runtime.discard_task(skill_scope)
 
@@ -729,6 +876,14 @@ def _tool_not_discovered_result() -> ToolExecutionResult:
         content="MCP 工具尚未通过 tool_search 发现。",
         is_error=True,
         metadata={"code": "tool_not_discovered"},
+    )
+
+
+def _tool_policy_denied_result(decision: ToolPolicyDecision) -> ToolExecutionResult:
+    return ToolExecutionResult(
+        content=decision.message,
+        is_error=True,
+        metadata={"code": decision.code},
     )
 
 

@@ -18,6 +18,7 @@ class AgentModelRequest:
     messages: tuple[ChatMessage, ...]
     system_prompt: tuple[str, ...] = ()
     supplements: tuple[str, ...] = ()
+    continuation_messages: tuple[ChatMessage, ...] = ()
     tools: tuple[ToolDefinition[Any], ...] = ()
     max_output_tokens: int | None = None
     thinking_enabled: bool | None = None
@@ -26,6 +27,7 @@ class AgentModelRequest:
         messages = tuple(self.messages)
         system_prompt = tuple(self.system_prompt)
         supplements = tuple(self.supplements)
+        continuation_messages = tuple(self.continuation_messages)
         tools = tuple(self.tools)
         if not messages or any(not isinstance(message, ChatMessage) for message in messages):
             raise ValueError("Agent 模型请求必须包含 ChatMessage")
@@ -33,6 +35,8 @@ class AgentModelRequest:
             raise ValueError("System Prompt 内容块不能为空")
         if any(not isinstance(content, str) or not content.strip() for content in supplements):
             raise ValueError("系统补充内容不能为空")
+        if any(not isinstance(message, ChatMessage) for message in continuation_messages):
+            raise ValueError("Continuation 必须包含 ChatMessage")
         if self.max_output_tokens is not None and (
             not isinstance(self.max_output_tokens, int)
             or isinstance(self.max_output_tokens, bool)
@@ -44,6 +48,7 @@ class AgentModelRequest:
         object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "system_prompt", system_prompt)
         object.__setattr__(self, "supplements", supplements)
+        object.__setattr__(self, "continuation_messages", continuation_messages)
         object.__setattr__(self, "tools", tools)
 
 

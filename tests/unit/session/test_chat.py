@@ -220,6 +220,37 @@ async def test_session_cancel_api_returns_cancel_event_and_rolls_back() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_cancel_cascades_to_children_owned_by_active_turn() -> None:
+    class ChildManager:
+        def __init__(self) -> None:
+            self.cancelled: list[str] = []
+
+        async def cancel_owned(self, turn_id: str) -> None:
+            self.cancelled.append(turn_id)
+
+        async def clear(self) -> None:
+            pass
+
+    provider = FakeProvider([text_response("late")], delay=10)
+    manager = ChildManager()
+    session = ChatSession(  # type: ignore[arg-type]
+        PlainChatRunner(provider),
+        subagent_manager=manager,
+    )
+    task = asyncio.create_task(collect(session, "hello"))
+    await provider.request_started.wait()
+
+    session.cancel_active_turn()
+    events = await task
+    await asyncio.sleep(0)
+
+    assert isinstance(events[-1], AgentCancelledEvent)
+    assert len(manager.cancelled) == 1
+    assert manager.cancelled[0]
+    await session.close()
+
+
+@pytest.mark.asyncio
 async def test_mode_commands_do_not_call_provider_or_enter_history() -> None:
     provider = FakeProvider([])
     runner = PlainChatRunner(provider)
@@ -376,8 +407,8 @@ async def test_session_hook_start_notice_and_end_notice(tmp_path, capsys) -> Non
     await session.close()
     await session.close()
 
-    assert session.startup_warnings == ("子 Agent Hook 尚未实现：started",)
-    assert capsys.readouterr().out.count("hook: 子 Agent Hook 尚未实现：ended") == 1
+    assert session.startup_warnings == ()
+    assert "子 Agent Hook 尚未实现" not in capsys.readouterr().out
     assert provider.close_count == 1
 
 

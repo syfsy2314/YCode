@@ -14,7 +14,8 @@ async def test_agent_and_reminder(tmp_path) -> None:
         {"id": "agent-demo", "event": "session.start", "action": {"type": "agent"}}
     )
     result = await executors.execute(agent, _event())
-    assert "尚未实现" in result.message
+    assert result.status.value == "succeeded"
+    assert result.message == ""
 
     reminder = HookRule.model_validate(
         {

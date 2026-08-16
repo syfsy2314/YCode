@@ -117,30 +117,30 @@ def load_named_anthropic_provider(
     loaded: LoadedAppConfig,
     name: str,
 ) -> ProviderConfig:
-    """按需校验 Skill 引用的已有 Anthropic Provider。"""
+    """按需校验功能配置引用的已有 Anthropic Provider。"""
 
     if loaded.active_provider.name == name:
         if loaded.active_provider.protocol is not ProviderProtocol.ANTHROPIC:
-            raise ConfigError(f"Skill 模型配置不是 Anthropic Provider：{name}")
+            raise ConfigError(f"模型配置不是 Anthropic Provider：{name}")
         return loaded.active_provider
     try:
         index, entry = next(
             (index, entry) for index, entry in enumerate(loaded.app.providers) if entry.name == name
         )
     except StopIteration as error:
-        raise ConfigError(f"Skill 模型配置不存在：{name}") from error
+        raise ConfigError(f"模型配置不存在：{name}") from error
     data = entry.as_mapping()
     if data.get("protocol") != ProviderProtocol.ANTHROPIC:
-        raise ConfigError(f"Skill 模型配置不是 Anthropic Provider：{name}")
+        raise ConfigError(f"模型配置不是 Anthropic Provider：{name}")
     resolver = EnvironmentResolver(load_project_dotenv(loaded.project_root))
     data = _expand_active_api_key(data, index, resolver)
     try:
         provider = ProviderConfig.model_validate(data)
     except ValidationError as error:
         raise ConfigError(
-            f"Skill 模型配置校验失败：{_format_validation_error(error, ('providers', index))}"
+            f"模型配置校验失败：{_format_validation_error(error, ('providers', index))}"
         ) from error
     if provider.protocol is not ProviderProtocol.ANTHROPIC:
-        raise ConfigError(f"Skill 模型配置不是 Anthropic Provider：{name}")
+        raise ConfigError(f"模型配置不是 Anthropic Provider：{name}")
     loaded.redactor.add(provider.api_key)
     return provider

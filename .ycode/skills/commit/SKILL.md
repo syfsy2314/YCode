@@ -1,6 +1,6 @@
 ---
 name: commit
-description: Inspect current changes and create a focused Git commit.
+description: 检查当前变更并创建一个聚焦的 Git 提交。
 allowed-tools: Read Grep Bash(git:*)
 ---
 Inspect the current repository changes and understand their purpose. Run the relevant focused checks,

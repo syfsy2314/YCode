@@ -155,7 +155,7 @@
 **验证：** 运行 `.venv\Scripts\python.exe -m pytest -q tests/unit/prompt/test_models.py`，
 预期全部通过。
 
-## T8：实现 Reminder 与 Agent 占位执行器
+## T8：实现 Reminder 与 Agent 兼容执行器
 
 **文件：** `ycode/hooks/executors.py`、`tests/unit/hooks/test_executors.py`  
 **依赖：** T1、T4、T7
@@ -164,7 +164,7 @@
 
 1. 定义统一 HookActionExecutor 协议。
 2. 实现 Reminder 模板渲染、XML 转义和 SystemSupplement 结果。
-3. 实现 Agent 占位动作，返回包含规则 ID 的终端通知。
+3. 保留 Agent 兼容动作并静默完成，不创建子 Agent 或返回遗留占位通知。
 4. 确保执行器异常转换为统一失败结果。
 5. 测试 Reminder 标签、一次性内容和 Agent 未实际启动行为。
 
@@ -371,7 +371,7 @@
 2. 提供启动入口触发 `session.start`，将通知合并到 startup_warnings。
 3. 手动压缩成功激活后触发 `context.compacted`。
 4. `close()` 在关闭 AgentLoop 前触发 `session.end`，随后关闭 HookRuntime。
-5. session.end Agent 占位通知通过关闭通知通道输出。
+5. session.end Agent 兼容动作不通过关闭通知通道输出占位信息。
 6. 测试会话起止顺序、手动压缩、重复 close 和无 Hook 兼容。
 
 **验证：** 运行 `.venv\Scripts\python.exe -m pytest -q tests/unit/session/test_chat.py -k hook`，

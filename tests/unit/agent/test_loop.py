@@ -11,13 +11,16 @@ from ycode.agent import (
     AgentErrorEvent,
     AgentLimitReachedEvent,
     AgentLoop,
+    AgentLoopOptions,
     AgentMode,
     AgentTermination,
     AgentTextDelta,
+    AgentToolScope,
     ContextCompactedEvent,
     FinalResponseEvent,
     ToolApprovalRequested,
     ToolExecutionCompleted,
+    ToolPolicyDecision,
 )
 from ycode.config import SecretRedactor
 from ycode.context import (
@@ -27,6 +30,7 @@ from ycode.context import (
     ConversationCompactor,
 )
 from ycode.core import (
+    AgentModelRequest,
     ChatMessage,
     StopReason,
     StreamEnd,
@@ -44,6 +48,7 @@ from ycode.prompt import (
     PromptRuntimeContext,
     build_builtin_prompt,
 )
+from ycode.prompt.models import SupplementKind, SystemSupplement
 from ycode.security import (
     ApprovalChoice,
     CommandSafetyResult,
@@ -141,6 +146,7 @@ def create_loop(
     context_manager: ContextManager | None = None,
     hook_runtime: HookRuntime | None = None,
     hook_context: HookContextFactory | None = None,
+    options: AgentLoopOptions | None = None,
 ) -> AgentLoop:
     registry = ToolRegistry()
     for tool in tools:
@@ -185,11 +191,120 @@ def create_loop(
         hook_runtime=hook_runtime,
         hook_context=hook_context,
         max_rounds=max_rounds,
+        options=options,
     )
 
 
 async def consume(turn) -> list[object]:
     return [event async for event in turn]
+
+
+class SequenceNotificationSource:
+    def __init__(self, values: list[tuple[SystemSupplement, ...]]) -> None:
+        self.values = values
+
+    def take_pending(self) -> tuple[SystemSupplement, ...]:
+        return self.values.pop(0) if self.values else ()
+
+
+class DenyToolPolicy:
+    def evaluate(self, call: ToolCallBlock) -> ToolPolicyDecision:
+        return ToolPolicyDecision(False, "subagent_tool_denied", f"denied {call.name}")
+
+
+async def test_request_snapshot_captures_actual_sent_request_and_turn_id(tmp_path) -> None:
+    provider = FakeProvider([final_turn()])
+    scope = AgentToolScope()
+    loop = create_loop(tmp_path, provider, options=AgentLoopOptions(tool_scope=scope))
+
+    turn = loop.start_turn((), ChatMessage.user_text("hello"), AgentMode.AGENT)
+    await consume(turn)
+
+    assert turn.turn_id == scope.turn_id
+    assert scope.current_snapshot is not None
+    assert scope.current_snapshot.turn_id == turn.turn_id
+    assert scope.current_snapshot.request == provider.agent_requests[0]
+
+
+async def test_runtime_notifications_enter_next_boundary_and_stay_in_turn(tmp_path) -> None:
+    provider = FakeProvider(
+        [tool_turn("call-1", "inspect"), tool_turn("call-2", "inspect"), final_turn()]
+    )
+    tool = CountingTool("inspect", ToolAccess.READ)
+    notice = SystemSupplement(SupplementKind.SYSTEM_REMINDER, "task completed")
+    source = SequenceNotificationSource([(), (notice,), ()])
+    loop = create_loop(
+        tmp_path,
+        provider,
+        tool,
+        options=AgentLoopOptions(notification_source=source),
+    )
+
+    await consume(loop.start_turn((), ChatMessage.user_text("work"), AgentMode.AGENT))
+
+    assert "task completed" not in "\n".join(provider.agent_requests[0].supplements)
+    assert "task completed" in "\n".join(provider.agent_requests[1].supplements)
+    assert "task completed" in "\n".join(provider.agent_requests[2].supplements)
+
+
+async def test_tool_policy_denies_before_permission_and_execution(tmp_path) -> None:
+    provider = FakeProvider([tool_turn("call-1", "mutate"), final_turn("alternative")])
+    tool = CountingTool("mutate", ToolAccess.WRITE)
+    loop = create_loop(
+        tmp_path,
+        provider,
+        tool,
+        permission_mode=PermissionMode.ALLOW,
+        options=AgentLoopOptions(tool_policy=DenyToolPolicy()),
+    )
+
+    await consume(loop.start_turn((), ChatMessage.user_text("change"), AgentMode.AGENT))
+
+    assert tool.calls == 0
+    result = provider.agent_requests[1].messages[-1].blocks(ToolResultBlock)[0]
+    assert "subagent_tool_denied" in result.content
+
+
+async def test_non_interactive_approval_is_returned_as_denial(tmp_path) -> None:
+    provider = FakeProvider([tool_turn("call-1", "mutate"), final_turn("alternative")])
+    tool = CountingTool("mutate", ToolAccess.WRITE)
+    loop = create_loop(
+        tmp_path,
+        provider,
+        tool,
+        permission_mode=PermissionMode.DEFAULT,
+        options=AgentLoopOptions(non_interactive_approvals=True),
+    )
+
+    events = await consume(loop.start_turn((), ChatMessage.user_text("change"), AgentMode.AGENT))
+
+    assert not any(isinstance(event, ToolApprovalRequested) for event in events)
+    assert tool.calls == 0
+
+
+async def test_seeded_turn_preserves_prefix_and_borrowed_provider(tmp_path) -> None:
+    provider = FakeProvider([final_turn("child result")])
+    loop = create_loop(tmp_path, provider, options=AgentLoopOptions(owns_provider=False))
+    parent = ChatMessage.user_text("parent request")
+    task = ChatMessage.user_text("fork task")
+    seed = AgentModelRequest(
+        messages=(parent,),
+        system_prompt=("stable",),
+        supplements=("runtime",),
+        continuation_messages=(task,),
+        thinking_enabled=False,
+    )
+
+    turn = loop.start_seeded_turn(seed, AgentMode.AGENT)
+    await consume(turn)
+
+    request = provider.agent_requests[0]
+    assert request.messages == (parent,)
+    assert request.system_prompt == ("stable",)
+    assert request.supplements == ("runtime",)
+    assert request.continuation_messages == (task,)
+    await loop.close()
+    assert provider.close_count == 0
 
 
 def summary_response() -> str:

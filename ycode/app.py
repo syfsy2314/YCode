@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import httpx
 
-from ycode.agent import AgentLoop, AgentMode, PlainChatRunner
+from ycode.agent import AgentLoop, AgentLoopOptions, AgentMode, AgentToolScope, PlainChatRunner
 from ycode.commands import CommandDefinitionError, build_command_runtime
 from ycode.config.discovery import discover_config
 from ycode.config.loader import load_config, load_named_anthropic_provider
@@ -31,7 +31,9 @@ from ycode.memory import MemoryStore, MemoryUpdater
 from ycode.prompt import (
     EnvironmentCollector,
     ProjectContextLoader,
+    PromptBundle,
     PromptRuntimeContext,
+    PromptSection,
     build_builtin_prompt,
 )
 from ycode.providers.factory import create_provider
@@ -48,8 +50,17 @@ from ycode.skills.commands import build_skill_command_definitions
 from ycode.skills.context import SkillContextBuilder
 from ycode.skills.installer import SkillInstaller
 from ycode.skills.isolated import IsolatedSkillRunner, ScopedSkillConversationRunner
+from ycode.subagents import (
+    SubagentManager,
+    SubagentProviderPool,
+    SubagentRoleCatalog,
+    SubagentRoleLoader,
+    SubagentRoleValidationEnvironment,
+    SubagentRunner,
+)
 from ycode.tools import ToolContext, ToolExecutor, ToolScheduler, create_builtin_registry
 from ycode.tools.builtin import InstallSkillTool, LoadSkillTool
+from ycode.tools.builtin.run_subagent import RunSubagentTool
 from ycode.tools.builtin.tool_search import ToolSearchTool
 from ycode.tools.command import PowerShellCommandRunner
 from ycode.tools.paths import WorkspacePathResolver
@@ -82,6 +93,8 @@ async def run_app(
     has_enabled_mcp = False
     skill_http_client: httpx.AsyncClient | None = None
     hook_runtime: HookRuntime | None = None
+    subagent_manager: SubagentManager | None = None
+    subagent_provider_pool: SubagentProviderPool | None = None
     try:
         if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
             try:
@@ -155,6 +168,22 @@ async def run_app(
             registry.register(InstallSkillTool(installer))
             if has_enabled_mcp:
                 registry.register(ToolSearchTool(registry))
+            subagent_environment = SubagentRoleValidationEnvironment(
+                frozenset(
+                    {
+                        *(tool.definition.name for tool in registry),
+                        "run_subagent",
+                    }
+                ),
+                provider_names,
+            )
+            subagent_catalog = SubagentRoleCatalog(
+                workspace,
+                SubagentRoleLoader(),
+                subagent_environment,
+            )
+            subagent_manager = SubagentManager(config.app.subagents, subagent_catalog)
+            registry.register(RunSubagentTool(subagent_manager))
             security_result = load_security_config(workspace, registry)
             if manager is not None:
                 manager.set_security_warnings(security_result.warnings)
@@ -187,6 +216,80 @@ async def run_app(
             hook_result = load_hook_config(workspace)
             hook_runtime = HookRuntime(hook_result.rules, workspace)
             hook_context = HookContextFactory(workspace, uuid4().hex)
+            subagent_catalog.load()
+
+            subagent_provider_pool = SubagentProviderPool(
+                config.active_provider,
+                cast(AgentChatProvider, provider),
+                lambda name: load_named_anthropic_provider(config, name),
+                provider_factory,
+            )
+
+            def subagent_loop_factory(runtime):
+                child_prompt = PromptRuntimeContext()
+                for supplement in project_context.supplements:
+                    child_prompt.set_session_supplement(supplement)
+                prompt_bundle = build_builtin_prompt()
+                if runtime.role is not None:
+                    prompt_bundle = PromptBundle(
+                        (
+                            *prompt_bundle.sections,
+                            PromptSection("subagent-role", 90, runtime.role.config.prompt),
+                        )
+                    )
+                child_context = ContextManager(
+                    policy,
+                    ContextArtifactStore(workspace, config.redactor, policy),
+                    ConversationCompactor(runtime.provider),
+                )
+                child_permission_engine = PermissionEngine(
+                    registry,
+                    resolver,
+                    security_result.config,
+                    PowerShellSafetyChecker(workspace),
+                )
+                child_hook_context = HookContextFactory(
+                    workspace,
+                    uuid4().hex,
+                    task_metadata={
+                        "task_id": runtime.task_id,
+                        "creation_mode": "fork" if runtime.role is None else "defined",
+                        "role": runtime.role.config.name if runtime.role is not None else None,
+                        "run_mode": runtime.run_mode.value,
+                    },
+                )
+                return AgentLoop(
+                    runtime.provider,
+                    registry,
+                    ToolScheduler(registry, ToolExecutor(registry)),
+                    prompt_bundle,
+                    child_prompt,
+                    EnvironmentCollector(workspace),
+                    ToolContext(workspace),
+                    permission_engine=child_permission_engine,
+                    permission_session=PermissionSession(runtime.permission_mode),
+                    context_manager=child_context,
+                    resource_manager=child_context,
+                    hook_runtime=hook_runtime,
+                    hook_context=child_hook_context,
+                    max_rounds=runtime.max_rounds,
+                    options=AgentLoopOptions(
+                        tool_policy=runtime.policy,
+                        hook_scope_id=runtime.hook_scope_id,
+                        non_interactive_approvals=True,
+                        owns_provider=False,
+                        clear_hook_scope_on_finish=True,
+                        preserve_seed_prefix=runtime.preserve_seed_prefix,
+                    ),
+                )
+
+            subagent_runner = SubagentRunner(
+                subagent_provider_pool,
+                registry,
+                subagent_loop_factory,
+                frozenset(config.app.subagents.async_allowed_tools),
+            )
+            subagent_manager.bind(subagent_runner)
 
             def isolated_loop_factory(temp_provider, temp_prompt, scope):
                 loop = AgentLoop(
@@ -234,6 +337,11 @@ async def run_app(
                 skill_runtime=skill_runtime,
                 hook_runtime=hook_runtime,
                 hook_context=hook_context,
+                options=AgentLoopOptions(
+                    notification_source=subagent_manager,
+                    tool_scope=AgentToolScope(),
+                    owns_provider=False,
+                ),
             )
         else:
             runner = PlainChatRunner(provider)
@@ -260,6 +368,7 @@ async def run_app(
                 skill_runtime=skill_runtime,
                 hook_runtime=hook_runtime,
                 hook_context=hook_context,
+                subagent_manager=subagent_manager,
             )
             session_ref["session"] = session
             if continue_session:
@@ -276,6 +385,8 @@ async def run_app(
         await ui.run()
     finally:
         try:
+            if subagent_manager is not None:
+                await subagent_manager.clear()
             if session is not None:
                 await session.close()
             else:
@@ -284,14 +395,22 @@ async def run_app(
                         await manager.close()
                 finally:
                     try:
-                        await provider.close()
+                        if context_manager is not None:
+                            await context_manager.close()
                     finally:
-                        try:
-                            if context_manager is not None:
-                                await context_manager.close()
-                        finally:
-                            if hook_runtime is not None:
-                                await hook_runtime.close()
+                        if hook_runtime is not None:
+                            await hook_runtime.close()
         finally:
-            if skill_http_client is not None:
-                await skill_http_client.aclose()
+            try:
+                if subagent_provider_pool is not None:
+                    await subagent_provider_pool.close()
+            finally:
+                try:
+                    if (
+                        config.active_provider.protocol is ProviderProtocol.ANTHROPIC
+                        or session is None
+                    ):
+                        await provider.close()
+                finally:
+                    if skill_http_client is not None:
+                        await skill_http_client.aclose()

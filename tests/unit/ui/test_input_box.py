@@ -206,3 +206,18 @@ async def test_approval_without_session_option_does_not_bind_three() -> None:
         assert not task.done()
         pipe_input.send_text("2")
         assert await task is ApprovalChoice.ALLOW_ONCE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["\x03", "\x1b"])
+async def test_wait_for_interrupt_accepts_ctrl_c_and_escape(key: str) -> None:
+    with create_pipe_input() as pipe_input:
+        box = InputBox(
+            console=console(),
+            unicode_supported=True,
+            input=pipe_input,
+            output=DummyOutput(),
+        )
+        task = asyncio.create_task(box.wait_for_interrupt())
+        pipe_input.send_text(key)
+        await asyncio.wait_for(task, timeout=1)

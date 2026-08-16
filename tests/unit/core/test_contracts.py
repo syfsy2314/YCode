@@ -108,15 +108,24 @@ def test_token_usage_adds_provider_neutral_counters() -> None:
 
 def test_agent_model_request_freezes_separate_channels() -> None:
     user = ChatMessage.user_text("hello")
+    continuation = ChatMessage.user_text("continue")
     request = AgentModelRequest(
         messages=(user,),
         system_prompt=("stable",),
         supplements=("<environment_context>context</environment_context>",),
+        continuation_messages=[continuation],  # type: ignore[arg-type]
     )
 
     assert request.messages == (user,)
     assert request.system_prompt == ("stable",)
     assert request.supplements[0].startswith("<environment_context>")
+    assert request.continuation_messages == (continuation,)
+
+    with pytest.raises(ValueError, match="Continuation"):
+        AgentModelRequest(
+            messages=(user,),
+            continuation_messages=("invalid",),  # type: ignore[arg-type]
+        )
 
 
 def test_agent_model_request_validates_request_overrides() -> None:

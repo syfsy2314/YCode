@@ -257,3 +257,14 @@ async def test_cancelling_pending_approval_clears_it_without_choice() -> None:
     assert not turn.approval_pending
     with pytest.raises(StopAsyncIteration):
         await anext(turn)
+
+
+def test_turn_stream_exposes_stable_owner_turn_id() -> None:
+    async def producer(turn: AgentTurnStream):
+        turn.complete(AgentTurnResult(AgentTermination.CANCELLED))
+        if False:
+            yield AgentCancelledEvent("cancelled")
+
+    turn = AgentTurnStream(producer, turn_id="turn-owner")
+
+    assert turn.turn_id == "turn-owner"

@@ -81,6 +81,23 @@ def test_app_config_context_window_defaults_and_validates_strictly() -> None:
             AppConfig.model_validate({**base, "context_window_tokens": value})
 
 
+def test_app_config_loads_subagent_defaults_and_overrides() -> None:
+    base = {"active": "local", "providers": [{"name": "local"}]}
+
+    assert AppConfig.model_validate(base).subagents.max_concurrent == 4
+    configured = AppConfig.model_validate(
+        {
+            **base,
+            "subagents": {
+                "max_concurrent": 2,
+                "async_allowed_tools": ["read_file", "grep"],
+            },
+        }
+    )
+    assert configured.subagents.max_concurrent == 2
+    assert configured.subagents.async_allowed_tools == ("read_file", "grep")
+
+
 @pytest.mark.parametrize(
     "data, expected",
     [

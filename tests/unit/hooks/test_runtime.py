@@ -30,7 +30,7 @@ async def test_enabled_and_once(tmp_path) -> None:
     runtime = HookRuntime(rules, tmp_path)
     first = await runtime.dispatch(_event())
     second = await runtime.dispatch(_event())
-    assert len(first.notices) == 1
+    assert first.notices == ()
     assert second.notices == ()
     assert runtime.rules[0].executed is False
     assert runtime.rules[1].executed is True
@@ -68,4 +68,61 @@ async def test_async_action_does_not_block(tmp_path) -> None:
     runtime = HookRuntime((rule,), tmp_path)
     await asyncio.wait_for(runtime.dispatch(_event()), timeout=1)
     assert runtime.rules[0].executed is True
+    await runtime.close()
+
+
+async def test_reminders_are_isolated_by_scope(tmp_path) -> None:
+    rule = HookRule.model_validate(
+        {
+            "id": "scoped-reminder",
+            "event": "session.start",
+            "action": {"type": "reminder", "content": "check result"},
+        }
+    )
+    runtime = HookRuntime((rule,), tmp_path)
+
+    await runtime.dispatch(_event(), scope_id="parent")
+    await runtime.dispatch(_event(), scope_id="child")
+
+    assert len(runtime.take_reminders("parent")) == 1
+    assert len(runtime.take_reminders("child")) == 1
+    assert runtime.take_reminders("parent") == ()
+    await runtime.close()
+
+
+async def test_once_state_is_shared_across_scopes(tmp_path) -> None:
+    rule = HookRule.model_validate(
+        {
+            "id": "shared-once",
+            "once": True,
+            "event": "session.start",
+            "action": {"type": "agent"},
+        }
+    )
+    runtime = HookRuntime((rule,), tmp_path)
+
+    first = await runtime.dispatch(_event(), scope_id="parent")
+    second = await runtime.dispatch(_event(), scope_id="child")
+
+    assert first.notices == ()
+    assert second.notices == ()
+    await runtime.close()
+
+
+async def test_clear_scope_discards_only_target_reminders(tmp_path) -> None:
+    rule = HookRule.model_validate(
+        {
+            "id": "cleanup-reminder",
+            "event": "session.start",
+            "action": {"type": "reminder", "content": "cleanup"},
+        }
+    )
+    runtime = HookRuntime((rule,), tmp_path)
+    await runtime.dispatch(_event(), scope_id="first")
+    await runtime.dispatch(_event(), scope_id="second")
+
+    runtime.clear_scope("first")
+
+    assert runtime.take_reminders("first") == ()
+    assert len(runtime.take_reminders("second")) == 1
     await runtime.close()

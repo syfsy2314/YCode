@@ -1,6 +1,6 @@
 ---
 name: review
-description: Review the current implementation for correctness and regressions.
+description: 审查当前实现的正确性和潜在回归。
 metadata:
   ycode-execution-mode: isolated
   ycode-context: recent

@@ -167,7 +167,13 @@ async def test_agent_request_adds_system_and_provider_neutral_tools() -> None:
         {"role": "user", "content": "hi"},
         {
             "role": "system",
-            "content": "<environment_context>workspace</environment_context>",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "<environment_context>workspace</environment_context>",
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                }
+            ],
         },
     ]
     assert request["tools"] == [
@@ -178,6 +184,38 @@ async def test_agent_request_adds_system_and_provider_neutral_tools() -> None:
         }
     ]
     assert isinstance(request["tools"][0]["input_schema"], dict)
+
+
+@pytest.mark.asyncio
+async def test_agent_request_appends_continuation_after_cached_parent_prefix() -> None:
+    client = client_with(event("message_start"), *completed())
+    provider = AnthropicProvider(config(), client=client)
+
+    await anext(
+        provider.stream_agent(
+            AgentModelRequest(
+                messages=(ChatMessage.user_text("parent"),),
+                supplements=("runtime",),
+                continuation_messages=(ChatMessage.user_text("fork task"),),
+            )
+        )
+    )
+
+    messages = client.messages.create.await_args.kwargs["messages"]
+    assert messages == [
+        {"role": "user", "content": "parent"},
+        {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "runtime",
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                }
+            ],
+        },
+        {"role": "user", "content": "fork task"},
+    ]
 
 
 @pytest.mark.asyncio

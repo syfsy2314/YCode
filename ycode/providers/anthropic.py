@@ -136,55 +136,77 @@ class AnthropicProvider:
         self._system_message_capability = _SystemMessageCapability.UNKNOWN
 
     @staticmethod
+    def _message(message: ChatMessage) -> dict[str, Any]:
+        if len(message.content) == 1 and isinstance(message.content[0], TextBlock):
+            return {"role": message.role, "content": message.content[0].text}
+
+        blocks: list[dict[str, Any]] = []
+        saw_text = False
+        for block in message.content:
+            if isinstance(block, TextBlock):
+                saw_text = True
+                blocks.append({"type": "text", "text": block.text})
+            elif isinstance(block, ThinkingBlock):
+                value: dict[str, Any] = {"type": "thinking", "thinking": block.text}
+                if block.signature:
+                    value["signature"] = block.signature
+                blocks.append(value)
+            elif isinstance(block, RedactedThinkingBlock):
+                blocks.append({"type": "redacted_thinking", "data": block.data})
+            elif isinstance(block, ToolCallBlock):
+                blocks.append(
+                    {
+                        "type": "tool_use",
+                        "id": block.id,
+                        "name": block.name,
+                        "input": thaw_json(block.arguments),
+                    }
+                )
+            elif isinstance(block, ToolResultBlock):
+                if saw_text:
+                    raise ProviderError(
+                        "request",
+                        "Anthropic 工具结果必须位于用户文本之前。",
+                        False,
+                    )
+                value = {
+                    "type": "tool_result",
+                    "tool_use_id": block.tool_call_id,
+                    "content": block.content,
+                }
+                if block.is_error:
+                    value["is_error"] = True
+                blocks.append(value)
+        return {"role": message.role, "content": blocks}
+
+    @staticmethod
+    def _with_cache_breakpoint(message: dict[str, Any]) -> dict[str, Any]:
+        cached = dict(message)
+        content = cached["content"]
+        cache_control = {"type": "ephemeral", "ttl": "5m"}
+        if isinstance(content, str):
+            cached["content"] = [{"type": "text", "text": content, "cache_control": cache_control}]
+            return cached
+        blocks = [dict(block) for block in content]
+        if blocks:
+            blocks[-1]["cache_control"] = cache_control
+        cached["content"] = blocks
+        return cached
+
+    @classmethod
     def _messages(
+        cls,
         messages: Sequence[ChatMessage],
         supplements: Sequence[str] = (),
+        continuation_messages: Sequence[ChatMessage] = (),
+        *,
+        cache_reusable_prefix: bool = False,
     ) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = []
-        for message in messages:
-            if len(message.content) == 1 and isinstance(message.content[0], TextBlock):
-                result.append({"role": message.role, "content": message.content[0].text})
-                continue
-
-            blocks: list[dict[str, Any]] = []
-            saw_text = False
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    saw_text = True
-                    blocks.append({"type": "text", "text": block.text})
-                elif isinstance(block, ThinkingBlock):
-                    value: dict[str, Any] = {"type": "thinking", "thinking": block.text}
-                    if block.signature:
-                        value["signature"] = block.signature
-                    blocks.append(value)
-                elif isinstance(block, RedactedThinkingBlock):
-                    blocks.append({"type": "redacted_thinking", "data": block.data})
-                elif isinstance(block, ToolCallBlock):
-                    blocks.append(
-                        {
-                            "type": "tool_use",
-                            "id": block.id,
-                            "name": block.name,
-                            "input": thaw_json(block.arguments),
-                        }
-                    )
-                elif isinstance(block, ToolResultBlock):
-                    if saw_text:
-                        raise ProviderError(
-                            "request",
-                            "Anthropic 工具结果必须位于用户文本之前。",
-                            False,
-                        )
-                    value = {
-                        "type": "tool_result",
-                        "tool_use_id": block.tool_call_id,
-                        "content": block.content,
-                    }
-                    if block.is_error:
-                        value["is_error"] = True
-                    blocks.append(value)
-            result.append({"role": message.role, "content": blocks})
+        result = [cls._message(message) for message in messages]
         result.extend({"role": "system", "content": content} for content in supplements)
+        if cache_reusable_prefix and result:
+            result[-1] = cls._with_cache_breakpoint(result[-1])
+        result.extend(cls._message(message) for message in continuation_messages)
         return result
 
     @staticmethod
@@ -235,6 +257,7 @@ class AnthropicProvider:
         model_request: AgentModelRequest,
         *,
         native_supplements: bool,
+        cache_reusable_prefix: bool = True,
     ) -> dict[str, Any]:
         request: dict[str, Any] = {
             "model": self._config.model,
@@ -242,6 +265,8 @@ class AnthropicProvider:
             "messages": self._messages(
                 model_request.messages,
                 model_request.supplements if native_supplements else (),
+                model_request.continuation_messages,
+                cache_reusable_prefix=cache_reusable_prefix,
             ),
             "stream": True,
         }
@@ -299,12 +324,21 @@ class AnthropicProvider:
             system_prompt=(system_prompt,) if system_prompt else (),
             tools=tuple(tools),
         )
-        async for event in self.stream_agent(model_request):
+        async for event in self._stream_agent(model_request, cache_reusable_prefix=False):
             yield event
 
     async def stream_agent(
         self,
         model_request: AgentModelRequest,
+    ) -> AsyncIterator[StreamEvent]:
+        async for event in self._stream_agent(model_request, cache_reusable_prefix=True):
+            yield event
+
+    async def _stream_agent(
+        self,
+        model_request: AgentModelRequest,
+        *,
+        cache_reusable_prefix: bool,
     ) -> AsyncIterator[StreamEvent]:
         if not isinstance(model_request, AgentModelRequest):
             raise TypeError("Anthropic Agent 请求必须是 AgentModelRequest")
@@ -314,6 +348,7 @@ class AnthropicProvider:
         request = self._request(
             model_request,
             native_supplements=native_supplements,
+            cache_reusable_prefix=cache_reusable_prefix,
         )
         message_started = False
         completed = False
@@ -330,7 +365,11 @@ class AnthropicProvider:
                     and self._unsupported_system_message(error)
                 ):
                     self._system_message_capability = _SystemMessageCapability.FALLBACK
-                    request = self._request(model_request, native_supplements=False)
+                    request = self._request(
+                        model_request,
+                        native_supplements=False,
+                        cache_reusable_prefix=cache_reusable_prefix,
+                    )
                     stream = await self.client.messages.create(**request)
                 else:
                     raise

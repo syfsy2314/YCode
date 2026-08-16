@@ -98,6 +98,7 @@ async def test_app_assembles_anthropic_agent_with_builtin_tools(tmp_path: Path) 
         "grep",
         "load_skill",
         "install_skill",
+        "run_subagent",
     ]
     assert any(f"Workspace: {tmp_path}" in item for item in request.supplements)
     assert any(
@@ -118,6 +119,7 @@ async def test_app_assembles_anthropic_agent_with_builtin_tools(tmp_path: Path) 
         "resume",
         "skills",
         "clear",
+        "tasks",
     ]
     context_root = tmp_path / ".ycode" / "context"
     assert context_root.is_dir()
@@ -162,7 +164,7 @@ hooks:
         )
 
     anthropic = warnings_by_protocol["anthropic"]
-    assert "子 Agent Hook 尚未实现：startup" in anthropic
+    assert not any("子 Agent Hook 尚未实现" in item for item in anthropic)
     assert "项目 Hook 配置可执行本地命令或发起 HTTP 请求。" in anthropic
     diagnostic = next(item for item in anthropic if item.startswith("Hook 配置错误"))
     assert str(hooks_path) in diagnostic

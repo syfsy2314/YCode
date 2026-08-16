@@ -53,6 +53,7 @@ def _request_with(
     request: AgentModelRequest,
     messages: tuple[ChatMessage, ...],
     memory: ConversationMemory | None,
+    continuation_messages: tuple[ChatMessage, ...] | None = None,
 ) -> AgentModelRequest:
     supplements = list(request.supplements)
     if memory is not None:
@@ -62,6 +63,31 @@ def _request_with(
         messages=messages,
         system_prompt=request.system_prompt,
         supplements=tuple(supplements),
+        continuation_messages=(
+            request.continuation_messages
+            if continuation_messages is None
+            else continuation_messages
+        ),
+        tools=request.tools,
+        max_output_tokens=request.max_output_tokens,
+        thinking_enabled=request.thinking_enabled,
+    )
+
+
+def _preserved_request_with(
+    request: AgentModelRequest,
+    messages: tuple[ChatMessage, ...],
+    continuation_messages: tuple[ChatMessage, ...],
+    memory: ConversationMemory | None,
+) -> AgentModelRequest:
+    supplements = list(request.supplements)
+    if memory is not None:
+        supplements.extend((MEMORY_TEMPLATE.format(summary=memory.summary), BOUNDARY_REMINDER))
+    return AgentModelRequest(
+        messages=messages,
+        system_prompt=request.system_prompt,
+        supplements=tuple(supplements),
+        continuation_messages=continuation_messages,
         tools=request.tools,
         max_output_tokens=request.max_output_tokens,
         thinking_enabled=request.thinking_enabled,
@@ -225,9 +251,28 @@ class ContextTransaction:
     def build_result_message(self, records: list[ToolExecutionRecord]) -> ChatMessage:
         return self.manager.externalizer.build_result_message(records)
 
-    async def prepare_request(self, request: AgentModelRequest) -> PreparedContextRequest:
+    async def prepare_request(
+        self,
+        request: AgentModelRequest,
+        *,
+        preserve_messages: bool = False,
+        allow_preserved_compaction: bool = False,
+    ) -> PreparedContextRequest:
+        if preserve_messages:
+            return await self._prepare_preserved_request(
+                request,
+                allow_compaction=allow_preserved_compaction,
+            )
         messages = self.manager.externalizer.normalize_messages(request.messages)
-        original_request = _request_with(request, messages, self.memory)
+        continuation_messages = self.manager.externalizer.normalize_messages(
+            request.continuation_messages
+        )
+        original_request = _request_with(
+            request,
+            messages,
+            self.memory,
+            continuation_messages,
+        )
         original_estimate = self.manager.estimator.estimate(original_request)
         if original_estimate.total_tokens <= self.manager.policy.auto_compact_threshold:
             return PreparedContextRequest(original_request, messages, original_estimate)
@@ -240,7 +285,12 @@ class ContextTransaction:
                 "上下文超过可继续发送上限，请执行 /compact。",
             )
 
-        minimal_request = _request_with(request, (self.latest_user_message,), None)
+        minimal_request = _request_with(
+            request,
+            (self.latest_user_message,),
+            None,
+            continuation_messages,
+        )
         if (
             not self.memory
             and messages == (self.latest_user_message,)
@@ -256,7 +306,12 @@ class ContextTransaction:
             result = await self.manager.compactor.compact(
                 SummarySource(self.memory, messages, self.latest_user_message)
             )
-            compacted_request = _request_with(request, result.retained_messages, result.summary)
+            compacted_request = _request_with(
+                request,
+                result.retained_messages,
+                result.summary,
+                continuation_messages,
+            )
             compacted_estimate = self.manager.estimator.estimate(compacted_request)
             if compacted_estimate.total_tokens > self.manager.policy.auto_compact_threshold:
                 raise ValueError("摘要后上下文仍超过自动压缩阈值")
@@ -288,6 +343,93 @@ class ContextTransaction:
         return PreparedContextRequest(
             compacted_request,
             result.retained_messages,
+            compacted_estimate,
+            compaction_report=report,
+        )
+
+    async def _prepare_preserved_request(
+        self,
+        request: AgentModelRequest,
+        *,
+        allow_compaction: bool,
+    ) -> PreparedContextRequest:
+        messages = self.manager.externalizer.normalize_messages(request.messages)
+        continuation = self.manager.externalizer.normalize_messages(request.continuation_messages)
+        original_request = _preserved_request_with(
+            request,
+            messages,
+            continuation,
+            self.memory,
+        )
+        original_estimate = self.manager.estimator.estimate(original_request)
+        if original_estimate.total_tokens <= self.manager.policy.auto_compact_threshold:
+            return PreparedContextRequest(original_request, messages, original_estimate)
+        if not allow_compaction:
+            raise ContextLimitError(
+                "context_uncompressible",
+                "Fork 首次请求超过上下文预算，不能改写继承前缀。",
+            )
+        if self.manager.auto_compaction_fused:
+            if original_estimate.total_tokens <= self.manager.policy.continue_request_limit:
+                return PreparedContextRequest(original_request, messages, original_estimate)
+            raise ContextLimitError("context_limit", "Fork continuation 超过可继续发送上限。")
+
+        minimal_request = _preserved_request_with(
+            request,
+            messages,
+            (self.latest_user_message,),
+            None,
+        )
+        if (
+            not continuation
+            or self.manager.estimator.estimate(minimal_request).total_tokens
+            > self.manager.policy.auto_compact_threshold
+        ):
+            raise ContextLimitError(
+                "context_uncompressible",
+                "Fork 固定前缀或任务消息超过可压缩预算。",
+            )
+        try:
+            result = await self.manager.compactor.compact(
+                SummarySource(self.memory, continuation, self.latest_user_message)
+            )
+            compacted_request = _preserved_request_with(
+                request,
+                messages,
+                result.retained_messages,
+                result.summary,
+            )
+            compacted_estimate = self.manager.estimator.estimate(compacted_request)
+            if compacted_estimate.total_tokens > self.manager.policy.auto_compact_threshold:
+                raise ValueError("Fork continuation 摘要后仍超过自动压缩阈值")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            continues = original_estimate.total_tokens <= self.manager.policy.continue_request_limit
+            report = self.manager._record_failure(error, continues)
+            if not continues:
+                raise ContextLimitError(
+                    "context_limit",
+                    "Fork continuation 摘要失败且超过可继续发送上限。",
+                    report,
+                ) from error
+            return PreparedContextRequest(
+                original_request,
+                messages,
+                original_estimate,
+                failure_report=report,
+            )
+
+        self.memory = result.summary
+        self._compacted = True
+        self.manager._reset_failures()
+        report = ContextCompactionReport(
+            original_estimate.total_tokens,
+            compacted_estimate.total_tokens,
+        )
+        return PreparedContextRequest(
+            compacted_request,
+            messages,
             compacted_estimate,
             compaction_report=report,
         )

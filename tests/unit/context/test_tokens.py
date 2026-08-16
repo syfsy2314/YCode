@@ -31,6 +31,12 @@ def test_estimate_covers_all_request_channels() -> None:
 
     assert estimator.estimate(request(system_prompt=("identity" * 20,))).total_tokens > base
     assert estimator.estimate(request(supplements=("environment" * 20,))).total_tokens > base
+    assert (
+        estimator.estimate(
+            request(continuation_messages=(ChatMessage.user_text("continue" * 20),))
+        ).total_tokens
+        > base
+    )
     assert estimator.estimate(request(tools=(READ_TOOL,))).total_tokens > base
     assert (
         estimator.estimate(request(messages=(ChatMessage.user_text("hello" * 30),))).total_tokens

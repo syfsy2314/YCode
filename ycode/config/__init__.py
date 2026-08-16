@@ -12,7 +12,13 @@ from ycode.config.mcp import (
     StdioMcpServerConfig,
     load_mcp_servers,
 )
-from ycode.config.models import AppConfig, ProviderConfig, ProviderEntry, ProviderProtocol
+from ycode.config.models import (
+    AppConfig,
+    ProviderConfig,
+    ProviderEntry,
+    ProviderProtocol,
+    SubagentConfig,
+)
 
 __all__ = [
     "AppConfig",
@@ -27,6 +33,7 @@ __all__ = [
     "ProviderProtocol",
     "SecretRedactor",
     "StdioMcpServerConfig",
+    "SubagentConfig",
     "discover_config",
     "load_mcp_servers",
     "load_config",

@@ -252,6 +252,45 @@ def wait_for_exit(process: PtyProcess, timeout: float = 10.0) -> None:
 
 
 @pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
+def test_windows_terminal_sync_subagent_and_tasks_command(
+    tmp_path: Path,
+    sse_server: SSETestServer,
+) -> None:
+    project = tmp_path / "subagent-sync"
+    project.mkdir()
+    sse_server.enqueue(
+        anthropic_tool_response(
+            [("sub-1", "run_subagent", {"task": "探索入口", "role": "explore"})]
+        )
+    )
+    sse_server.enqueue(anthropic_text_response("子任务结论"))
+    sse_server.enqueue(anthropic_text_response("父任务完成"))
+    write_anthropic_config(project / ".ycode" / "config.yaml", sse_server, thinking=False)
+
+    process, reader = spawn_ycode(project)
+    try:
+        reader.wait_for("Send a message...", timeout=15)
+        process.write("委派探索任务\r")
+        reader.wait_for("父任务完成", timeout=20)
+        reader.wait_for("Send a message...", timeout=15, count=2)
+
+        process.write("/tasks\r")
+        output = reader.wait_for("completed", timeout=15)
+        task_id = re.search(r"\b[0-9a-f]{12}\b", output)
+        assert task_id is not None
+        process.write(f"/tasks {task_id.group(0)}\r")
+        reader.wait_for("子任务结论", timeout=15)
+        reader.wait_for("Send a message...", timeout=15, count=4)
+        assert len(sse_server.requests) == 3
+
+        process.write("/exit\r")
+        wait_for_exit(process)
+        assert "Traceback" not in reader.snapshot()
+    finally:
+        stop_process(process)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
 def test_windows_terminal_input_hint_and_question_mark_message(
     tmp_path: Path, sse_server: SSETestServer
 ) -> None:
@@ -563,11 +602,11 @@ hooks:
         process.write("exercise hooks\r")
         reader.wait_for("工具审批：write_file", timeout=20)
         process.write("2")
-        reader.wait_for("hook: 子 Agent Hook 尚未实现：deny-command", timeout=20)
         reader.wait_for("hook adjusted safely", timeout=20)
         reader.wait_for("Send a message...", timeout=15, count=2)
         assert reader.snapshot().count("工具审批：write_file") == 1
         assert "工具审批：run_command" not in reader.snapshot()
+        assert "子 Agent Hook 尚未实现" not in reader.snapshot()
         process.write("/exit\r")
         wait_for_exit(process)
         assert "Traceback" not in reader.snapshot()
@@ -799,11 +838,12 @@ def test_windows_terminal_plan_mode_and_tool_filter(
         "glob",
         "grep",
         "load_skill",
+        "run_subagent",
     ]
     assert any(
         message["role"] == "system"
-        and "<task_mode>" in message["content"]
-        and "Current task mode: plan-only" in message["content"]
+        and "<task_mode>" in json.dumps(message["content"])
+        and "Current task mode: plan-only" in json.dumps(message["content"])
         for message in request["messages"]
     )
     error_results = [
@@ -1083,7 +1123,8 @@ def test_windows_terminal_mcp_deferred_flow(tmp_path: Path, sse_server: SSETestS
     state = [json.loads(line) for line in state_file.read_text(encoding="utf-8").splitlines()]
     assert any(item.get("event") == "call" and item.get("tool") == "echo" for item in state)
     assert state[-1]["event"] == "stopped"
-    assert [tool["name"] for tool in sse_server.requests[0].json["tools"]][-1] == ("tool_search")
+    initial_tools = [tool["name"] for tool in sse_server.requests[0].json["tools"]]
+    assert initial_tools[-2:] == ["tool_search", "run_subagent"]
     assert "mcp_fixture_echo" not in {tool["name"] for tool in sse_server.requests[0].json["tools"]}
     assert "mcp_fixture_echo" in {tool["name"] for tool in sse_server.requests[1].json["tools"]}
 
@@ -1422,7 +1463,9 @@ def test_windows_terminal_memory_system(tmp_path: Path, sse_server: SSETestServe
     assert all("Remember stable preferences." in json.dumps(item) for item in main_requests)
     assert all("project-stack.md" in json.dumps(item) for item in main_requests)
     assert "long time gap" in json.dumps(sse_server.requests[3].json)
-    exit_transcript = json.loads(sse_server.requests[-1].json["messages"][0]["content"])
+    exit_content = sse_server.requests[-1].json["messages"][0]["content"]
+    exit_text = exit_content[0]["text"] if isinstance(exit_content, list) else exit_content
+    exit_transcript = json.loads(exit_text)
     assert {item["session_id"] for item in exit_transcript["new_conversations"]} == {
         session_a_id,
         next(path.stem for path in session_files if path.stem != session_a_id),

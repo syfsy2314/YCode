@@ -28,6 +28,7 @@ async def test_production_definitions_and_help_come_from_registry() -> None:
         "resume",
         "skills",
         "clear",
+        "tasks",
     ]
     assert runtime.registry.resolve("QUIT").name == "exit"
     controller = Controller()
@@ -73,6 +74,9 @@ async def test_help_alias_detail_and_hidden_command() -> None:
         ("/skills reload", ("reload_skills",)),
         ("/skills deactivate review", ("deactivate_skill", "review")),
         ("/clear", ("clear_session",)),
+        ("/tasks", ("show_tasks",)),
+        ("/tasks abc", ("show_tasks", "abc")),
+        ("/tasks stop abc", ("stop_task", "abc")),
     ],
 )
 async def test_builtin_controller_calls(command: str, expected: tuple) -> None:

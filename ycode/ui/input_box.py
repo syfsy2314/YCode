@@ -182,6 +182,10 @@ class InputBox:
         def exit_application(event) -> None:
             event.app.exit(exception=KeyboardInterrupt())
 
+        @bindings.add("escape")
+        def escape_application(event) -> None:
+            event.app.exit(exception=KeyboardInterrupt())
+
         return Application(
             layout=Layout(root, focused_element=input_window),
             key_bindings=merge_key_bindings([load_key_bindings(), bindings]),
@@ -205,7 +209,7 @@ class InputBox:
         ).run_async()
 
     async def read_approval(self, decision: PermissionDecision) -> ApprovalChoice:
-        self._console.print(
+        approval_prompt = (
             f"\n工具审批：{decision.subject.call.name}\n"
             f"原因：{decision.message}\n"
             f"{decision.subject.approval_summary}\n"
@@ -235,6 +239,10 @@ class InputBox:
         def cancel(event) -> None:
             event.app.exit(exception=KeyboardInterrupt())
 
+        @bindings.add("escape")
+        def cancel_escape(event) -> None:
+            event.app.exit(exception=KeyboardInterrupt())
+
         application: Application[ApprovalChoice] = Application(
             layout=Layout(
                 Window(
@@ -261,17 +269,37 @@ class InputBox:
             input=self._input,
             output=self._output,
         )
-        return await application.run_async()
+        # 等审批应用完成输入接管后再显示提示，避免快速按键落在监听切换间隙。
+        return await application.run_async(pre_run=lambda: self._console.print(approval_prompt))
 
     async def wait_for_interrupt(self) -> None:
-        """响应期间只监听 Ctrl+C，不接受普通文本输入。"""
+        """响应期间只监听 ESC 或 Ctrl+C，不接受普通文本输入。"""
         input_device = self._input or get_app_session().input
-        interrupted = asyncio.get_running_loop().create_future()
+        loop = asyncio.get_running_loop()
+        interrupted = loop.create_future()
+        flush_handle: asyncio.TimerHandle | None = None
 
-        def input_ready() -> None:
-            for key_press in input_device.read_keys():
-                if key_press.key == Keys.ControlC and not interrupted.done():
+        def consume(keys) -> None:
+            for key_press in keys:
+                if key_press.key in {Keys.ControlC, Keys.Escape} and not interrupted.done():
                     interrupted.set_result(None)
 
+        def flush_escape() -> None:
+            if not interrupted.done():
+                consume(input_device.flush_keys())
+
+        def input_ready() -> None:
+            nonlocal flush_handle
+            consume(input_device.read_keys())
+            if not interrupted.done():
+                # VT100 解析器需要一个短暂等待来区分单独 ESC 与转义序列。
+                if flush_handle is not None:
+                    flush_handle.cancel()
+                flush_handle = loop.call_later(0.05, flush_escape)
+
         with input_device.raw_mode(), input_device.attach(input_ready):
-            await interrupted
+            try:
+                await interrupted
+            finally:
+                if flush_handle is not None:
+                    flush_handle.cancel()

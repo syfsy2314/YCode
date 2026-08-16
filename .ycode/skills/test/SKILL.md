@@ -1,6 +1,6 @@
 ---
 name: test
-description: Run focused functional checks for the requested change.
+description: 针对请求的变更运行聚焦的功能检查。
 metadata:
   ycode-execution-mode: isolated
   ycode-context: none

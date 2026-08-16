@@ -49,8 +49,8 @@
   （验证：运行 HTTP 状态与结果隔离测试）
 - [ ] Reminder 生成包含规则 ID、事件名和 XML 转义正文的 `<system-reminder>`。
   （验证：运行 Reminder 执行器与 Prompt 模型标签测试）
-- [ ] Agent 动作不创建子 Agent，只产生包含规则 ID 的“子 Agent Hook 尚未实现”终端
-  通知。（验证：运行占位执行器及 HookNoticeEvent 终端渲染测试）
+- [ ] Agent 动作不创建子 Agent且不产生遗留占位通知，子 Agent 统一由 `run_subagent`
+  工具创建。（验证：运行兼容执行器及终端无占位通知测试）
 
 ## 运行状态、异步与错误隔离
 

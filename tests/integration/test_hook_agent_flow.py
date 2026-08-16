@@ -43,7 +43,7 @@ async def test_hook_deny_reaches_model_and_prevents_side_effect(tmp_path) -> Non
     events = await consume(loop.start_turn((), ChatMessage.user_text("change it"), AgentMode.AGENT))
 
     assert tool.calls == 0
-    assert any(isinstance(event, HookNoticeEvent) for event in events)
+    assert not any(isinstance(event, HookNoticeEvent) for event in events)
     result = provider.agent_requests[1].messages[-1].blocks(ToolResultBlock)[0]
     assert result.is_error is True
     assert "Hook 规则 deny-mutation" in result.content
@@ -156,7 +156,7 @@ async def test_disabled_and_once_rules_across_repeated_tool_events(tmp_path) -> 
     )
 
     notices = [event.message for event in events if isinstance(event, HookNoticeEvent)]
-    assert notices == ["子 Agent Hook 尚未实现：once-notice"]
+    assert notices == []
     assert tool.calls == 2
     assert runtime.rules[0].executed is False
     assert runtime.rules[1].executed is True

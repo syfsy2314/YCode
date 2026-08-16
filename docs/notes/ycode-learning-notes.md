@@ -84,7 +84,8 @@ def main(argv=None) -> int:
 `run_app()` 是组合根：它读取配置、只创建 `active` 指向的 Provider，并根据协议选择
 对话运行器。Provider 工厂在协议分支内局部导入实现，因此活动配置为 Anthropic 时不会
 导入 OpenAI Provider 或 OpenAI SDK。Anthropic 路径还会装配命令框架、内建工具、MCP、
-权限系统、项目 Hook 和 AgentLoop；OpenAI 仍保持纯聊天，也不加载 Hook。
+权限系统、项目 Hook、子 Agent 运行时和 AgentLoop；OpenAI 仍保持纯聊天，也不加载
+Hook 或子 Agent。
 
 简化后的核心逻辑：
 
@@ -115,6 +116,10 @@ if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
         if has_enabled_mcp:
             registry.register(ToolSearchTool(registry))
 
+    subagent_catalog = SubagentRoleCatalog(...)
+    subagent_manager = SubagentManager(config.app.subagents, subagent_catalog)
+    registry.register(RunSubagentTool(subagent_manager))
+
     security_result = load_security_config(workspace, registry)
     permission_session = PermissionSession(security_result.config.mode)
     permission_engine = PermissionEngine(
@@ -123,6 +128,9 @@ if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
     hook_result = load_hook_config(workspace)
     hook_runtime = HookRuntime(hook_result.rules, workspace)
     hook_context = HookContextFactory(workspace, uuid4().hex)
+    subagent_catalog.load()
+    subagent_provider_pool = SubagentProviderPool(...)
+    subagent_manager.bind(SubagentRunner(..., subagent_loop_factory, ...))
     runner = AgentLoop(
         provider,
         registry,
@@ -140,6 +148,11 @@ if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
         context_manager=context_manager,
         hook_runtime=hook_runtime,
         hook_context=hook_context,
+        options=AgentLoopOptions(
+            notification_source=subagent_manager,
+            tool_scope=AgentToolScope(),
+            owns_provider=False,
+        ),
     )
 else:
     runner = PlainChatRunner(provider)
@@ -158,6 +171,7 @@ if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
         command_runtime=command_runtime,
         hook_runtime=hook_runtime,
         hook_context=hook_context,
+        subagent_manager=subagent_manager,
     )
     if continue_session:
         await session.restore()
@@ -187,6 +201,7 @@ TerminalUI
                     ├── ToolRegistry
                     │       ├── 六个基础内建工具
                     │       ├── LoadSkillTool / InstallSkillTool
+                    │       ├── RunSubagentTool
                     │       ├── ToolSearchTool（配置 MCP 时）
                     │       └── MCPToolWrapper...
                     ├── McpManager
@@ -200,6 +215,11 @@ TerminalUI
                     │       ├── RuntimeHookRule
                     │       └── HookActionExecutors
                     ├── HookContextFactory
+                    ├── SubagentManager
+                    │       ├── SubagentRoleCatalog
+                    │       └── SubagentRunner
+                    │               ├── SubagentProviderPool
+                    │               └── 独立 AgentLoop...
                     ├── PromptBundle
                     ├── PromptRuntimeContext
                     ├── ProjectContextLoader
@@ -228,24 +248,28 @@ TerminalUI
 - Anthropic 装配集中式命令运行时；OpenAI 不装配命令注册、分发或补全。
 - Anthropic 使用 `config.project_root` 统一工具、项目指令、会话、上下文和记忆的路径
   边界，并支持 `--continue`。
-- Anthropic 从最近的 `.ycode/hooks.yaml` 创建一个应用会话级 `HookRuntime`，只注入主
-  AgentLoop 与 ChatSession；隔离 Skill AgentLoop 不继承它。
+- Anthropic 从最近的 `.ycode/hooks.yaml` 创建一个应用会话级 `HookRuntime`。主 Agent、
+  ChatSession 和子 Agent 共享规则、执行器和 once 状态；每个子 Agent 使用独立 Reminder
+  scope。隔离 Skill AgentLoop 仍不继承它。
+- Anthropic 创建会话级 `SubagentManager` 和 `SubagentProviderPool`；OpenAI 不注册
+  `run_subagent`，也不创建角色目录或后台任务。
 - OpenAI 只通过 PlainChatRunner 发起一次模型请求，没有工具定义、Agent system prompt 或 plan-only 能力。
 - OpenAI 不装配持久化会话、项目记忆或 Hook，使用 `--continue` 会在创建 Provider 前失败。
 - `enabled: true` 的 MCP 在 UI 装配完成后后台连接；`enabled: false` 不创建连接任务。
 
-退出时，`finally` 调用 `session.close()`。Session 先触发 `session.end`，再让
-`HookRuntime.close()` 最多等待后台 Hook 3 秒并取消剩余任务，然后关闭 Runner。
-AgentLoop 通过 `resource_manager` 关闭 MCP：未完成的后台启动先取消，READY 连接再正常
-退出，最后关闭 HTTP Client、stdio 子进程和 Provider。
+退出时先由 `SubagentManager.clear()` 取消并清空子任务，再调用 `session.close()`。
+Session 先触发 `session.end`，再让 `HookRuntime.close()` 最多等待后台 Hook 3 秒并取消
+剩余任务，然后关闭 Runner。AgentLoop 通过 `resource_manager` 关闭 MCP；随后关闭命名
+子 Provider，最后关闭主 Provider。借用主 Provider 的子循环设置 `owns_provider=False`，
+不会抢先关闭共享连接。
 
 ### 面试表述
 
 YCode 通过 `pyproject.toml` 注册 CLI 入口。`cli.main()` 负责参数解析和启动 asyncio
 事件循环，`run_app()` 是组合根：它按 `active` 延迟导入单个 Provider，在 Anthropic
-路径装配命令、工具、权限、Hook 与 AgentLoop，然后让启用的 MCP 后台连接并立即进入
-UI；OpenAI 保持 PlainChatRunner 且不加载 Hook。资源关闭从 Session 先经过 Hook 收尾，
-再沿 Runner 传递，MCP 后台任务和 Provider 都会被释放。
+路径装配命令、工具、权限、Hook、子 Agent 与 AgentLoop，然后让启用的 MCP 后台连接并
+立即进入 UI；OpenAI 保持 PlainChatRunner 且不加载 Hook。资源关闭先取消子任务，再经过
+Session、Hook、MCP、命名子 Provider 和主 Provider，所有权边界明确。
 
 ## 核心数据与组件关系
 
@@ -1563,7 +1587,7 @@ OpenAI PlainChatRunner 和隔离 Skill AgentLoop 都不会创建或触发 HookRu
 | `enabled` | 固定启用标记，默认 `true` |
 | `event` | 必填生命周期事件 |
 | `conditions` | 可选的 `all` 或 `any` 条件组 |
-| `action` | 一个 Shell、HTTP、Reminder 或 Agent 占位动作 |
+| `action` | 一个 Shell、HTTP、Reminder 或兼容 Agent 动作 |
 | `permission` | 仅 `tool.before_execute` 可用的固定决定 |
 | `once` | 是否只消费第一次匹配，默认 `false` |
 | `async` | 是否后台执行，仅 Shell/HTTP 可用 |
@@ -1585,8 +1609,8 @@ once == false                    → executed 为 true 也可再次触发
 第一条。`HookDiagnostic` 保存配置路径、规则序号、可识别 ID 和字段错误，启动时集中展示。
 只有已启用的 Shell/HTTP 才产生一次外部操作风险提示。
 
-当前仓库的 `.ycode/hooks.yaml` 是可加载示例：只有启动占位通知启用；高风险命令拦截、
-工具失败 Reminder 和异步 Shell 示例都处于禁用状态。当前 `.ycode/config.example.yaml`
+当前仓库的 `.ycode/hooks.yaml` 是可加载示例：兼容 Agent、高风险命令拦截、工具失败
+Reminder 和异步 Shell 示例都处于禁用状态。当前 `.ycode/config.example.yaml`
 没有 Hook 节点。Hook 必须放在独立 `hooks.yaml`，不能直接成为 `config.yaml` 的顶层字段。
 
 ### 2. 事件、上下文与条件
@@ -1633,7 +1657,7 @@ JSON null 与字段缺失不是同一个内部状态；不过当前 `exact` 不�
 | `shell` | 使用平台默认 Shell、项目根 cwd 执行，捕获输出，可同步或异步 |
 | `http` | 支持 GET/POST/PUT/PATCH/DELETE，模板化 URL、头和文本/JSON body |
 | `reminder` | 生成请求级 `<system-reminder>`，只供模型下一次请求使用 |
-| `agent` | 不启动子 Agent，只产生“子 Agent Hook 尚未实现：<rule-id>”终端通知 |
+| `agent` | 兼容旧配置并静默成功；不创建子 Agent，也不产生占位通知 |
 
 同步 `tool.before_execute` Shell 只要有非空 stdout，就会尝试把整段 stdout 解析为严格的
 权限 JSON：
@@ -1650,8 +1674,8 @@ JSON null 与字段缺失不是同一个内部状态；不过当前 `exact` 不�
 进入模型上下文。
 
 当前没有通用 `print` 动作。若只是想打印任意模板内容，不能把 `shell: echo` 当成终端
-输出；`agent` 也只有固定占位文字。轻量 `print` 动作已经记录在 Hook task 的后续待办，
-尚未进入 Spec、实现或验收范围。
+输出；兼容 `agent` 动作也不会产生终端文本。子 Agent 统一由 `run_subagent` 工具创建，
+Hook 配置没有任务、角色和运行模式字段，不能据此隐式创建子任务。
 
 ### 4. HookRuntime 分发与后台任务
 
@@ -1660,9 +1684,10 @@ JSON null 与字段缺失不是同一个内部状态；不过当前 `exact` 不�
 运行，立即把控制权还给 Agent。动作异常、超时和取消统一转成 HookActionResult 并记录
 有界日志，不触发新的 `agent.error`。
 
-Reminder 进入运行时队列，由 `take_reminders()` 一次性取出并清空。Agent 占位消息进入
-`HookDispatchResult.notices`：Agent Loop 中转换成 `HookNoticeEvent`，`session.start` 合并
-到启动提示，`session.end` 在关闭阶段直接输出。
+Reminder 按 `scope_id` 进入运行时队列，由 `take_reminders(scope_id)` 一次性取出并清空。
+主 Agent 使用 `main`，每个子 Agent 使用 `subagent:<task-id>`；任务结束清理自己的 scope。
+兼容 `agent` 动作返回成功但不产生 `notices`，因此不会再形成误导性的启动 warning 或
+`HookNoticeEvent`。
 
 关闭顺序是：
 
@@ -1826,6 +1851,7 @@ UI 展示 `display_text`，Agent 请求和成功提交的会话历史使用 `mod
 | `/resume <session-id>` | STATE | 原子恢复指定会话 |
 | `/skills [show/deactivate/reload]` | LOCAL/STATE | 查看、停用或重新扫描项目 Skill |
 | `/clear` | STATE | 建立空会话并清除历史、摘要、Skill 和临时授权 |
+| `/tasks [id|stop <id>]` | LOCAL | 列出、查看或取消当前会话的子 Agent 任务 |
 | `/<skill-name> [arguments]` | AI | 显式运行当前可用项目 Skill |
 
 `/help`、解析、实际分发和 `CommandCompleter` 都读取同一个 Registry，避免多份手写命令
@@ -2408,23 +2434,24 @@ JSONL 是会话的事实来源，因此持久化失败时不能先把临时消�
 
 ### 3. 取消传播
 
-响应期间，InputBox 单独监听 Ctrl+C：
+响应期间，InputBox 单独监听 ESC 和 Ctrl+C：
 
 ~~~text
-Ctrl+C
+ESC / Ctrl+C
     ↓
 TerminalUI
     ↓ cancel_active_turn()
 ChatSession
-    ↓ AgentTurn.cancel()
+    ├── AgentTurn.cancel()
+    └── SubagentManager.cancel_owned(turn_id)
 AgentTurnStream 取消当前 active child
     ↓
 Provider / Scheduler / ToolExecutor / CommandRunner
 ~~~
 
-等待工具审批时，普通 Ctrl+C 监听会暂停，由审批 InputBox 独占输入；Ctrl+C 直接取消
-待审批 Future 和整个 AgentTurn。这样既不会出现两个终端读取器竞争，也不会在取消后
-继续检查或启动批次中的后续工具。
+等待工具审批时，普通中断监听会暂停，由审批 InputBox 独占输入；ESC 或 Ctrl+C 直接
+取消待审批 Future 和整个 AgentTurn。审批应用在 `pre_run` 阶段完成输入接管后才显示
+提示，避免快速按键落在监听切换间隙。
 
 取消要求：
 
@@ -2432,14 +2459,17 @@ Provider / Scheduler / ToolExecutor / CommandRunner
 - 已启动的读取任务被取消并等待清理。
 - PowerShell 及其子进程树被终止。
 - 当前回合历史不提交。
+- 当前回合拥有且仍运行的同步、异步子任务进入 cancelled；此前正常回合遗留的异步任务
+  不受影响。
 - Renderer 停止计时和 Rich Live。
 - TUI 回到输入状态。
 
 外层 asyncio 任务被取消时，清理完成后仍继续传播 CancelledError，不把它伪装成普通 Agent 取消。
 
-空闲输入阶段不走上面的取消链，而是由普通 InputBox 的显式 `c-c` 绑定抛出
+空闲输入阶段不走上面的任务归属取消链，而是由普通 InputBox 的 ESC/`c-c` 绑定抛出
 `KeyboardInterrupt`。TerminalUI 捕获后调用幂等的 `request_exit()`：先执行本次进程的
-记忆整理，再由 `run_app()` 的 `finally` 关闭 Session、MCP 后台任务和 Provider。
+记忆整理，再由 `run_app()` 的 `finally` 清空全部子任务并关闭 Session、MCP、子 Provider
+和主 Provider。
 prompt_toolkit 的基础绑定会忽略 `Ctrl+C`，因此这个显式绑定是安全退出行为的一部分，
 不能只依赖 `load_key_bindings()`。
 
@@ -2451,25 +2481,239 @@ YCode 把整个用户回合作为会话事务：只有 COMPLETED 才先落盘并
 审批、调度任务或 PowerShell 进程树并恢复输入；空闲输入中的 Ctrl+C 则进入统一安全
 退出管线。
 
-## 当前验证状态
+## 子 Agent 系统：定义式角色、Fork 与后台任务
 
-截至 2026-08-14，Hook 实现完成后的最新工作区验证为：
+子 Agent 只在 Anthropic Agent 路径装配。它不是新的对话产品入口，而是主 Agent 可调用的
+统一工具：主模型决定何时委派，子循环从工具参数直接开始并“跑到底”，不会等待新的终端
+输入。
 
-~~~text
-ruff format --check ycode tests：227 files already formatted
-ruff check ycode tests：All checks passed
-compileall -q ycode tests：通过
-Hook 集成测试：4 passed
-Hook Windows ConPTY 场景：1 passed, 22 deselected
-非 E2E 全量：683 passed, 2 skipped, 1 failed
+### 1. 统一入口与两种创建方式
+
+`run_subagent` 的稳定参数只有三个：
+
+~~~json
+{
+  "task": "必须完成的具体任务",
+  "role": "可选角色名",
+  "mode": "可选 sync 或 async"
+}
 ~~~
 
-唯一非 E2E 失败仍是当前工作区
+角色名不写进工具 Schema 的动态枚举，因此增删项目角色不会改变 Anthropic 工具前缀。工具
+自身标记为 `READ`，只表示“创建任务”不是文件写入；子 Agent 后续每次工具调用仍单独经过
+执行策略、权限引擎和 Hook。
+
+创建语义是：
+
+| 参数组合 | 创建方式 | 运行方式 |
+|---|---|---|
+| 指定 `role`，省略 `mode` | defined | 默认 sync |
+| 指定 `role`，`mode=async` | defined | async |
+| 省略 `role`，省略或指定 async | fork | 强制 async |
+| 省略 `role`，指定 sync | 非法 | 返回 `fork_sync_invalid` |
+
+同步任务也登记到任务管理器，但父工具调用会一直等待终态；异步任务立即返回 `running` 和
+task ID。运行方式创建后不可转换，也没有超时自动转后台。
+
+### 2. Markdown 角色目录
+
+启动时只扫描项目根 `.ycode/agents/*.md` 的直接文件，并始终加载内置 `explore`、`plan`。
+角色使用 YAML frontmatter 加 Markdown 正文：
+
+~~~markdown
+---
+name: review
+description: 检查当前实现
+model: child-model
+allowed-tools: [read_file, glob, grep]
+denied-tools: []
+max-rounds: 10
+permission: strict
+---
+
+你负责检查当前实现并给出证据。
+~~~
+
+Loader 严格检查未知字段、文件名与 name、一句话说明、正文、模型名、工具名、名单重叠、
+轮次和权限枚举。名称会 `strip + casefold`；项目角色不能覆盖内置角色，规范化重名的项目
+角色全部不可用。单个错误角色保存为带 `SubagentRoleProblem` 的目录条目，不阻止其他角色
+或主应用启动。
+
+任务创建时保存不可变 `SubagentRoleSnapshot`。运行中修改角色文件不会改变已创建任务；当前
+也没有角色热重载或用户级角色搜索路径。
+
+### 3. 父请求快照与 Fork 缓存前缀
+
+主 `AgentLoop` 使用 `AgentToolScope`。每次真正发送模型请求前保存：
+
+~~~text
+AgentRequestSnapshot
+    ├── turn_id
+    ├── 实际 AgentModelRequest
+    ├── AgentMode
+    ├── 当前 PermissionMode
+    └── effective_tool_names
+~~~
+
+模型随后调用 `run_subagent` 时，工具从 `ToolContext.agent_scope.current_snapshot` 取得产生这次
+工具调用的请求。快照不包含尚未完成的 assistant tool call，因此 Fork 不会把自己的
+`run_subagent` 调用递归带进父前缀。
+
+`AgentModelRequest` 新增 `continuation_messages`：
+
+~~~text
+tools
+→ stable system prompt
+→ parent messages
+→ parent supplements
+→ conversation cache breakpoint
+→ continuation_messages
+~~~
+
+Fork 逐项保留父请求的 messages、system、supplements、tools 顺序、输出上限和 Thinking
+设置，只在 continuation 追加 `fork.md` 强制规范和具体任务。强制规范要求不再创建子
+Agent、不向用户索取确认、直接用工具完成任务，并按“结论、证据、风险/待办”返回简洁文本。
+
+Anthropic 在线格式把缓存断点放到最后一个可复用父消息或 supplement，任务位于断点之后，
+所以首次 Fork 有机会命中父请求 Prompt Cache。普通 `stream_chat` 保持旧消息格式；缓存
+条件不满足只意味着用量里没有 cache read，不会把任务判为失败。
+
+首次 Fork 若仅因新任务导致上下文超限，会明确失败而不压缩父前缀。首次请求成功后，后续
+上下文管理只能追加或压缩子 continuation，并把子摘要放在父 supplements 之后。
+
+### 4. 独立循环、共享设施与 Provider 所有权
+
+`SubagentRunner` 为每个任务创建独立 `AgentLoop`：
+
+~~~text
+SubagentManager.start()
+    ↓
+SubagentRunner.run()
+    ├── SubagentProviderPool.get()
+    ├── 独立 PromptRuntimeContext
+    ├── 独立 ContextManager / ContextArtifactStore
+    ├── 独立 PermissionSession
+    ├── 独立 Hook scope 与任务元数据
+    └── AgentLoop 跑到底
+            ↓
+    SubagentTaskView
+~~~
+
+定义式从空消息历史开始，使用基础内置 Prompt 加角色正文，再注入参数任务；Fork 使用父请求
+种子。模型有工具调用就执行并继续，没有工具调用且返回正常文本才完成。最终 result 取最后
+一条非空 assistant 文本；空结果、Provider 错误、轮次耗尽和取消分别进入对应终态。
+
+父子共享项目文件系统、ToolRegistry/Executor 基础设施、HookRuntime 和 Provider 连接池，
+但不共享消息历史、上下文压缩状态、权限临时授权、Reminder 或 Token 累计。Token 用量按
+任务独立记录 input、output、cache creation 和 cache read，不并入父回合。
+
+Fork 和未指定模型的定义式任务借用主 Anthropic Provider；指定命名模型时 ProviderPool
+延迟创建并在会话内复用。子循环统一 `owns_provider=False`：它只能借用，不能自行关闭。
+退出时先清任务，再关闭命名子 Provider，最后关闭主 Provider。
+
+### 5. 执行前多层安全边界
+
+子 Agent 工具定义“可见”不等于“可执行”。`SubagentToolPolicy` 在普通 PermissionEngine
+和 Hook 前执行：
+
+~~~text
+全局硬拒绝 run_subagent / load_skill / install_skill
+→ Fork 父有效工具集 或 defined 注册表基础集
+→ 角色 allowed-tools
+→ 角色 denied-tools
+→ async_allowed_tools（仅异步）
+→ plan-only 只读硬上限
+→ PermissionEngine
+→ Hook permission
+~~~
+
+Fork 可以继承父 Agent 的写工具并实际执行，所以不是从 Schema 中隐藏所有写能力；真正的
+边界是执行前检查。`run_subagent` 即使仍出现在 Fork 工具定义里也无条件拒绝，防止
+A→B→C 嵌套。Skill 加载和安装同样硬拒绝，避免运行中扩大能力。
+
+Fork 继承父权限模式的值，但使用空白 PermissionSession；定义式取父模式和角色 permission
+中更严格者。角色不能把 strict/default 提升到 allow。父任务处于 plan-only 时，无论角色、
+Fork 或异步白名单如何配置，最终都只能执行 READ 工具。
+
+子 Agent 是非交互工作者：权限或 Hook 最终得到 ASK 时自动转成拒绝工具结果，不显示审批
+UI，也不暂停或自动批准。拒绝不会直接终止循环，模型仍可选择其他工具或方案。
+
+### 6. 同步、异步通知与任务命令
+
+`SubagentManager` 是会话级统一任务表，默认同步和异步合计最多运行 4 个；达到上限立即
+返回 `concurrency_limit`，不排队。任务状态包括：
+
+~~~text
+running
+completed
+failed
+cancelled
+limit_reached
+~~~
+
+每条记录保存 task ID、创建/运行方式、角色、原任务、结果或错误、分类 Token 与起止时间。
+`/tasks` 显示列表，`/tasks <id>` 接受完整 ID 或唯一前缀查看详情，`/tasks stop <id>` 取消
+运行任务。命令直接读取 Manager，不调用模型，也不进入会话历史。
+
+异步任务进入终态后设置一次 `notification_pending`。主 Agent 的
+`AgentLoopOptions.notification_source` 在下一次安全请求边界提取通知，并固定到当前回合
+后续请求；如果当前回合已经结束，就留到下一次用户消息。通知是结构化
+`SYSTEM_REMINDER`，不会主动发起父回合、打断流式请求或重复注入。
+
+### 7. Hook、取消与会话边界
+
+父子共享 Hook 规则和 once 状态，但每个子任务使用 `subagent:<task-id>` Reminder scope。
+子 Hook 上下文增加 task ID、defined/fork、角色和 sync/async；子任务触发回合、消息、工具、
+压缩和错误事件，不重复触发 session.start/end，终态后清理自己的 scope。
+
+旧 Hook `action: {type: agent}` 只是兼容配置：现在静默成功，不创建任务，也不再输出“尚未
+实现” warning。Hook 配置没有 task/role/mode，不能安全代替 `run_subagent`。
+
+每个父回合有稳定 owner turn ID。活动响应中按 ESC 或 Ctrl+C 时：
+
+~~~text
+ChatSession.cancel_active_turn()
+    ├── 当前 AgentTurn.cancel()
+    └── SubagentManager.cancel_owned(turn_id)
+~~~
+
+这只取消当前回合拥有且仍运行的同步/异步子任务，不影响此前正常回合遗留的后台任务。
+`/clear`、恢复其他会话和退出则调用 `SubagentManager.clear()`，取消全部运行任务并清除记录
+与待注入通知。取消只停止后续运行，不声称回滚已经完成的文件修改或命令副作用。
+
+### 8. 当前范围与面试表述
+
+当前只实现 Anthropic 子 Agent；没有 OpenAI 适配、嵌套任务、角色热加载、任务持久化、
+队列、重试、独立工作树、写冲突协调或生产级并发可靠性工程。内置角色只有 `explore` 和
+`plan`。
+
+面试时可以概括为：YCode 用一个稳定 READ 工具把主请求快照交给会话级任务管理器；定义式
+子 Agent 用角色快照和空历史，Fork 用不可改写的父请求缓存前缀，两者复用同一 AgentLoop
+但隔离消息、上下文、权限、Reminder 和 Token。执行前策略负责防嵌套、防扩权、角色、异步
+和 plan-only 边界，异步结果只在安全模型请求边界注入，取消则通过 owner turn ID 精确级联。
+
+## 当前验证状态
+
+截至 2026-08-16，子 Agent 与 Hook 兼容 warning 修复后的最新工作区验证为：
+
+~~~text
+本次修改 Python 文件 format --check：59 files already formatted
+本次修改 Python 文件 ruff check：All checks passed
+compileall -q ycode tests：通过
+子 Agent 单元测试：40 passed
+受影响模块回归：467 passed, 2 skipped
+子 Agent / Hook 集成：6 passed
+Hook warning 定向回归：73 passed
+Windows ConPTY 全量：24 passed
+非 E2E 验收（排除已确认豁免的 Skill 文件）：738 passed, 2 skipped
+~~~
+
+当前工作区唯一已确认的仓库级豁免仍是
 `.ycode/skills/frontend-design/SKILL.md` 返回 Windows `PermissionError: [WinError 5]`；
-它也会导致对 `.` 执行 Ruff 时 Ruff 自身崩溃，所以本次格式和静态检查明确限定为实际
-Python 源目录 `ycode tests`。完整 E2E 首轮中的既有审批 Ctrl+C 用例曾因 ConPTY 按键
-传递波动失败，单独重跑为 `1 passed`。因此当前不能把全项目状态记录为全绿，但 Hook
-定向单元、集成和真实终端主链路已有实际通过证据。
+它会使示例 Skill 扫描测试失败，也会导致对 `.` 执行 Ruff 时无法读取该目录。用户已确认
+把它作为既有工作区权限问题，不阻塞子 Agent 功能验收。仓库还存在与本功能无关的历史
+Markdown 格式问题，因此这里准确记录“本次修改 Python 文件”格式通过，而不把整个仓库
+描述成无条件全绿。
 
 新增实现与验证覆盖：
 
@@ -2483,7 +2727,14 @@ Python 源目录 `ycode tests`。完整 E2E 首轮中的既有审批 Ctrl+C 用�
 - Hook deny 阻止工具副作用并把原因作为工具结果反馈模型。
 - Hook ask 复用现有审批槽且不产生会话授权。
 - 工具 after Reminder 只进入下一次模型请求，不进入会话历史。
+- Hook `agent` 兼容动作静默完成，不再产生“子 Agent Hook 尚未实现”warning。
 - 真实终端验证启动风险提示、ask/deny、模型调整和 session.end 收尾。
+- `run_subagent` 定义式同步、定义式异步和 Fork 参数语义。
+- Markdown 角色加载、内置角色优先、错误角色隔离和命名模型复用。
+- 父请求快照、continuation 缓存前缀、Fork 强制任务注入和缓存分类 Token。
+- 子工具多层执行前拒绝、父权限上限、plan-only 只读与 ASK 自动拒绝。
+- 同步/异步统一任务状态、并发上限、一次性通知和 `/tasks` 管理命令。
+- 父子 Hook scope、权限、上下文和 Token 隔离，以及 owner turn 级联取消。
 
 记忆系统 E2E 使用本地假 SSE Provider，连续启动三个真实 YCode 进程，覆盖：
 
@@ -2600,9 +2851,9 @@ Invocation arguments:
 无参数时明确写 `No arguments were provided.`。终端仍显示原始 Slash Command，避免 UI
 文本和模型文本互相污染。
 
-`SkillRuntime.enter_call()` 用调用栈拒绝循环，并把最大嵌套深度限制为 3。隔离分支复制
-父调用栈并共享任务授权对象，但不继承主分支的待提交共享状态。因此子 Agent 中激活的
-共享 Skill 不会意外进入主会话。
+`SkillRuntime.enter_call()` 用调用栈拒绝循环，并把最大嵌套深度限制为 3。隔离 Skill
+子循环复制父调用栈并共享任务授权对象，但不继承主分支的待提交共享状态。因此隔离 Skill
+子循环中激活的共享 Skill 不会意外进入主会话；它不是 `run_subagent` 创建的子 Agent。
 
 ### 4. 共享模式的事务边界
 

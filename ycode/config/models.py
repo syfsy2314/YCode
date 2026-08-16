@@ -1,5 +1,6 @@
 """YAML 配置对应的强类型模型。"""
 
+import re
 from enum import StrEnum
 from typing import Any
 from urllib.parse import urlparse
@@ -13,6 +14,33 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+_TOOL_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+DEFAULT_ASYNC_ALLOWED_TOOLS = (
+    "read_file",
+    "glob",
+    "grep",
+    "tool_search",
+    "write_file",
+    "edit_file",
+    "run_command",
+)
+
+
+class SubagentConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_concurrent: int = Field(default=4, strict=True, gt=0)
+    async_allowed_tools: tuple[str, ...] = DEFAULT_ASYNC_ALLOWED_TOOLS
+
+    @field_validator("async_allowed_tools")
+    @classmethod
+    def validate_async_tools(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("async_allowed_tools 不允许重复")
+        if any(not _TOOL_NAME_PATTERN.fullmatch(name) for name in value):
+            raise ValueError("async_allowed_tools 必须包含合法工具名称")
+        return value
 
 
 class ProviderProtocol(StrEnum):
@@ -62,6 +90,7 @@ class AppConfig(BaseModel):
     active: str = Field(min_length=1)
     providers: list[ProviderEntry] = Field(min_length=1)
     mcp_servers: list[Any] = Field(default_factory=list)
+    subagents: SubagentConfig = Field(default_factory=SubagentConfig)
     context_window_tokens: int = Field(default=200_000, strict=True, gt=33_000)
     _active_provider: ProviderConfig | None = PrivateAttr(default=None)
 

@@ -13,7 +13,14 @@ from ycode.context import (
     ContextPolicy,
     ConversationCompactor,
 )
-from ycode.core import AgentModelRequest, ChatMessage, StopReason, StreamEnd, TextDelta
+from ycode.core import (
+    AgentModelRequest,
+    ChatMessage,
+    StopReason,
+    StreamEnd,
+    TextDelta,
+    ToolResultBlock,
+)
 
 
 def summary_response() -> str:
@@ -78,6 +85,69 @@ async def test_auto_compaction_is_transactional_and_retains_latest_user(tmp_path
     commit = transaction.create_commit((latest, ChatMessage.assistant_text("完成")))
     manager.commit(commit)
     assert manager.memory is commit.memory
+
+
+@pytest.mark.asyncio
+async def test_prepare_request_preserves_and_externalizes_continuation(tmp_path: Path) -> None:
+    manager, _ = make_manager(tmp_path, [])
+    latest = ChatMessage.user_text("latest")
+    continuation = ChatMessage(
+        "user",
+        (ToolResultBlock("call-1", "x" * 60_000),),
+    )
+    request = AgentModelRequest(
+        messages=(latest,),
+        continuation_messages=(continuation,),
+    )
+
+    prepared = await manager.begin_turn((), latest).prepare_request(request)
+
+    result = prepared.request.continuation_messages[0].blocks(ToolResultBlock)[0]
+    assert '"externalized":true' in result.content
+
+
+@pytest.mark.asyncio
+async def test_preserved_first_request_fails_without_rewriting_prefix(tmp_path: Path) -> None:
+    manager, provider = make_manager(tmp_path, [])
+    task = ChatMessage.user_text("task")
+    request = AgentModelRequest(
+        messages=(ChatMessage.user_text("x" * 510_000),),
+        continuation_messages=(task,),
+    )
+
+    with pytest.raises(ContextLimitError, match="继承前缀"):
+        await manager.begin_turn((), task).prepare_request(
+            request,
+            preserve_messages=True,
+        )
+
+    assert provider.agent_requests == []
+
+
+@pytest.mark.asyncio
+async def test_preserved_compaction_only_replaces_continuation(tmp_path: Path) -> None:
+    manager, _ = make_manager(
+        tmp_path,
+        [[TextDelta(0, summary_response()), StreamEnd(StopReason.END_TURN)]],
+    )
+    parent = ChatMessage.user_text("parent prefix")
+    task = ChatMessage.user_text("task")
+    request = AgentModelRequest(
+        messages=(parent,),
+        supplements=("parent supplement",),
+        continuation_messages=(ChatMessage.assistant_text("x" * 510_000), task),
+    )
+
+    prepared = await manager.begin_turn((), task).prepare_request(
+        request,
+        preserve_messages=True,
+        allow_preserved_compaction=True,
+    )
+
+    assert prepared.request.messages == (parent,)
+    assert prepared.request.supplements[0] == "parent supplement"
+    assert prepared.request.continuation_messages == (task,)
+    assert prepared.compaction_report is not None
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,7 @@ from ycode.core.messages import FrozenJsonObject, ToolCallBlock, freeze_json
 from ycode.tools.arguments import ToolArguments
 
 if TYPE_CHECKING:
+    from ycode.agent.contracts import AgentToolScope
     from ycode.skills.models import SkillTaskScope
     from ycode.tools.exposure import ToolExposureSession
 
@@ -65,6 +66,7 @@ class ToolContext:
     workspace: Path
     exposure: "ToolExposureSession | None" = None
     skill_scope: "SkillTaskScope | None" = None
+    agent_scope: "AgentToolScope | None" = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.workspace, Path):

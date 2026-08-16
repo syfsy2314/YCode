@@ -1,16 +1,19 @@
 """Agent 状态、运行结果和可取消事件流。"""
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
+from uuid import uuid4
 
 from ycode.context.models import ContextCommit
 from ycode.core.events import TokenUsage
-from ycode.core.messages import ChatMessage
-from ycode.security.models import ApprovalChoice
+from ycode.core.messages import ChatMessage, ToolCallBlock
+from ycode.core.provider import AgentModelRequest
+from ycode.prompt.models import SystemSupplement
+from ycode.security.models import ApprovalChoice, PermissionMode
 from ycode.skills.models import SkillTaskScope
 
 
@@ -24,6 +27,64 @@ class AgentTermination(StrEnum):
     LIMIT_REACHED = "limit_reached"
     CANCELLED = "cancelled"
     ERROR = "error"
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRequestSnapshot:
+    turn_id: str
+    request: AgentModelRequest
+    mode: AgentMode
+    permission_mode: PermissionMode
+    effective_tool_names: frozenset[str]
+
+
+@dataclass(slots=True)
+class AgentToolScope:
+    turn_id: str = ""
+    current_snapshot: AgentRequestSnapshot | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolPolicyDecision:
+    allowed: bool
+    code: str = ""
+    message: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.allowed and (not self.code or not self.message):
+            raise ValueError("工具策略拒绝必须携带错误码和消息")
+
+
+@runtime_checkable
+class AgentToolPolicy(Protocol):
+    def evaluate(self, call: ToolCallBlock) -> ToolPolicyDecision: ...
+
+
+@runtime_checkable
+class AgentNotificationSource(Protocol):
+    def take_pending(self) -> tuple[SystemSupplement, ...]: ...
+
+
+@runtime_checkable
+class OwnedTurnController(Protocol):
+    async def cancel_owned(self, turn_id: str) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class AgentLoopOptions:
+    tool_policy: AgentToolPolicy | None = None
+    notification_source: AgentNotificationSource | None = None
+    tool_scope: AgentToolScope | None = None
+    hook_scope_id: str = "main"
+    task_metadata: Mapping[str, object] | None = None
+    non_interactive_approvals: bool = False
+    owns_provider: bool = True
+    clear_hook_scope_on_finish: bool = False
+    preserve_seed_prefix: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.hook_scope_id:
+            raise ValueError("Hook scope ID 不能为空")
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +195,9 @@ class AgentTurn(Protocol):
     @property
     def result(self) -> AgentTurnResult | None: ...
 
+    @property
+    def turn_id(self) -> str: ...
+
     def cancel(self) -> None: ...
     def submit_approval(self, choice: ApprovalChoice) -> None: ...
 
@@ -158,6 +222,8 @@ class AgentTurnStream:
     def __init__(
         self,
         producer: Callable[["AgentTurnStream"], AsyncIterator["AgentEvent"]],
+        *,
+        turn_id: str | None = None,
     ) -> None:
         self._iterator = producer(self)
         self._stored_result: AgentTurnResult | None = None
@@ -165,6 +231,11 @@ class AgentTurnStream:
         self._cancel_requested = False
         self._exhausted = False
         self._approval: asyncio.Future[ApprovalChoice] | None = None
+        self._turn_id = turn_id or uuid4().hex
+
+    @property
+    def turn_id(self) -> str:
+        return self._turn_id
 
     def __aiter__(self) -> "AgentTurnStream":
         return self

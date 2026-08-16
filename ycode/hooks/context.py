@@ -10,9 +10,16 @@ from ycode.tools.contracts import ToolExecutionRecord
 
 
 class HookContextFactory:
-    def __init__(self, project: Path, session_id: str) -> None:
+    def __init__(
+        self,
+        project: Path,
+        session_id: str,
+        *,
+        task_metadata: Mapping[str, object] | None = None,
+    ) -> None:
         self._project = project.resolve()
         self._session_id = session_id
+        self._task_metadata = dict(task_metadata) if task_metadata is not None else None
 
     def simple(self, name: HookEventName, **values: object) -> HookEvent:
         context = self._base(name)
@@ -73,8 +80,11 @@ class HookContextFactory:
         )
 
     def _base(self, name: HookEventName) -> dict[str, object]:
-        return {
+        context: dict[str, object] = {
             "event": {"name": name.value},
             "project": {"path": str(self._project)},
             "session": {"id": self._session_id},
         }
+        if self._task_metadata is not None:
+            context["subagent"] = dict(self._task_metadata)
+        return context

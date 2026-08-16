@@ -50,6 +50,22 @@ def test_loads_plain_api_key(tmp_path: Path) -> None:
     assert load_config(path).active_provider.api_key.get_secret_value() == "plain-key"
 
 
+def test_loads_subagent_configuration(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    write_config(path)
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + "\nsubagents:\n  max_concurrent: 3\n"
+        + "  async_allowed_tools: [read_file, grep]\n",
+        encoding="utf-8",
+    )
+
+    loaded = load_config(path)
+
+    assert loaded.app.subagents.max_concurrent == 3
+    assert loaded.app.subagents.async_allowed_tools == ("read_file", "grep")
+
+
 def test_expands_environment_reference(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "config.yaml"
     write_config(path, "${YCODE_TEST_KEY}")

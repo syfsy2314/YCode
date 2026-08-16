@@ -149,6 +149,20 @@ class TerminalUI:
     async def clear_session(self) -> None:
         self._console.print(await self._session.clear_session())
 
+    async def show_tasks(self, task_id: str | None = None) -> None:
+        try:
+            message = self._session.tasks_status(task_id)
+        except (ValueError, RuntimeError) as error:
+            raise CommandExecutionError(str(error)) from error
+        self._console.print(message)
+
+    async def stop_task(self, task_id: str) -> None:
+        try:
+            message = await self._session.stop_task(task_id)
+        except (ValueError, RuntimeError) as error:
+            raise CommandExecutionError(str(error)) from error
+        self._console.print(message)
+
     async def set_mode(self, mode: str) -> None:
         from ycode.agent import AgentMode
 

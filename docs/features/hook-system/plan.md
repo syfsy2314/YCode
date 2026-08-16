@@ -336,7 +336,7 @@ class HookDispatchResult:
 - 普通事件的权限字段始终为空。
 - `tool.before_execute` 汇总权限决定并在 `deny` 时短路。
 - Reminder 动作成功后进入一次性队列。
-- Agent 占位动作通过 `notices` 返回终端信息。
+- Agent 兼容动作静默成功，不通过 `notices` 返回遗留占位信息。
 - `take_reminders()` 原子取出并清空当前 Reminder 队列。
 - `close()` 等待后台任务最多 3 秒，随后取消剩余任务并关闭 HTTP 客户端。
 
@@ -449,7 +449,7 @@ Reminder 执行器生成 `SystemSupplement(SupplementKind.SYSTEM_REMINDER, conte
 SupplementKind 值为 `system-reminder`，现有 `tagged_content` 因而生成准确的
 `<system-reminder>...</system-reminder>`。
 
-Agent 占位执行器返回 `子 Agent Hook 尚未实现：<rule-id>` 通知，不创建 Agent。
+Agent 兼容执行器静默成功，不创建 Agent；子 Agent 统一由 `run_subagent` 工具创建。
 
 ### HookRuntime
 
@@ -573,13 +573,9 @@ AgentLoop 自动压缩和 ChatSession 手动压缩各自在成功激活结果后
 触发 `turn.start/end`。
 
 `ycode/ui/terminal.py` 渲染 HookNoticeEvent。配置诊断沿用启动 warning 展示。Shell/HTTP
-普通日志不持续打印到终端；Agent 占位通知显示为：
+普通日志不持续打印到终端；兼容 Agent 动作不再输出遗留占位通知。
 
-```text
-hook: 子 Agent Hook 尚未实现：<rule-id>
-```
-
-session.end 发生在 UI 输入循环退出后，其占位通知由关闭路径直接输出，其他结果只写日志。
+session.end 发生在 UI 输入循环退出后；动作结果只写日志，不输出 Agent 占位通知。
 
 ### 应用装配
 

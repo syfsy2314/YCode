@@ -1,7 +1,7 @@
 hooks:
-  # 当前 Agent 动作仅在终端打印占位信息，不会真正启动子 Agent。
+  # 兼容 Agent 动作静默完成；子 Agent 统一通过 run_subagent 创建。
   - id: session-start-notice
-    enabled: true
+    enabled: false
     event: session.start
     once: true
     action:

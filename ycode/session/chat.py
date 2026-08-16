@@ -58,6 +58,7 @@ from ycode.skills.runtime import SkillRuntime, SkillRuntimeError
 
 if TYPE_CHECKING:
     from ycode.commands import CommandRuntime
+    from ycode.subagents import SubagentManager
 
 type _TerminalEvent = (
     FinalResponseEvent | AgentLimitReachedEvent | AgentCancelledEvent | AgentErrorEvent
@@ -89,6 +90,7 @@ class ChatSession:
         skill_runtime: SkillRuntime | None = None,
         hook_runtime: HookRuntime | None = None,
         hook_context: HookContextFactory | None = None,
+        subagent_manager: SubagentManager | None = None,
     ) -> None:
         self._runner = runner
         self._history: list[ChatMessage] = []
@@ -107,6 +109,8 @@ class ChatSession:
             raise ValueError("Hook 运行时和上下文工厂必须同时提供")
         self._hook_runtime = hook_runtime
         self._hook_context = hook_context
+        self._subagent_manager = subagent_manager
+        self._subagent_cancellations: set[asyncio.Task[None]] = set()
         self._active_turn: AgentTurn | None = None
         self._active_compaction: asyncio.Task[object] | None = None
         self._turn_finished = asyncio.Event()
@@ -190,6 +194,8 @@ class ChatSession:
     async def restore(self, session_id: str | None = None) -> SessionRestoredEvent:
         if self._session_manager is None:
             raise SessionStorageError("当前对话未启用持久化会话")
+        if self._subagent_manager is not None:
+            await self._subagent_manager.clear()
         snapshot = (
             await self._session_manager.load(session_id)
             if session_id is not None
@@ -597,6 +603,8 @@ class ChatSession:
     async def clear_session(self) -> str:
         if self._active_turn is not None or self._active_compaction is not None:
             raise RuntimeError("活动任务期间不能清空会话")
+        if self._subagent_manager is not None:
+            await self._subagent_manager.clear()
         self._history.clear()
         self._mode = AgentMode.AGENT
         self._startup_restore_event = None
@@ -617,7 +625,12 @@ class ChatSession:
 
     def cancel_active_turn(self) -> None:
         if self._active_turn is not None:
+            turn_id = self._active_turn.turn_id
             self._active_turn.cancel()
+            if self._subagent_manager is not None:
+                task = asyncio.create_task(self._subagent_manager.cancel_owned(turn_id))
+                self._subagent_cancellations.add(task)
+                task.add_done_callback(self._subagent_cancellations.discard)
         if self._active_compaction is not None:
             self._active_compaction.cancel()
 
@@ -632,6 +645,21 @@ class ChatSession:
         if self._memory_update_task is None:
             self._memory_update_task = asyncio.create_task(self._finalize_memory())
         return await asyncio.shield(self._memory_update_task)
+
+    def tasks_status(self, task_id: str | None = None) -> str:
+        if self._subagent_manager is None:
+            raise ValueError("当前对话未启用子 Agent。")
+        from ycode.subagents import format_task_detail, format_task_list
+
+        if task_id is None:
+            return format_task_list(self._subagent_manager.tasks)
+        return format_task_detail(self._subagent_manager.get(task_id))
+
+    async def stop_task(self, task_id: str) -> str:
+        if self._subagent_manager is None:
+            raise ValueError("当前对话未启用子 Agent。")
+        task = await self._subagent_manager.stop(task_id)
+        return f"子 Agent 任务 {task.task_id} 已取消。"
 
     async def _finalize_memory(self) -> MemoryUpdateReport:
         if not self._new_commits or self._memory_store is None or self._memory_updater is None:
@@ -662,6 +690,10 @@ class ChatSession:
         if self._active_turn is not None or self._active_compaction is not None:
             self.cancel_active_turn()
             await self._turn_finished.wait()
+        if self._subagent_manager is not None:
+            await self._subagent_manager.clear()
+        if self._subagent_cancellations:
+            await asyncio.gather(*self._subagent_cancellations, return_exceptions=True)
         try:
             if self._hook_runtime is not None and self._hook_context is not None:
                 result = await self._hook_runtime.dispatch(

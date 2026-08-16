@@ -43,10 +43,7 @@ class HookActionExecutors:
                 if isinstance(rule.action, ReminderHookAction):
                     return self._reminder(rule, event)
                 if isinstance(rule.action, AgentHookAction):
-                    return HookActionResult(
-                        HookActionStatus.SUCCEEDED,
-                        message=f"子 Agent Hook 尚未实现：{rule.id}",
-                    )
+                    return HookActionResult(HookActionStatus.SUCCEEDED)
                 raise TypeError("未知 Hook 动作")
         except TimeoutError:
             return HookActionResult(HookActionStatus.TIMED_OUT, message="Hook 动作执行超时")

@@ -126,6 +126,17 @@ def build_command_runtime(
         await controller.clear_session()
         await controller.refresh_status()
 
+    async def tasks_handler(invocation: CommandInvocation, controller: UIController) -> None:
+        parts = invocation.arguments.split()
+        if not parts:
+            await controller.show_tasks()
+        elif len(parts) == 1:
+            await controller.show_tasks(parts[0])
+        elif len(parts) == 2 and parts[0].lower() == "stop":
+            await controller.stop_task(parts[1])
+        else:
+            raise CommandUsageError
+
     definitions = (
         CommandDefinition(
             "help",
@@ -180,6 +191,15 @@ def build_command_runtime(
         ),
         CommandDefinition(
             "clear", (), "清空当前会话", "/clear", CommandKind.STATE, "", clear_handler
+        ),
+        CommandDefinition(
+            "tasks",
+            (),
+            "查看或终止子 Agent 任务",
+            "/tasks [task-id|stop <task-id>]",
+            CommandKind.LOCAL,
+            "[task-id|stop <task-id>]",
+            tasks_handler,
         ),
     )
     for definition in (*definitions, *tuple(extra_definitions)):

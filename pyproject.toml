@@ -42,6 +42,7 @@ exclude = ["tests*"]
 "ycode.prompt.resources" = ["*.md"]
 "ycode.context.resources" = ["*.md"]
 "ycode.memory.resources" = ["*.md"]
+"ycode.subagents.resources" = ["*.md"]
 
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"

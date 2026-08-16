@@ -37,7 +37,7 @@ class HookRuntime:
     ) -> None:
         self._rules = [RuntimeHookRule(rule) for rule in rules]
         self._executors = HookActionExecutors(project, http_client)
-        self._reminders: list[SystemSupplement] = []
+        self._reminders: dict[str, list[SystemSupplement]] = {}
         self._tasks: set[asyncio.Task[None]] = set()
         self._closing = False
 
@@ -45,7 +45,14 @@ class HookRuntime:
     def rules(self) -> tuple[RuntimeHookRule, ...]:
         return tuple(self._rules)
 
-    async def dispatch(self, event: HookEvent) -> HookDispatchResult:
+    async def dispatch(
+        self,
+        event: HookEvent,
+        *,
+        scope_id: str = "main",
+    ) -> HookDispatchResult:
+        if not scope_id:
+            raise ValueError("Hook scope ID 不能为空")
         if self._closing and event.name is not HookEventName.SESSION_END:
             return HookDispatchResult()
         aggregate: HookPermissionDecision | None = None
@@ -71,7 +78,7 @@ class HookRuntime:
                 continue
             result = await self._execute(runtime_rule, event)
             if result.reminder:
-                self._reminders.append(
+                self._reminders.setdefault(scope_id, []).append(
                     SystemSupplement(SupplementKind.SYSTEM_REMINDER, result.reminder)
                 )
             if result.message and rule.action.type == "agent":
@@ -90,10 +97,12 @@ class HookRuntime:
                 reason = decision_reason
         return HookDispatchResult(aggregate, reason, tuple(notices))
 
-    def take_reminders(self) -> tuple[SystemSupplement, ...]:
-        reminders = tuple(self._reminders)
-        self._reminders.clear()
+    def take_reminders(self, scope_id: str = "main") -> tuple[SystemSupplement, ...]:
+        reminders = tuple(self._reminders.pop(scope_id, ()))
         return reminders
+
+    def clear_scope(self, scope_id: str) -> None:
+        self._reminders.pop(scope_id, None)
 
     async def close(self) -> None:
         if self._closing:
