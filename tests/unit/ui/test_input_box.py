@@ -209,6 +209,20 @@ async def test_approval_without_session_option_does_not_bind_three() -> None:
 
 
 @pytest.mark.asyncio
+async def test_confirmation_accepts_only_explicit_yes() -> None:
+    with create_pipe_input() as pipe_input:
+        box = InputBox(
+            console=console(),
+            unicode_supported=True,
+            input=pipe_input,
+            output=DummyOutput(),
+        )
+        pipe_input.send_text("yes\r")
+
+        assert await box.read_confirmation("风险摘要") is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("key", ["\x03", "\x1b"])
 async def test_wait_for_interrupt_accepts_ctrl_c_and_escape(key: str) -> None:
     with create_pipe_input() as pipe_input:

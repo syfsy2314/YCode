@@ -8,6 +8,7 @@ from ycode.security import PermissionMode
 from ycode.subagents import (
     SubagentConfig,
     SubagentCreationMode,
+    SubagentIsolation,
     SubagentRoleConfig,
     SubagentRunMode,
     SubagentStatus,
@@ -40,6 +41,14 @@ def test_role_config_freezes_tool_sets_and_validates_rounds() -> None:
 
     assert role.allowed_tools == frozenset({"read_file"})
     assert role.denied_tools == frozenset({"run_command"})
+    assert role.isolation is SubagentIsolation.NONE
+    isolated = SubagentRoleConfig(
+        "writer",
+        "Write code",
+        "Implement changes",
+        isolation=SubagentIsolation.WORKTREE,
+    )
+    assert isolated.isolation is SubagentIsolation.WORKTREE
     with pytest.raises(ValueError, match="正整数"):
         SubagentRoleConfig("bad", "bad", "bad", max_rounds=0)
 

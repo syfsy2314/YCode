@@ -55,6 +55,21 @@ class SessionManager:
     def active_session_id(self) -> str | None:
         return self._active_session_id
 
+    @property
+    def current_session_id(self) -> str | None:
+        """返回已提交或已预留的稳定会话 ID。"""
+        return self._active_session_id or self._pending_session_id
+
+    def reserve_session_id(self, first_message: ChatMessage) -> str:
+        """为首次回合预留会话 ID，但不提前创建空会话文件。"""
+        if not isinstance(first_message, ChatMessage) or first_message.role != "user":
+            raise ValueError("只能使用用户消息预留会话 ID")
+        if self._active_session_id is not None:
+            return self._active_session_id
+        if self._pending_session_id is None:
+            self._pending_session_id = self._new_session_id(first_message)
+        return self._pending_session_id
+
     def begin_new(self) -> None:
         self._active_session_id = None
         self._last_turn_number = 0

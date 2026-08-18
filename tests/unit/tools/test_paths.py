@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from ycode.tools import ToolError
-from ycode.tools.paths import WorkspacePathResolver
+from ycode.tools.paths import WorkspaceMount, WorkspacePathResolver
 
 
 def test_resolves_relative_and_inside_absolute_paths(tmp_path: Path) -> None:
@@ -113,3 +113,54 @@ def test_rejects_junction_escape(tmp_path: Path) -> None:
     with pytest.raises(ToolError) as error:
         resolver.resolve_write_target("junction/new.txt")
     assert error.value.code == "path_outside_workspace"
+
+
+def test_read_only_virtual_mount_allows_reads_but_rejects_writes_and_command_cwd(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "worktree"
+    memory = tmp_path / "main-memory"
+    workspace.mkdir()
+    memory.mkdir()
+    topic = memory / "topic.md"
+    topic.write_text("memory\n", encoding="utf-8")
+    resolver = WorkspacePathResolver(
+        workspace,
+        mounts=(WorkspaceMount(Path(".ycode/memory"), memory, virtual=True),),
+    )
+
+    assert resolver.resolve_existing_file(".ycode/memory/topic.md") == topic.resolve()
+    assert resolver.relative_display(topic) == ".ycode/memory/topic.md"
+    with pytest.raises(ToolError) as write_error:
+        resolver.resolve_write_target(".ycode/memory/new.md")
+    assert write_error.value.code == "mount_read_only"
+    with pytest.raises(ToolError) as cwd_error:
+        resolver.resolve_command_directory(".ycode/memory")
+    assert cwd_error.value.code == "mount_cwd_denied"
+    with pytest.raises(ToolError) as direct_error:
+        resolver.resolve_existing_file(topic.resolve())
+    assert direct_error.value.code == "path_outside_workspace"
+
+
+def test_writable_directory_mount_stays_within_registered_source(tmp_path: Path) -> None:
+    workspace = tmp_path / "worktree"
+    dependency = tmp_path / "dependency"
+    workspace.mkdir()
+    dependency.mkdir()
+    resolver = WorkspacePathResolver(
+        workspace,
+        mounts=(
+            WorkspaceMount(
+                Path("node_modules"),
+                dependency,
+                writable=True,
+                command_cwd_allowed=True,
+            ),
+        ),
+    )
+
+    assert resolver.resolve_write_target("node_modules/new.txt") == dependency.resolve() / "new.txt"
+    assert resolver.resolve_command_directory("node_modules") == dependency.resolve()
+    with pytest.raises(ToolError) as traversal:
+        resolver.resolve_write_target("node_modules/../outside.txt")
+    assert traversal.value.code == "path_outside_workspace"

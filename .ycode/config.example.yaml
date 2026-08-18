@@ -1,6 +1,15 @@
 active: claude-local
 context_window_tokens: 200000
 
+worktrees:
+  copy_files:
+    - settings.local.json
+  ignored_file_globs:
+    - fixtures/local/**/*.json
+  link_directories:
+    - node_modules
+  cleanup_ttl_hours: 24
+
 providers:
   - name: claude-local
     protocol: anthropic
@@ -39,4 +48,3 @@ mcp_servers:
     transport: stdio
     command: python
     args: ["-m", "disabled_mcp_server"]
-

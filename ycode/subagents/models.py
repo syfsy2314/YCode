@@ -6,9 +6,13 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from ycode.core.events import TokenUsage
 from ycode.security.models import PermissionMode
+
+if TYPE_CHECKING:
+    from ycode.worktrees.models import WorktreeLease, WorktreeSummary
 
 
 class SubagentCreationMode(StrEnum):
@@ -19,6 +23,11 @@ class SubagentCreationMode(StrEnum):
 class SubagentRunMode(StrEnum):
     SYNC = "sync"
     ASYNC = "async"
+
+
+class SubagentIsolation(StrEnum):
+    NONE = "none"
+    WORKTREE = "worktree"
 
 
 class SubagentStatus(StrEnum):
@@ -43,6 +52,7 @@ class SubagentRoleConfig:
     denied_tools: frozenset[str] = frozenset()
     max_rounds: int = 10
     permission: PermissionMode = PermissionMode.DEFAULT
+    isolation: SubagentIsolation = SubagentIsolation.NONE
 
     def __post_init__(self) -> None:
         if not self.name or not self.description.strip() or not self.prompt.strip():
@@ -60,6 +70,8 @@ class SubagentRoleConfig:
             raise ValueError("角色最大轮次必须是正整数")
         if not isinstance(self.permission, PermissionMode):
             raise TypeError("角色权限模式无效")
+        if not isinstance(self.isolation, SubagentIsolation):
+            raise TypeError("角色隔离模式无效")
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +132,21 @@ class RunSubagentArguments:
     task: str
     role: str | None = None
     mode: SubagentRunMode | None = None
+    shared_fallback_token: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SharedFallbackGrant:
+    token: str
+    session_id: str
+    role: str
+    task: str
+    mode: SubagentRunMode
+    issued_turn_id: str
+
+    def __post_init__(self) -> None:
+        if not all((self.token, self.session_id, self.role, self.task, self.issued_turn_id)):
+            raise ValueError("共享降级授权字段不能为空")
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +156,9 @@ class SubagentInvocation:
     creation_mode: SubagentCreationMode
     run_mode: SubagentRunMode
     owner_turn_id: str
+    shared_fallback: bool = False
+    worktree_lease: WorktreeLease | None = None
+    parent_workspace: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +184,7 @@ class SubagentTaskView:
     started_at: datetime
     finished_at: datetime | None = None
     error: SubagentError | None = None
+    worktree: WorktreeSummary | None = None
 
 
 @dataclass(slots=True)

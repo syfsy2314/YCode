@@ -62,6 +62,16 @@ async def test_runner_uses_process_working_directory(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_applies_private_environment_overlay(tmp_path: Path) -> None:
+    result = await PowerShellCommandRunner({"YCODE_TEST_OVERLAY": "isolated-value"}).run(
+        "$env:YCODE_TEST_OVERLAY",
+        tmp_path,
+    )
+
+    assert result.stdout.strip() == "isolated-value"
+
+
+@pytest.mark.asyncio
 async def test_runner_caps_combined_output_without_deadlock(tmp_path: Path) -> None:
     result = await PowerShellCommandRunner().run(
         "[Console]::Out.Write('o' * 70000); [Console]::Error.Write('e' * 70000)",

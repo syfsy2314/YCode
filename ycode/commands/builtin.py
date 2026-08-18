@@ -137,6 +137,19 @@ def build_command_runtime(
         else:
             raise CommandUsageError
 
+    async def worktree_handler(invocation: CommandInvocation, controller: UIController) -> None:
+        parts = invocation.arguments.split()
+        if parts in (["list"], ["cleanup"]):
+            await controller.manage_worktrees(parts[0])
+        elif len(parts) == 2 and parts[0] == "status":
+            await controller.manage_worktrees("status", parts[1])
+        elif len(parts) == 2 and parts[0] == "delete":
+            await controller.manage_worktrees("delete", parts[1])
+        elif len(parts) == 3 and parts[0] == "delete" and parts[2] == "--force":
+            await controller.manage_worktrees("delete", parts[1], force=True)
+        else:
+            raise CommandUsageError
+
     definitions = (
         CommandDefinition(
             "help",
@@ -200,6 +213,15 @@ def build_command_runtime(
             CommandKind.LOCAL,
             "[task-id|stop <task-id>]",
             tasks_handler,
+        ),
+        CommandDefinition(
+            "worktree",
+            (),
+            "查看、删除或清理子 Agent Worktree",
+            "/worktree <list|status <name>|delete <name> [--force]|cleanup>",
+            CommandKind.LOCAL,
+            "<list|status|delete|cleanup>",
+            worktree_handler,
         ),
     )
     for definition in (*definitions, *tuple(extra_definitions)):

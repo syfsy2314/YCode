@@ -59,6 +59,7 @@ from ycode.skills.runtime import SkillRuntime, SkillRuntimeError
 if TYPE_CHECKING:
     from ycode.commands import CommandRuntime
     from ycode.subagents import SubagentManager
+    from ycode.worktrees.manager import WorktreeManager
 
 type _TerminalEvent = (
     FinalResponseEvent | AgentLimitReachedEvent | AgentCancelledEvent | AgentErrorEvent
@@ -91,6 +92,7 @@ class ChatSession:
         hook_runtime: HookRuntime | None = None,
         hook_context: HookContextFactory | None = None,
         subagent_manager: SubagentManager | None = None,
+        worktree_manager: WorktreeManager | None = None,
     ) -> None:
         self._runner = runner
         self._history: list[ChatMessage] = []
@@ -110,6 +112,7 @@ class ChatSession:
         self._hook_runtime = hook_runtime
         self._hook_context = hook_context
         self._subagent_manager = subagent_manager
+        self._worktree_manager = worktree_manager
         self._subagent_cancellations: set[asyncio.Task[None]] = set()
         self._active_turn: AgentTurn | None = None
         self._active_compaction: asyncio.Task[object] | None = None
@@ -247,7 +250,11 @@ class ChatSession:
         event = SessionRestoredEvent(
             snapshot.session_id,
             len(candidate.history),
-            (*tuple(warning.message for warning in snapshot.warnings), *skill_warnings),
+            (
+                *tuple(warning.message for warning in snapshot.warnings),
+                *skill_warnings,
+                *self._restored_worktree_warnings(snapshot.session_id),
+            ),
         )
         self._startup_restore_event = event
         return event
@@ -381,6 +388,8 @@ class ChatSession:
             yield self.change_permission_mode(target_permission)
             return
 
+        if self._session_manager is not None:
+            self._session_manager.reserve_session_id(user_message)
         scoped_start = getattr(self._runner, "start_turn_with_skill_scope", None)
         turn = (
             scoped_start(tuple(self._history), user_message, self._mode, skill_scope)
@@ -660,6 +669,47 @@ class ChatSession:
             raise ValueError("当前对话未启用子 Agent。")
         task = await self._subagent_manager.stop(task_id)
         return f"子 Agent 任务 {task.task_id} 已取消。"
+
+    def worktree_list(self) -> str:
+        if self._worktree_manager is None:
+            raise ValueError("当前对话未启用 Worktree 管理。")
+        from ycode.worktrees.formatting import format_records
+
+        return format_records(self._worktree_manager.list_records())
+
+    async def worktree_status(self, name: str) -> str:
+        if self._worktree_manager is None:
+            raise ValueError("当前对话未启用 Worktree 管理。")
+        from ycode.worktrees.formatting import format_record
+
+        return format_record(await self._worktree_manager.status(name))
+
+    async def worktree_delete_preview(self, name: str) -> str:
+        if self._worktree_manager is None:
+            raise ValueError("当前对话未启用 Worktree 管理。")
+        from ycode.worktrees.formatting import format_delete_preview
+
+        preview = await self._worktree_manager.prepare_delete(name, force=True)
+        return format_delete_preview(preview)
+
+    async def worktree_delete(self, name: str, *, force: bool, confirmed: bool) -> str:
+        if self._worktree_manager is None:
+            raise ValueError("当前对话未启用 Worktree 管理。")
+        await self._worktree_manager.delete(name, force=force, confirmed=confirmed)
+        return f"已删除 Worktree：{name}"
+
+    async def worktree_cleanup(self) -> str:
+        if self._worktree_manager is None:
+            raise ValueError("当前对话未启用 Worktree 管理。")
+        from ycode.worktrees.formatting import format_cleanup
+
+        return format_cleanup(await self._worktree_manager.cleanup())
+
+    def _restored_worktree_warnings(self, session_id: str) -> tuple[str, ...]:
+        if self._worktree_manager is None:
+            return ()
+        names = tuple(item.name for item in self._worktree_manager.records_for_session(session_id))
+        return (f"该会话有遗留 Worktree：{', '.join(names)}",) if names else ()
 
     async def _finalize_memory(self) -> MemoryUpdateReport:
         if not self._new_commits or self._memory_store is None or self._memory_updater is None:

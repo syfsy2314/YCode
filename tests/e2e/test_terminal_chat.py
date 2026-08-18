@@ -291,6 +291,82 @@ def test_windows_terminal_sync_subagent_and_tasks_command(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
+def test_windows_terminal_worktree_subagent_and_management_commands(
+    tmp_path: Path,
+    sse_server: SSETestServer,
+) -> None:
+    project = tmp_path / "subagent-worktree"
+    project.mkdir()
+    subprocess.run(("git", "init", str(project)), check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(project), "config", "user.name", "YCode Test"), check=True)
+    subprocess.run(
+        ("git", "-C", str(project), "config", "user.email", "ycode@example.test"),
+        check=True,
+    )
+    (project / ".gitignore").write_text(".ycode/worktrees/\n", encoding="utf-8")
+    (project / "base.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(("git", "-C", str(project), "add", ".gitignore", "base.txt"), check=True)
+    subprocess.run(("git", "-C", str(project), "commit", "-m", "base"), check=True)
+    write_anthropic_config(project / ".ycode" / "config.yaml", sse_server, thinking=False)
+    (project / ".ycode" / "security.yaml").write_text("mode: allow\n", encoding="utf-8")
+    agents = project / ".ycode" / "agents"
+    agents.mkdir()
+    (agents / "writer.md").write_text(
+        "---\nname: writer\ndescription: 隔离写作\nallowed-tools: [write_file]\n"
+        "permission: allow\nisolation: worktree\n---\n完成写作任务。\n",
+        encoding="utf-8",
+    )
+    sse_server.enqueue(
+        anthropic_tool_response(
+            [("sub-worktree", "run_subagent", {"task": "写结果", "role": "writer"})]
+        )
+    )
+    sse_server.enqueue(
+        anthropic_tool_response(
+            [("write-result", "write_file", {"path": "result.txt", "content": "done\n"})]
+        )
+    )
+    sse_server.enqueue(anthropic_text_response("隔离写作完成"))
+    sse_server.enqueue(anthropic_text_response("父任务完成"))
+    sse_server.enqueue(
+        anthropic_tool_response(
+            [("sub-worktree-2", "run_subagent", {"task": "再写结果", "role": "writer"})]
+        )
+    )
+    sse_server.enqueue(
+        anthropic_tool_response(
+            [("write-result-2", "write_file", {"path": "result.txt", "content": "two\n"})]
+        )
+    )
+    sse_server.enqueue(anthropic_text_response("第二个隔离写作完成"))
+    sse_server.enqueue(anthropic_text_response("父任务完成"))
+
+    process, reader = spawn_ycode(project)
+    try:
+        reader.wait_for("Send a message...", timeout=15)
+        process.write("委派隔离写作\r")
+        reader.wait_for("父任务完成", timeout=30)
+        reader.wait_for("Send a message...", timeout=15, count=2)
+        process.write("再委派一个隔离写作\r")
+        reader.wait_for("父任务完成", timeout=30, count=2)
+        reader.wait_for("Send a message...", timeout=15, count=3)
+        process.write("/tasks\r")
+        output = reader.wait_for("retained", timeout=15, count=2)
+        assert output.count("retained") >= 2
+        process.write("/worktree list\r")
+        reader.wait_for("agents/writer-", timeout=15)
+        assert not (project / "result.txt").exists()
+        retained = list((project / ".ycode" / "worktrees" / "agents").glob("*/result.txt"))
+        assert len(retained) == 2
+        assert {path.read_text(encoding="utf-8") for path in retained} == {"done\n", "two\n"}
+        process.write("/exit\r")
+        wait_for_exit(process)
+        assert "Traceback" not in reader.snapshot()
+    finally:
+        stop_process(process)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="需要 Windows ConPTY")
 def test_windows_terminal_input_hint_and_question_mark_message(
     tmp_path: Path, sse_server: SSETestServer
 ) -> None:

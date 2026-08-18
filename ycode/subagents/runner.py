@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.resources import files
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from ycode.agent import (
     AgentLoop,
@@ -30,6 +30,9 @@ from ycode.subagents.models import (
 from ycode.subagents.policy import SubagentToolPolicy, stricter_permission_mode
 from ycode.subagents.providers import SubagentProviderPool
 from ycode.tools.registry import ToolRegistry
+
+if TYPE_CHECKING:
+    from ycode.worktrees.runtime import SubagentWorkspaceFactory
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,12 +62,14 @@ class SubagentRunner:
         async_allowed_tools: frozenset[str],
         *,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        workspace_factory: SubagentWorkspaceFactory | None = None,
     ) -> None:
         self._provider_pool = provider_pool
         self._registry = registry
         self._loop_factory = loop_factory
         self._async_allowed_tools = async_allowed_tools
         self._clock = clock
+        self._workspace_factory = workspace_factory
 
     async def run(
         self,
@@ -110,12 +115,18 @@ class SubagentRunner:
                 f"subagent:{task_id}",
                 invocation.creation_mode is SubagentCreationMode.FORK,
             )
-            loop = self._loop_factory(runtime)
+            if invocation.worktree_lease is not None:
+                if self._workspace_factory is None:
+                    raise RuntimeError("隔离子 Agent 工作区工厂未装配。")
+                loop = self._workspace_factory.create(runtime, invocation.worktree_lease).loop
+            else:
+                loop = self._loop_factory(runtime)
             if invocation.creation_mode is SubagentCreationMode.FORK:
                 seed = _fork_request(parent.request, invocation.task)
                 turn = loop.start_seeded_turn(seed, runtime.mode)
             else:
-                turn = loop.start_turn((), ChatMessage.user_text(invocation.task), runtime.mode)
+                task = _workspace_task(invocation) if invocation.worktree_lease else invocation.task
+                turn = loop.start_turn((), ChatMessage.user_text(task), runtime.mode)
             async for _ in turn:
                 pass
             result = turn.result
@@ -270,4 +281,19 @@ def _last_assistant_text(messages: tuple[ChatMessage, ...]) -> str:
             if message.role == "assistant" and message.text.strip()
         ),
         "",
+    )
+
+
+def _workspace_task(invocation: SubagentInvocation) -> str:
+    assert invocation.worktree_lease is not None
+    parent = invocation.parent_workspace or "<unknown>"
+    child = str(invocation.worktree_lease.path)
+    return (
+        "<trusted-workspace-mapping>\n"
+        f"父项目路径：{parent}\n"
+        f"本任务 Worktree 路径：{child}\n"
+        "任务正文中的父项目绝对路径应翻译到本 Worktree 的相对对应位置。"
+        "所有工具调用必须以本 Worktree 为工作区，不要访问父项目目录。\n"
+        "</trusted-workspace-mapping>\n\n"
+        f"{invocation.task}"
     )

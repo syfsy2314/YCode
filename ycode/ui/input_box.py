@@ -272,6 +272,10 @@ class InputBox:
         # 等审批应用完成输入接管后再显示提示，避免快速按键落在监听切换间隙。
         return await application.run_async(pre_run=lambda: self._console.print(approval_prompt))
 
+    async def read_confirmation(self, message: str) -> bool:
+        self._console.print(f"{message}\n输入 yes 确认，其他输入取消。")
+        return (await self.read()).strip().casefold() == "yes"
+
     async def wait_for_interrupt(self) -> None:
         """响应期间只监听 ESC 或 Ctrl+C，不接受普通文本输入。"""
         input_device = self._input or get_app_session().input

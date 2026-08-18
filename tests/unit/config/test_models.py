@@ -1,7 +1,13 @@
 import pytest
 from pydantic import ValidationError
 
-from ycode.config.models import AppConfig, ProviderConfig, ProviderEntry, ProviderProtocol
+from ycode.config.models import (
+    AppConfig,
+    ProviderConfig,
+    ProviderEntry,
+    ProviderProtocol,
+    WorktreeConfig,
+)
 
 
 def provider_data(**overrides: object) -> dict[str, object]:
@@ -96,6 +102,52 @@ def test_app_config_loads_subagent_defaults_and_overrides() -> None:
     )
     assert configured.subagents.max_concurrent == 2
     assert configured.subagents.async_allowed_tools == ("read_file", "grep")
+
+
+def test_app_config_loads_worktree_defaults_and_overrides() -> None:
+    base = {"active": "local", "providers": [{"name": "local"}]}
+
+    defaults = AppConfig.model_validate(base).worktrees
+    assert defaults.cleanup_ttl_hours == 24
+    assert defaults.copy_files == ()
+
+    configured = AppConfig.model_validate(
+        {
+            **base,
+            "worktrees": {
+                "copy_files": ["settings.local.json"],
+                "ignored_file_globs": ["fixtures/**/*.json"],
+                "link_directories": ["node_modules"],
+                "cleanup_ttl_hours": 48,
+            },
+        }
+    ).worktrees
+    assert configured.copy_files == ("settings.local.json",)
+    assert configured.ignored_file_globs == ("fixtures/**/*.json",)
+    assert configured.link_directories == ("node_modules",)
+    assert configured.cleanup_ttl_hours == 48
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("copy_files", ["../secret"]),
+        ("copy_files", ["C:/secret"]),
+        ("copy_files", ["a\\b"]),
+        ("copy_files", ["*.json"]),
+        ("ignored_file_globs", ["../**/*.json"]),
+        ("link_directories", ["node_modules", "node_modules"]),
+    ],
+)
+def test_worktree_config_rejects_unsafe_paths(field: str, value: list[str]) -> None:
+    with pytest.raises(ValidationError, match="Worktree"):
+        WorktreeConfig.model_validate({field: value})
+
+
+@pytest.mark.parametrize("value", [0, True, "24", 24.0])
+def test_worktree_config_ttl_is_strict_positive_integer(value: object) -> None:
+    with pytest.raises(ValidationError, match="cleanup_ttl_hours"):
+        WorktreeConfig.model_validate({"cleanup_ttl_hours": value})
 
 
 @pytest.mark.parametrize(

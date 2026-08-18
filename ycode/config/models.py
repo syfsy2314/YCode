@@ -2,6 +2,7 @@
 
 import re
 from enum import StrEnum
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
 from urllib.parse import urlparse
 
@@ -25,6 +26,46 @@ DEFAULT_ASYNC_ALLOWED_TOOLS = (
     "edit_file",
     "run_command",
 )
+
+
+def _validate_worktree_paths(
+    value: tuple[str, ...],
+    *,
+    allow_glob: bool,
+) -> tuple[str, ...]:
+    if len(set(value)) != len(value):
+        raise ValueError("Worktree 路径不允许重复")
+    for item in value:
+        if not item or "\\" in item:
+            raise ValueError("Worktree 路径必须使用非空仓库相对 POSIX 路径")
+        windows = PureWindowsPath(item)
+        path = PurePosixPath(item)
+        if path.is_absolute() or windows.is_absolute() or windows.drive:
+            raise ValueError("Worktree 路径不能是绝对路径")
+        if any(part in {"", ".", ".."} for part in path.parts):
+            raise ValueError("Worktree 路径不能包含空段、. 或 ..")
+        if not allow_glob and any(character in item for character in "*?[]"):
+            raise ValueError("Worktree 普通路径不能包含 Glob 字符")
+    return value
+
+
+class WorktreeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    copy_files: tuple[str, ...] = ()
+    ignored_file_globs: tuple[str, ...] = ()
+    link_directories: tuple[str, ...] = ()
+    cleanup_ttl_hours: int = Field(default=24, strict=True, gt=0)
+
+    @field_validator("copy_files", "link_directories")
+    @classmethod
+    def validate_plain_paths(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _validate_worktree_paths(value, allow_glob=False)
+
+    @field_validator("ignored_file_globs")
+    @classmethod
+    def validate_glob_paths(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _validate_worktree_paths(value, allow_glob=True)
 
 
 class SubagentConfig(BaseModel):
@@ -91,6 +132,7 @@ class AppConfig(BaseModel):
     providers: list[ProviderEntry] = Field(min_length=1)
     mcp_servers: list[Any] = Field(default_factory=list)
     subagents: SubagentConfig = Field(default_factory=SubagentConfig)
+    worktrees: WorktreeConfig = Field(default_factory=WorktreeConfig)
     context_window_tokens: int = Field(default=200_000, strict=True, gt=33_000)
     _active_provider: ProviderConfig | None = PrivateAttr(default=None)
 

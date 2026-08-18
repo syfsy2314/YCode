@@ -20,6 +20,18 @@ def _turn(text: str = "实现：会话/恢复？") -> tuple[TurnMessage, ...]:
     )
 
 
+def test_reserve_session_id_is_stable_without_creating_empty_file(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path, clock=lambda: NOW)
+
+    reserved = manager.reserve_session_id(ChatMessage.user_text("首次任务"))
+
+    assert manager.current_session_id == reserved
+    assert not manager.sessions_root.exists()
+    assert manager.reserve_session_id(ChatMessage.user_text("另一条消息")) == reserved
+    manager.begin_new()
+    assert manager.current_session_id is None
+
+
 @pytest.mark.asyncio
 async def test_id_keeps_chinese_removes_invalid_and_handles_collision(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path, clock=lambda: NOW)

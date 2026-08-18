@@ -11,7 +11,7 @@ from ycode.tools.contracts import (
     ToolExecutionResult,
 )
 from ycode.tools.errors import ToolError
-from ycode.tools.paths import WorkspacePathResolver
+from ycode.tools.paths import PathOperation, WorkspacePathResolver
 from ycode.tools.text_files import TextFileService
 
 
@@ -49,7 +49,10 @@ class EditFileTool:
         context: ToolContext,
     ) -> ToolExecutionResult:
         del context
-        path = self._resolver.resolve_existing_file(arguments.path)
+        path = self._resolver.resolve_existing_file(
+            arguments.path,
+            operation=PathOperation.WRITE,
+        )
         decoded = await self._text_files.read(path)
         old_text = _normalize_newlines(arguments.old_text)
         new_text = _normalize_newlines(arguments.new_text)

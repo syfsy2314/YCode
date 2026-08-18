@@ -78,6 +78,17 @@ class InterruptingInput(FakeInput):
         await asyncio.Future()
 
 
+class ConfirmingInput(CommandInput):
+    def __init__(self, confirmed: bool) -> None:
+        super().__init__([])
+        self.confirmed = confirmed
+        self.previews: list[str] = []
+
+    async def read_confirmation(self, message: str) -> bool:
+        self.previews.append(message)
+        return self.confirmed
+
+
 class FakeRenderer:
     def __init__(self) -> None:
         self.started = 0
@@ -156,6 +167,40 @@ async def test_command_runtime_routes_local_commands_without_provider() -> None:
     assert permission.mode is PermissionMode.STRICT
     assert provider.requests == []
     assert session.history == ()
+
+
+@pytest.mark.asyncio
+async def test_worktree_force_delete_requires_confirmation_and_cancel_is_non_mutating() -> None:
+    class WorktreeSession:
+        command_runtime = None
+        permission_mode = PermissionMode.DEFAULT
+        mode = AgentMode.AGENT
+
+        def __init__(self) -> None:
+            self.deleted: list[tuple[str, bool, bool]] = []
+
+        async def worktree_delete_preview(self, name: str) -> str:
+            return f"preview:{name}"
+
+        async def worktree_delete(self, name: str, *, force: bool, confirmed: bool) -> str:
+            self.deleted.append((name, force, confirmed))
+            return "deleted"
+
+    target = StringIO()
+    session = WorktreeSession()
+    denied = ConfirmingInput(False)
+    ui = TerminalUI(
+        config(),
+        session,  # type: ignore[arg-type]
+        console=Console(file=target, width=80, color_system=None),
+        input_factory=lambda _: denied,
+    )
+
+    await ui.manage_worktrees("delete", "agents/writer-a", force=True)
+
+    assert denied.previews == ["preview:agents/writer-a"]
+    assert session.deleted == []
+    assert "已取消" in target.getvalue()
 
 
 @pytest.mark.asyncio

@@ -46,6 +46,7 @@ def test_tool_detail_and_notification_share_runtime_fields() -> None:
         "started_at",
         "finished_at",
         "error",
+        "worktree",
     }
     assert set(payload) == expected
     assert all(detail[name] == payload[name] for name in expected)

@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 
 from ycode.prompt.models import SupplementKind, SystemSupplement
 from ycode.subagents.models import SubagentTaskView
+from ycode.worktrees.formatting import summary_payload
 
 
 def task_payload(task: SubagentTaskView) -> dict[str, object]:
@@ -30,6 +31,7 @@ def task_payload(task: SubagentTaskView) -> dict[str, object]:
             if task.error is not None
             else None
         ),
+        "worktree": summary_payload(task.worktree) if task.worktree is not None else None,
     }
 
 
@@ -52,7 +54,7 @@ def format_task_list(
     if not tasks:
         return "当前会话没有子 Agent 任务。"
     current = now or datetime.now(UTC)
-    lines = ["ID           状态           创建方式  角色       时长      Token"]
+    lines = ["ID           状态           创建方式  角色       时长      Token  Worktree"]
     for task in tasks:
         end = task.finished_at or current
         elapsed = max(0.0, (end - task.started_at).total_seconds())
@@ -66,7 +68,8 @@ def format_task_list(
         lines.append(
             f"{task.task_id[:12]:<12} {task.status.value:<14} "
             f"{task.creation_mode.value:<9} {(task.role or '-'):<10} "
-            f"{elapsed:>7.1f}s {total:>8}"
+            f"{elapsed:>7.1f}s {total:>8} "
+            f"{task.worktree.disposition.value if task.worktree is not None else '-'}"
         )
     return "\n".join(lines)
 

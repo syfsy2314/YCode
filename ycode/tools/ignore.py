@@ -39,18 +39,35 @@ class WorkspaceFileWalker:
         self,
         resolver: WorkspacePathResolver,
         ignore: IgnoreMatcher,
+        exclusions: tuple[Path, ...] = (),
     ) -> None:
         self._resolver = resolver
         self._ignore = ignore
+        self._exclusions = tuple(path.resolve(strict=False) for path in exclusions)
 
     def iter_files(
         self,
         start: Path,
         cancelled: threading.Event,
     ) -> Iterator[tuple[Path, str]]:
+        yield from self._iter_root(
+            start,
+            cancelled,
+            respect_ignore=_within(start, self._resolver.workspace),
+        )
+        for virtual_root in self._resolver.virtual_search_roots(start):
+            yield from self._iter_root(virtual_root, cancelled, respect_ignore=False)
+
+    def _iter_root(
+        self,
+        start: Path,
+        cancelled: threading.Event,
+        *,
+        respect_ignore: bool,
+    ) -> Iterator[tuple[Path, str]]:
         if start.is_file():
             relative = self._resolver.relative_display(start)
-            if not self._ignore.is_ignored(relative):
+            if not respect_ignore or not self._ignore.is_ignored(relative):
                 yield start, relative
             return
 
@@ -60,26 +77,40 @@ class WorkspaceFileWalker:
             kept_directories: list[str] = []
             for name in sorted(directory_names):
                 candidate = current / name
+                if any(_within(candidate, excluded) for excluded in self._exclusions):
+                    continue
                 if candidate.is_symlink() or os.path.isjunction(candidate):
                     continue
                 try:
                     relative = self._resolver.relative_display(candidate)
                 except ToolError:
                     continue
-                if not self._ignore.is_ignored(relative, is_directory=True):
+                if not respect_ignore or not self._ignore.is_ignored(relative, is_directory=True):
                     kept_directories.append(name)
             directory_names[:] = kept_directories
 
             for name in sorted(file_names):
                 check_thread_cancelled(cancelled)
                 candidate = current / name
+                if any(_within(candidate, excluded) for excluded in self._exclusions):
+                    continue
                 try:
-                    resolved = self._resolver.resolve_existing_file(candidate)
+                    resolved = self._resolver.resolve_discovered_file(candidate)
                     relative = self._resolver.relative_display(resolved)
                 except ToolError:
                     continue
-                if not self._ignore.is_ignored(relative):
+                if not respect_ignore or not self._ignore.is_ignored(relative):
                     yield resolved, relative
+
+
+def _within(path: Path, root: Path) -> bool:
+    try:
+        root_key = os.path.normcase(str(root.resolve(strict=False)))
+        path_key = os.path.normcase(str(path.resolve(strict=False)))
+        common = os.path.commonpath((root_key, path_key))
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return os.path.normcase(common) == root_key
 
 
 def compile_posix_glob(pattern: str) -> re.Pattern[str]:

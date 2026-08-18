@@ -10,6 +10,7 @@ import yaml
 
 from ycode.security.models import PermissionMode
 from ycode.subagents.models import (
+    SubagentIsolation,
     SubagentRoleCatalogEntry,
     SubagentRoleConfig,
     SubagentRoleProblem,
@@ -27,6 +28,7 @@ _FIELDS = frozenset(
         "denied-tools",
         "max-rounds",
         "permission",
+        "isolation",
     }
 )
 
@@ -138,6 +140,19 @@ class SubagentRoleLoader:
                 )
             )
 
+        isolation_text = data.get("isolation", SubagentIsolation.NONE.value)
+        try:
+            isolation = SubagentIsolation(isolation_text)
+        except (TypeError, ValueError):
+            isolation = SubagentIsolation.NONE
+            problems.append(
+                self._problem(
+                    source,
+                    "isolation_invalid",
+                    "isolation 必须是 none/worktree",
+                )
+            )
+
         if problems:
             return SubagentRoleCatalogEntry(
                 source,
@@ -154,6 +169,7 @@ class SubagentRoleLoader:
             denied_tools=denied,
             max_rounds=max_rounds,
             permission=permission,
+            isolation=isolation,
         )
         return SubagentRoleCatalogEntry(
             source,

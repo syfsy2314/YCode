@@ -120,6 +120,7 @@ async def test_app_assembles_anthropic_agent_with_builtin_tools(tmp_path: Path) 
         "skills",
         "clear",
         "tasks",
+        "worktree",
     ]
     context_root = tmp_path / ".ycode" / "context"
     assert context_root.is_dir()

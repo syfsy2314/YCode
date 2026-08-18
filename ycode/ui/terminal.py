@@ -163,6 +163,33 @@ class TerminalUI:
             raise CommandExecutionError(str(error)) from error
         self._console.print(message)
 
+    async def manage_worktrees(
+        self, action: str, name: str | None = None, *, force: bool = False
+    ) -> None:
+        try:
+            if action == "list":
+                message = self._session.worktree_list()
+            elif action == "status" and name is not None:
+                message = await self._session.worktree_status(name)
+            elif action == "cleanup":
+                message = await self._session.worktree_cleanup()
+            elif action == "delete" and name is not None:
+                if force:
+                    preview = await self._session.worktree_delete_preview(name)
+                    if not await self._input.read_confirmation(preview):
+                        self._console.print("已取消强制删除。")
+                        return
+                message = await self._session.worktree_delete(
+                    name,
+                    force=force,
+                    confirmed=force,
+                )
+            else:
+                raise ValueError("Worktree 命令参数无效。")
+        except (ValueError, RuntimeError) as error:
+            raise CommandExecutionError(str(error)) from error
+        self._console.print(message)
+
     async def set_mode(self, mode: str) -> None:
         from ycode.agent import AgentMode
 

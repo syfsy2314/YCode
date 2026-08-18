@@ -11,6 +11,7 @@ from ycode.subagents import (
     RunSubagentArguments,
     SubagentCreationMode,
     SubagentError,
+    SubagentIsolation,
     SubagentManager,
     SubagentManagerError,
     SubagentRoleConfig,
@@ -19,6 +20,7 @@ from ycode.subagents import (
     SubagentStatus,
     SubagentTaskView,
 )
+from ycode.worktrees import WorktreeManagerError
 
 BASE_TIME = datetime(2026, 8, 16, tzinfo=UTC)
 
@@ -241,3 +243,63 @@ def test_terminal_stop_and_ambiguous_prefix_are_rejected() -> None:
     with pytest.raises(SubagentManagerError) as ambiguous:
         current.get("abc")
     assert ambiguous.value.code == "task_id_ambiguous"
+
+
+@pytest.mark.asyncio
+async def test_shared_fallback_token_requires_later_matching_turn_and_is_one_time() -> None:
+    class IsolatedCatalog:
+        role = SubagentRoleSnapshot(
+            SubagentRoleConfig(
+                "review",
+                "review",
+                "work",
+                isolation=SubagentIsolation.WORKTREE,
+            ),
+            "review.md",
+        )
+
+        def get_available(self, name: str):
+            return self.role if name == "review" else None
+
+    class UnavailableWorktree:
+        project_root = "C:/project"
+
+        async def acquire(self, role: str, session: str, task: str):
+            del role, session, task
+            raise WorktreeManagerError("git_unavailable", "Git 不可用")
+
+    runner = ControlledRunner()
+    task_numbers = iter(range(1, 10))
+    current = SubagentManager(
+        SubagentConfig(),
+        IsolatedCatalog(),  # type: ignore[arg-type]
+        id_factory=lambda: f"task-isolated-{next(task_numbers)}",
+        session_id_provider=lambda: "session-a",
+        worktree_manager=UnavailableWorktree(),  # type: ignore[arg-type]
+        fallback_token_factory=lambda: "grant-token",
+        clock=lambda: BASE_TIME,
+    )
+    current.bind(runner)  # type: ignore[arg-type]
+
+    with pytest.raises(SubagentManagerError) as unavailable:
+        await current.start(RunSubagentArguments("inspect", "review"), parent("turn-1"))
+    assert unavailable.value.code == "isolation_unavailable"
+    assert "grant-token" in str(unavailable.value)
+    assert current.tasks == ()
+
+    arguments = RunSubagentArguments("inspect", "review", None, "grant-token")
+    with pytest.raises(SubagentManagerError) as same_turn:
+        await current.start(arguments, parent("turn-1"))
+    assert same_turn.value.code == "fallback_same_turn"
+    with pytest.raises(SubagentManagerError) as mismatch:
+        await current.start(
+            RunSubagentArguments("changed", "review", None, "grant-token"),
+            parent("turn-2"),
+        )
+    assert mismatch.value.code == "fallback_mismatch"
+
+    result = await current.start(arguments, parent("turn-2"))
+    assert result.status is SubagentStatus.COMPLETED
+    with pytest.raises(SubagentManagerError) as reused:
+        await current.start(arguments, parent("turn-3"))
+    assert reused.value.code == "fallback_token_invalid"

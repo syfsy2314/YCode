@@ -3,7 +3,11 @@ from pathlib import Path
 import pytest
 
 from ycode.security import PermissionMode
-from ycode.subagents import SubagentRoleLoader, SubagentRoleValidationEnvironment
+from ycode.subagents import (
+    SubagentIsolation,
+    SubagentRoleLoader,
+    SubagentRoleValidationEnvironment,
+)
 
 
 @pytest.fixture
@@ -34,6 +38,7 @@ def test_loader_parses_full_role(
                 "denied-tools: [write_file]",
                 "max-rounds: 7",
                 "permission: strict",
+                "isolation: worktree",
             )
         ),
     )
@@ -46,6 +51,20 @@ def test_loader_parses_full_role(
     assert entry.role.config.max_rounds == 7
     assert entry.role.config.permission is PermissionMode.STRICT
     assert entry.role.config.allowed_tools == frozenset({"read_file", "grep"})
+    assert entry.role.config.isolation is SubagentIsolation.WORKTREE
+
+
+def test_loader_defaults_isolation_to_none(
+    tmp_path: Path,
+    environment: SubagentRoleValidationEnvironment,
+) -> None:
+    path = tmp_path / "role.md"
+    write_role(path, "name: role\ndescription: ok")
+
+    entry = SubagentRoleLoader().load(path, environment)
+
+    assert entry.role is not None
+    assert entry.role.config.isolation is SubagentIsolation.NONE
 
 
 @pytest.mark.parametrize(
@@ -68,6 +87,8 @@ def test_loader_parses_full_role(
         ),
         ("name: role\ndescription: ok\nmax-rounds: 0", "body", "max_rounds_invalid"),
         ("name: role\ndescription: ok\npermission: root", "body", "permission_invalid"),
+        ("name: role\ndescription: ok\nisolation: container", "body", "isolation_invalid"),
+        ("name: role\ndescription: ok\nisolation: true", "body", "isolation_invalid"),
     ],
 )
 def test_loader_isolates_invalid_roles(

@@ -44,7 +44,11 @@ class GlobTool:
         del context
         matcher = compile_posix_glob(arguments.pattern)
         ignore = IgnoreMatcher(self._resolver.workspace)
-        walker = WorkspaceFileWalker(self._resolver, ignore)
+        walker = WorkspaceFileWalker(
+            self._resolver,
+            ignore,
+            self._resolver.search_exclusions(self._resolver.workspace),
+        )
 
         def search(cancelled: threading.Event) -> tuple[list[str], int]:
             matches: list[str] = []

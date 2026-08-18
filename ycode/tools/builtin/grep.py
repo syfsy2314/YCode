@@ -18,7 +18,7 @@ from ycode.tools.contracts import (
 )
 from ycode.tools.errors import ToolError
 from ycode.tools.ignore import IgnoreMatcher, WorkspaceFileWalker, compile_posix_glob
-from ycode.tools.paths import WorkspacePathResolver
+from ycode.tools.paths import PathOperation, WorkspacePathResolver
 
 
 class GrepArguments(BaseModel):
@@ -72,7 +72,11 @@ class GrepTool:
         )
         start = self._resolve_start(arguments.path)
         ignore = IgnoreMatcher(self._resolver.workspace)
-        walker = WorkspaceFileWalker(self._resolver, ignore)
+        walker = WorkspaceFileWalker(
+            self._resolver,
+            ignore,
+            self._resolver.search_exclusions(start),
+        )
 
         def search(cancelled: threading.Event) -> tuple[list[_Match], dict[str, int]]:
             matches: list[_Match] = []
@@ -120,11 +124,11 @@ class GrepTool:
 
     def _resolve_start(self, value: str) -> Path:
         try:
-            return self._resolver.resolve_existing_file(value)
+            return self._resolver.resolve_existing_file(value, operation=PathOperation.SEARCH)
         except ToolError as error:
             if error.code != "not_a_file":
                 raise
-        return self._resolver.resolve_existing_directory(value)
+        return self._resolver.resolve_existing_directory(value, operation=PathOperation.SEARCH)
 
     @staticmethod
     def _search_file(

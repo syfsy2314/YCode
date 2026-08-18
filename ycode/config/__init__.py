@@ -18,6 +18,7 @@ from ycode.config.models import (
     ProviderEntry,
     ProviderProtocol,
     SubagentConfig,
+    WorktreeConfig,
 )
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
     "SecretRedactor",
     "StdioMcpServerConfig",
     "SubagentConfig",
+    "WorktreeConfig",
     "discover_config",
     "load_mcp_servers",
     "load_config",

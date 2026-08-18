@@ -8,8 +8,8 @@ class Controller:
         self.calls = []
 
     def __getattr__(self, name):
-        async def call(*args):
-            self.calls.append((name, *args))
+        async def call(*args, **kwargs):
+            self.calls.append((name, *args, *((kwargs,) if kwargs else ())))
 
         return call
 
@@ -29,6 +29,7 @@ async def test_production_definitions_and_help_come_from_registry() -> None:
         "skills",
         "clear",
         "tasks",
+        "worktree",
     ]
     assert runtime.registry.resolve("QUIT").name == "exit"
     controller = Controller()
@@ -77,6 +78,14 @@ async def test_help_alias_detail_and_hidden_command() -> None:
         ("/tasks", ("show_tasks",)),
         ("/tasks abc", ("show_tasks", "abc")),
         ("/tasks stop abc", ("stop_task", "abc")),
+        ("/worktree list", ("manage_worktrees", "list")),
+        ("/worktree status agents/review-a", ("manage_worktrees", "status", "agents/review-a")),
+        ("/worktree delete agents/review-a", ("manage_worktrees", "delete", "agents/review-a")),
+        (
+            "/worktree delete agents/review-a --force",
+            ("manage_worktrees", "delete", "agents/review-a", {"force": True}),
+        ),
+        ("/worktree cleanup", ("manage_worktrees", "cleanup")),
     ],
 )
 async def test_builtin_controller_calls(command: str, expected: tuple) -> None:

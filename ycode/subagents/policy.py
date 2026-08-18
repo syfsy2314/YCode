@@ -60,6 +60,14 @@ class SubagentToolPolicy:
             names = frozenset(name for name in names if self._access.get(name) is ToolAccess.READ)
         return frozenset(names)
 
+    @property
+    def base_tool_names(self) -> frozenset[str]:
+        return self._base_tool_names
+
+    @property
+    def async_allowed_tools(self) -> frozenset[str]:
+        return self._async_allowed_tools
+
     def evaluate(self, call: ToolCallBlock) -> ToolPolicyDecision:
         name = call.name
         if name == "run_subagent":

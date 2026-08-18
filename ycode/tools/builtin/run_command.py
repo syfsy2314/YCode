@@ -46,7 +46,7 @@ class RunCommandTool:
         context: ToolContext,
     ) -> ToolExecutionResult:
         del context
-        cwd = self._resolver.resolve_existing_directory(arguments.cwd)
+        cwd = self._resolver.resolve_command_directory(arguments.cwd)
         command_result = await self._runner.run(arguments.command, cwd)
         content = (
             f"exit_code: {command_result.exit_code}\n"

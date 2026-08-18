@@ -66,6 +66,8 @@ from ycode.tools.command import PowerShellCommandRunner
 from ycode.tools.paths import WorkspacePathResolver
 from ycode.tools.text_files import TextFileService
 from ycode.ui.terminal import TerminalUI
+from ycode.worktrees import WorktreeAccessGuard, WorktreeManager
+from ycode.worktrees.runtime import SubagentWorkspaceFactory
 
 ProviderFactory = Callable[[ProviderConfig], ChatProvider]
 UIFactory = Callable[[ProviderConfig, ChatSession], Any]
@@ -83,8 +85,18 @@ async def run_app(
     config = load_config(path)
     if continue_session and config.active_provider.protocol is ProviderProtocol.OPENAI:
         raise ConfigError("--continue 当前仅支持 Anthropic 会话")
-    provider = provider_factory(config.active_provider)
     workspace = config.project_root
+    worktree_manager: WorktreeManager | None = None
+    worktree_startup_warnings: tuple[str, ...] = ()
+    if config.active_provider.protocol is ProviderProtocol.ANTHROPIC:
+        worktree_manager = WorktreeManager(workspace, config.app.worktrees)
+        try:
+            worktree_manager.ensure_start_allowed(start_dir or Path.cwd())
+            cleanup = await worktree_manager.reconcile_startup()
+        except Exception as error:
+            raise ConfigError(str(error)) from error
+        worktree_startup_warnings = cleanup.warnings
+    provider = provider_factory(config.active_provider)
     permission_session: PermissionSession | None = None
     manager: McpManager | None = None
     context_manager: ContextManager | None = None
@@ -113,7 +125,11 @@ async def run_app(
                 ContextArtifactStore(workspace, config.redactor, policy),
                 ConversationCompactor(cast(AgentChatProvider, provider)),
             )
-            resolver = WorkspacePathResolver(workspace)
+            assert worktree_manager is not None
+            resolver = WorkspacePathResolver(
+                workspace,
+                policy=WorktreeAccessGuard(worktree_manager.store),
+            )
             registry = create_builtin_registry(
                 resolver,
                 TextFileService(),
@@ -182,7 +198,12 @@ async def run_app(
                 SubagentRoleLoader(),
                 subagent_environment,
             )
-            subagent_manager = SubagentManager(config.app.subagents, subagent_catalog)
+            subagent_manager = SubagentManager(
+                config.app.subagents,
+                subagent_catalog,
+                session_id_provider=lambda: session_manager.current_session_id,
+                worktree_manager=worktree_manager,
+            )
             registry.register(RunSubagentTool(subagent_manager))
             security_result = load_security_config(workspace, registry)
             if manager is not None:
@@ -223,6 +244,14 @@ async def run_app(
                 cast(AgentChatProvider, provider),
                 lambda name: load_named_anthropic_provider(config, name),
                 provider_factory,
+            )
+            workspace_factory = SubagentWorkspaceFactory(
+                workspace,
+                registry,
+                security_result.config,
+                config.redactor,
+                policy,
+                hook_result.rules,
             )
 
             def subagent_loop_factory(runtime):
@@ -288,6 +317,7 @@ async def run_app(
                 registry,
                 subagent_loop_factory,
                 frozenset(config.app.subagents.async_allowed_tools),
+                workspace_factory=workspace_factory,
             )
             subagent_manager.bind(subagent_runner)
 
@@ -358,6 +388,7 @@ async def run_app(
                 startup_warnings=(
                     *(warning.message for warning in project_context.warnings),
                     *(format_hook_diagnostic(item) for item in hook_result.diagnostics),
+                    *worktree_startup_warnings,
                     *(
                         ("项目 Hook 配置可执行本地命令或发起 HTTP 请求。",)
                         if hook_result.external_action_warning
@@ -369,6 +400,7 @@ async def run_app(
                 hook_runtime=hook_runtime,
                 hook_context=hook_context,
                 subagent_manager=subagent_manager,
+                worktree_manager=worktree_manager,
             )
             session_ref["session"] = session
             if continue_session:

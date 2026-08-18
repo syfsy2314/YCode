@@ -20,8 +20,12 @@ class RunSubagentArguments(BaseModel):
         default=None,
         description="执行方式；定义式默认 sync，Fork 只能使用 async",
     )
+    shared_fallback_token: str | None = Field(
+        default=None,
+        description="隔离失败后由系统签发的一次性共享执行授权",
+    )
 
-    @field_validator("task", "role")
+    @field_validator("task", "role", "shared_fallback_token")
     @classmethod
     def strip_text(cls, value: str | None) -> str | None:
         if value is None:
@@ -57,7 +61,12 @@ class RunSubagentTool:
             raise ToolError("subagent_context_missing", "当前任务没有可用的父 Agent 请求快照。")
         try:
             result = await self._manager.start(
-                RuntimeArguments(arguments.task, arguments.role, arguments.mode),
+                RuntimeArguments(
+                    arguments.task,
+                    arguments.role,
+                    arguments.mode,
+                    arguments.shared_fallback_token,
+                ),
                 scope.current_snapshot,
             )
         except SubagentManagerError as error:

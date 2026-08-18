@@ -1,8 +1,10 @@
 """固定 PowerShell 后端的异步命令执行。"""
 
 import asyncio
+import os
 import subprocess
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -60,6 +62,9 @@ class _OutputBudget:
 class PowerShellCommandRunner:
     """使用 powershell.exe 执行命令并在取消时终止完整进程树。"""
 
+    def __init__(self, environment: Mapping[str, str] | None = None) -> None:
+        self._environment = dict(environment or {})
+
     async def run(self, command: str, cwd: Path) -> CommandResult:
         if not command:
             raise ValueError("PowerShell 命令不能为空")
@@ -72,6 +77,7 @@ class PowerShellCommandRunner:
             "-Command",
             f"{_POWERSHELL_UTF8_PREFIX}{command}",
             cwd=str(cwd),
+            env={**os.environ, **self._environment},
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,

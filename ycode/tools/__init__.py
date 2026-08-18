@@ -17,6 +17,12 @@ from ycode.tools.contracts import (
 )
 from ycode.tools.errors import ToolError
 from ycode.tools.executor import ToolExecutor
+from ycode.tools.paths import (
+    PathOperation,
+    WorkspaceMount,
+    WorkspacePathPolicy,
+    WorkspacePathResolver,
+)
 from ycode.tools.registry import ToolRegistry, create_builtin_registry
 from ycode.tools.scheduler import (
     ScheduledToolCancelled,
@@ -41,7 +47,11 @@ __all__ = [
     "ToolExecutionResult",
     "ToolRegistry",
     "PydanticToolArguments",
+    "PathOperation",
     "ToolScheduler",
+    "WorkspaceMount",
+    "WorkspacePathPolicy",
+    "WorkspacePathResolver",
     "ScheduledToolCancelled",
     "ScheduledToolCompleted",
     "ScheduledToolEvent",
