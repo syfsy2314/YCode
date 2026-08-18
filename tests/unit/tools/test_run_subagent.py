@@ -5,6 +5,7 @@ import pytest
 
 from ycode.agent import AgentToolScope
 from ycode.subagents.models import RunSubagentArguments as RuntimeArguments
+from ycode.subagents.models import SubagentIsolation
 from ycode.tools.builtin.run_subagent import RunSubagentArguments, RunSubagentTool
 from ycode.tools.contracts import ToolContext
 from ycode.tools.errors import ToolError
@@ -17,7 +18,11 @@ async def test_run_subagent_uses_current_parent_snapshot() -> None:
     manager = SimpleNamespace(start=lambda *_: None)
 
     async def start(arguments: RuntimeArguments, snapshot: object) -> object:
-        assert arguments == RuntimeArguments("检查代码", "explore", None)
+        assert arguments == RuntimeArguments(
+            task="检查代码",
+            role="explore",
+            isolation=SubagentIsolation.WORKTREE,
+        )
         assert snapshot is parent
         return task
 
@@ -34,7 +39,11 @@ async def test_run_subagent_uses_current_parent_snapshot() -> None:
     module.task_payload = lambda value: {"task_id": value.task_id}
     try:
         result = await tool.execute(
-            RunSubagentArguments(task="  检查代码  ", role=" explore "),
+            RunSubagentArguments(
+                task="  检查代码  ",
+                role=" explore ",
+                isolation="worktree",
+            ),
             ToolContext(Path.cwd(), agent_scope=AgentToolScope(current_snapshot=parent)),  # type: ignore[arg-type]
         )
     finally:
@@ -42,6 +51,16 @@ async def test_run_subagent_uses_current_parent_snapshot() -> None:
         module.task_payload = original_payload
     assert result.content == tool_result.content
     assert result.metadata["subagent"]["task_id"] == "task-1"
+
+
+def test_run_subagent_isolation_schema_accepts_only_supported_values() -> None:
+    assert RunSubagentArguments(task="检查", isolation="none").isolation is SubagentIsolation.NONE
+    assert (
+        RunSubagentArguments(task="检查", isolation="worktree").isolation
+        is SubagentIsolation.WORKTREE
+    )
+    with pytest.raises(ValueError, match="isolation"):
+        RunSubagentArguments(task="检查", isolation="container")
 
 
 @pytest.mark.asyncio

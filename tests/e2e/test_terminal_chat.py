@@ -316,6 +316,11 @@ def test_windows_terminal_worktree_subagent_and_management_commands(
         "permission: allow\nisolation: worktree\n---\n完成写作任务。\n",
         encoding="utf-8",
     )
+    (agents / "tool-writer.md").write_text(
+        "---\nname: tool-writer\ndescription: 工具指定隔离写作\n"
+        "allowed-tools: [write_file]\npermission: allow\n---\n完成写作任务。\n",
+        encoding="utf-8",
+    )
     sse_server.enqueue(
         anthropic_tool_response(
             [("sub-worktree", "run_subagent", {"task": "写结果", "role": "writer"})]
@@ -330,7 +335,17 @@ def test_windows_terminal_worktree_subagent_and_management_commands(
     sse_server.enqueue(anthropic_text_response("父任务完成"))
     sse_server.enqueue(
         anthropic_tool_response(
-            [("sub-worktree-2", "run_subagent", {"task": "再写结果", "role": "writer"})]
+            [
+                (
+                    "sub-worktree-2",
+                    "run_subagent",
+                    {
+                        "task": "再写结果",
+                        "role": "tool-writer",
+                        "isolation": "worktree",
+                    },
+                )
+            ]
         )
     )
     sse_server.enqueue(

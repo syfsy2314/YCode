@@ -95,7 +95,7 @@ worktrees:
 
 不内置任何框架文件名，也不把 `.ycode/config.yaml` 复制到子 Worktree。
 
-### 3.2 角色隔离字段
+### 3.2 工具与角色隔离字段
 
 ```python
 class SubagentIsolation(StrEnum):
@@ -106,9 +106,14 @@ class SubagentIsolation(StrEnum):
 class SubagentRoleConfig:
     ...
     isolation: SubagentIsolation = SubagentIsolation.NONE
+
+
+class RunSubagentArguments:
+    ...
+    isolation: SubagentIsolation | None = None
 ```
 
-角色 Loader 将 `isolation` 加入严格字段集合。省略时为 `none`；未知值或非字符串值产生角色级诊断并禁用该角色。内置角色保持 `none`，Fork 不读取该字段。
+角色 Loader 将 `isolation` 加入严格字段集合。省略时为 `none`；未知值或非字符串值产生角色级诊断并禁用该角色。`run_subagent` Schema 同样暴露可选 `isolation`。管理器按“工具参数 → 角色定义 → `none`”解析最终隔离模式，因此工具可以为单次定义式任务或 Fork 请求 Worktree，也可以显式用 `none` 覆盖角色默认值。
 
 ## 4. Worktree 身份与持久化模型
 
@@ -120,7 +125,7 @@ class SubagentRoleConfig:
 agents/<role-slug>-<task-suffix>
 ```
 
-- `role-slug` 由已验证角色名生成：转小写、把非法字符折叠为单个 `-`、去除不安全首尾字符并截断。
+- `role-slug` 由已验证角色名生成；无角色 Fork 使用固定 `fork`：转小写、把非法字符折叠为单个 `-`、去除不安全首尾字符并截断。
 - `task-suffix` 只来自 YCode 生成的任务 ID，不读取任务正文或模型输出。
 - 最终名称统一经过 `WorktreeName.parse()` 再校验段数、段长、总长、Windows 保留名、段尾点和连续 `--`。
 - 冲突时只替换系统生成的任务后缀，最多重试固定次数；不会接管已有目录或分支。
@@ -440,7 +445,7 @@ Git `worktree --lock --reason` 作为活动期额外保护。它不代替 YCode 
 `run_subagent` 增加可选的、不面向普通调用的 `shared_fallback_token`：
 
 1. 隔离创建因 Git 不可用、无初始 commit 或创建失败而终止时，管理器返回 `isolation_unavailable`、明确原因和随机一次性 token；
-2. token 仅存内存，并绑定当前 session、角色、原始任务、模式和发放它的父 `turn_id`；
+2. token 仅存内存，并绑定当前 session、角色或 Fork 身份、原始任务、模式、最终隔离模式和发放它的父 `turn_id`；
 3. 主 Agent 必须结束当前回合并向用户询问是否允许该任务共享主仓库执行；
 4. 用户明确同意后的新回合，主 Agent 用原参数和 token 重试；
 5. 管理器要求 parent `turn_id` 已变化、绑定字段完全一致，然后消费 token 并仅对这一次调用使用 `isolation: none`；

@@ -303,3 +303,64 @@ async def test_shared_fallback_token_requires_later_matching_turn_and_is_one_tim
     with pytest.raises(SubagentManagerError) as reused:
         await current.start(arguments, parent("turn-3"))
     assert reused.value.code == "fallback_token_invalid"
+
+
+@pytest.mark.asyncio
+async def test_tool_isolation_overrides_role_default_and_supports_fork() -> None:
+    class IsolatedCatalog:
+        role = SubagentRoleSnapshot(
+            SubagentRoleConfig(
+                "review",
+                "review",
+                "work",
+                isolation=SubagentIsolation.WORKTREE,
+            ),
+            "review.md",
+        )
+
+        def get_available(self, name: str):
+            return self.role if name == "review" else None
+
+    class UnavailableWorktree:
+        project_root = "C:/project"
+        requested_roles: list[str] = []
+
+        async def acquire(self, role: str, session: str, task: str):
+            del session, task
+            self.requested_roles.append(role)
+            raise WorktreeManagerError("git_unavailable", "Git 不可用")
+
+    worktrees = UnavailableWorktree()
+    current = SubagentManager(
+        SubagentConfig(),
+        IsolatedCatalog(),  # type: ignore[arg-type]
+        id_factory=iter(("task-local", "task-role", "task-fork")).__next__,
+        session_id_provider=lambda: "session-a",
+        worktree_manager=worktrees,  # type: ignore[arg-type]
+        clock=lambda: BASE_TIME,
+    )
+    current.bind(ControlledRunner())  # type: ignore[arg-type]
+
+    local = await current.start(
+        RunSubagentArguments(
+            "local override",
+            "review",
+            isolation=SubagentIsolation.NONE,
+        ),
+        parent("turn-local"),
+    )
+    assert local.status is SubagentStatus.COMPLETED
+    assert worktrees.requested_roles == []
+
+    with pytest.raises(SubagentManagerError) as role_default:
+        await current.start(RunSubagentArguments("role default", "review"), parent("turn-role"))
+    assert role_default.value.code == "isolation_unavailable"
+    assert worktrees.requested_roles == ["review"]
+
+    with pytest.raises(SubagentManagerError) as fork_override:
+        await current.start(
+            RunSubagentArguments("fork isolated", isolation=SubagentIsolation.WORKTREE),
+            parent("turn-fork"),
+        )
+    assert fork_override.value.code == "isolation_unavailable"
+    assert worktrees.requested_roles == ["review", "fork"]

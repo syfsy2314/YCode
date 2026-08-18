@@ -35,11 +35,12 @@
 - [ ] B1. 项目角色 `isolation: none` 可用，省略 `isolation` 时默认行为与当前普通子 Agent 相同。
 - [ ] B2. 项目角色 `isolation: worktree` 可用，并保存在任务派发时的不可变角色快照中。
 - [ ] B3. `isolation` 未知值、错误类型或未知 Frontmatter 字段只使对应角色不可用，不阻止其他角色或应用启动。
-- [ ] B4. 定义式同步和异步角色都能触发 Worktree；无角色 Fork 永远不触发。
-- [ ] B5. 任意子 Agent 仍不能调用 `run_subagent` 创建嵌套子 Agent。
-- [ ] B6. Git 不可用、仓库无初始 commit 或 Worktree 创建失败时，子任务不会登记为 running 或静默共享主仓库。
-- [ ] B7. 隔离失败结果包含明确原因和一次性 fallback token，主 Agent 会先结束当前回合并询问用户。
-- [ ] B8. 同一父回合内携带 token 重试被拒绝；未获得新的用户回合时不能自动降级。
+- [ ] B4. `run_subagent` Schema 包含可选 `isolation`，只接受 `none/worktree`；非法值只拒绝本次调用。
+- [ ] B5. 工具参数优先于角色定义，两处都省略时使用本地工作区；工具可为定义式同步、异步及无角色 Fork 请求 Worktree，也可用 `none` 覆盖角色默认隔离。
+- [ ] B6. 任意子 Agent 仍不能调用 `run_subagent` 创建嵌套子 Agent。
+- [ ] B7. Git 不可用、仓库无初始 commit 或 Worktree 创建失败时，子任务不会登记为 running 或静默共享主仓库。
+- [ ] B8. 隔离失败结果包含明确原因和一次性 fallback token，主 Agent 会先结束当前回合并询问用户。
+- [ ] B9. 同一父回合内携带 token 重试被拒绝；未获得新的用户回合时不能自动降级。
 - [ ] B9. 用户在后续回合明确允许后，完全相同的 session、角色、任务和模式可以共享执行一次。
 - [ ] B10. token 的参数改变、跨会话、重复使用、未知值或进程恢复后使用均被拒绝。
 
@@ -188,7 +189,7 @@
 
 ## L. 真实终端协作流程（AC12）
 
-- [ ] L1. 在真实终端由主 Agent创建两个 `isolation: worktree` 子 Agent。
+- [ ] L1. 在真实终端由主 Agent分别通过角色默认值和工具 `isolation: worktree` 创建两个隔离子 Agent。
 - [ ] L2. 两个任务显示不同逻辑名称、绝对路径和临时分支。
 - [ ] L3. 两个子 Agent能独立修改同一相对文件而不互相覆盖或观察中间状态。
 - [ ] L4. 两个任务的通知包含各自 Worktree 摘要，留下变更时均正确 retained。

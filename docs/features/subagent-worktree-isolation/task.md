@@ -30,6 +30,7 @@
 - [ ] 对配置路径执行严格类型、重复项和明显绝对/越界形式校验；更新 `.ycode/config.example.yaml`。
 - [ ] 新增 `SubagentIsolation.NONE / WORKTREE` 并加入 `SubagentRoleConfig`。
 - [ ] 扩展角色 Frontmatter Loader：`isolation` 省略时为 `none`，非法值只禁用对应角色。
+- [ ] 扩展 `run_subagent` 工具与运行时参数：可选 `isolation` 接受 `none/worktree`，并按“工具参数 → 角色定义 → `none`”解析。
 - [ ] 建立生命周期、owner、record、lease、状态摘要、删除判定和任务 Worktree 摘要等 Provider 无关模型。
 - [ ] 实现 `WorktreeName` 严格校验：字符集、段数、长度、空段、`.`/`..`、反斜杠、Windows 保留名、段尾点和连续 `--`。
 - [ ] 实现基于角色与任务 ID 的系统命名、有限冲突后缀和 `ycode/<flat-name>` 可逆分支映射。
@@ -340,8 +341,8 @@
 
 **实现内容：**
 
-- [ ] `SubagentManager.start()` 在登记 running 前根据角色快照决定是否 acquire Worktree。
-- [ ] 同步和异步隔离任务都等待关键初始化完成；Fork 和 `isolation: none` 不调用 WorktreeManager。
+- [ ] `SubagentManager.start()` 在登记 running 前根据工具参数和角色快照的优先级决定是否 acquire Worktree。
+- [ ] 同步和异步隔离任务都等待关键初始化完成；显式请求隔离的 Fork 使用固定 `fork` 身份创建 Worktree，最终模式为 `none` 的任务不调用 WorktreeManager。
 - [ ] 扩展 runtime request/assignment，使 Runner 选择共享或 Worktree 工厂，不读取模型提供的工作区路径。
 - [ ] 在隔离任务原文前注入可信 parent/worktree 映射模板，保持原始任务正文逐字不变。
 - [ ] 让隔离子 Agent 的文件、搜索、命令、Git、环境和 YCode Hooks 全部使用 assignment 路径。

@@ -113,10 +113,7 @@ class SubagentManager:
         parent: AgentRequestSnapshot,
         task_id: str,
     ) -> SubagentInvocation:
-        isolated = (
-            invocation.role is not None
-            and invocation.role.config.isolation is SubagentIsolation.WORKTREE
-        )
+        isolated = invocation.isolation is SubagentIsolation.WORKTREE
         token = arguments.shared_fallback_token
         if token is not None:
             if not isolated:
@@ -134,7 +131,7 @@ class SubagentManager:
             if self._worktree_manager is None:
                 raise WorktreeManagerError("worktree_unavailable", "Worktree 功能未装配。")
             lease = await self._worktree_manager.acquire(
-                invocation.role.config.name,
+                self._invocation_identity(invocation),
                 session_id,
                 task_id,
             )
@@ -156,14 +153,14 @@ class SubagentManager:
         invocation: SubagentInvocation,
         parent: AgentRequestSnapshot,
     ) -> SharedFallbackGrant:
-        assert invocation.role is not None
         token = self._fallback_token_factory()
         grant = SharedFallbackGrant(
             token,
             session_id,
-            invocation.role.config.name,
+            self._invocation_identity(invocation),
             invocation.task,
             invocation.run_mode,
+            invocation.isolation,
             parent.turn_id,
         )
         self._fallback_grants[token] = grant
@@ -177,7 +174,7 @@ class SubagentManager:
     ) -> None:
         grant = self._fallback_grants.get(token)
         session_id = self._session_id_provider()
-        role = invocation.role.config.name if invocation.role is not None else ""
+        role = self._invocation_identity(invocation)
         if grant is None:
             raise SubagentManagerError("fallback_token_invalid", "共享降级授权无效或已使用。")
         if parent.turn_id == grant.issued_turn_id:
@@ -187,6 +184,7 @@ class SubagentManager:
             or role != grant.role
             or invocation.task != grant.task
             or invocation.run_mode is not grant.mode
+            or invocation.isolation is not grant.isolation
         ):
             raise SubagentManagerError("fallback_mismatch", "共享降级授权与当前任务不匹配。")
         del self._fallback_grants[token]
@@ -278,13 +276,21 @@ class SubagentManager:
                 raise SubagentManagerError("fork_sync_invalid", "Fork 子 Agent 必须异步执行。")
             run_mode = SubagentRunMode.ASYNC
             creation_mode = SubagentCreationMode.FORK
+        isolation = arguments.isolation
+        if isolation is None:
+            isolation = role.config.isolation if role is not None else SubagentIsolation.NONE
         return SubagentInvocation(
             task,
             role,
             creation_mode,
             run_mode,
             parent.turn_id,
+            isolation,
         )
+
+    @staticmethod
+    def _invocation_identity(invocation: SubagentInvocation) -> str:
+        return invocation.role.config.name if invocation.role is not None else "fork"
 
     def _resolve(self, task_id: str) -> ManagedSubagentTask:
         value = task_id.strip()

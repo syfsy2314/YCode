@@ -133,6 +133,7 @@ class RunSubagentArguments:
     role: str | None = None
     mode: SubagentRunMode | None = None
     shared_fallback_token: str | None = None
+    isolation: SubagentIsolation | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +143,7 @@ class SharedFallbackGrant:
     role: str
     task: str
     mode: SubagentRunMode
+    isolation: SubagentIsolation
     issued_turn_id: str
 
     def __post_init__(self) -> None:
@@ -156,6 +158,7 @@ class SubagentInvocation:
     creation_mode: SubagentCreationMode
     run_mode: SubagentRunMode
     owner_turn_id: str
+    isolation: SubagentIsolation = SubagentIsolation.NONE
     shared_fallback: bool = False
     worktree_lease: WorktreeLease | None = None
     parent_workspace: str | None = None
